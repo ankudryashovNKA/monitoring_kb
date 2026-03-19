@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import platform
 import socket
 import time
 from datetime import datetime, timezone
@@ -11,15 +12,27 @@ import requests
 DEFAULT_INTERVAL_SECONDS = 60
 
 
+def detect_primary_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
 
-def collect_metrics(node_id: str) -> dict[str, str | float]:
+
+def collect_metrics(node_id: str) -> dict[str, str | float | int]:
+    virtual_memory = psutil.virtual_memory()
     return {
         "node_id": node_id,
         "cpu_percent": psutil.cpu_percent(interval=1),
-        "ram_percent": psutil.virtual_memory().percent,
+        "ram_percent": virtual_memory.percent,
+        "os_name": f"{platform.system()} {platform.release()}",
+        "cpu_cores": psutil.cpu_count() or 1,
+        "ram_total_mb": int(virtual_memory.total / (1024 * 1024)),
+        "ip_address": detect_primary_ip(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-
 
 
 def main() -> None:
