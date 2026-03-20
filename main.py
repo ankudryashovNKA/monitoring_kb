@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from collections import defaultdict, deque
+import os
+import sqlite3
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Deque
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -11,6 +13,7 @@ from pydantic import BaseModel, Field
 
 RETENTION_PERIOD = timedelta(hours=1)
 RECENT_POINTS_LIMIT = 10
+DB_PATH = Path(os.getenv("MONITORING_DB_PATH", "monitoring.db"))
 
 
 @dataclass
@@ -47,30 +50,98 @@ class NodeRenameIn(BaseModel):
     display_name: str = Field(..., min_length=1, max_length=100)
 
 
-app = FastAPI(title="Monitoring KB MVP")
-_storage: dict[str, Deque[MetricPoint]] = defaultdict(deque)
-_nodes: dict[str, NodeInfo] = {}
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(title="Monitoring KB MVP", lifespan=lifespan)
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _prune(points: Deque[MetricPoint], now: datetime) -> None:
-    cutoff = now - RETENTION_PERIOD
-    while points and points[0].timestamp < cutoff:
-        points.popleft()
+def _normalize_timestamp(timestamp: datetime | None) -> datetime:
+    value = timestamp or _utcnow()
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
-def _serialize_metric(point: MetricPoint) -> dict[str, str | float]:
+def _connect() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def init_db() -> None:
+    with _connect() as connection:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS nodes (
+                node_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                os_name TEXT NOT NULL,
+                cpu_cores INTEGER NOT NULL,
+                ram_total_mb INTEGER NOT NULL,
+                ip_address TEXT NOT NULL,
+                last_seen TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL,
+                cpu_percent REAL NOT NULL,
+                ram_percent REAL NOT NULL,
+                timestamp TEXT NOT NULL,
+                FOREIGN KEY (node_id) REFERENCES nodes (node_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_metrics_node_timestamp
+                ON metrics (node_id, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_metrics_timestamp
+                ON metrics (timestamp DESC);
+            """
+        )
+
+
+def reset_db() -> None:
+    with _connect() as connection:
+        connection.execute("DELETE FROM metrics")
+        connection.execute("DELETE FROM nodes")
+
+
+def _prune_expired(connection: sqlite3.Connection, now: datetime) -> None:
+    cutoff = (now - RETENTION_PERIOD).isoformat()
+    connection.execute("DELETE FROM metrics WHERE timestamp < ?", (cutoff,))
+
+
+def _serialize_metric(row: sqlite3.Row) -> dict[str, str | float]:
+    point = MetricPoint(
+        node_id=row["node_id"],
+        cpu_percent=row["cpu_percent"],
+        ram_percent=row["ram_percent"],
+        timestamp=datetime.fromisoformat(row["timestamp"]),
+    )
     item = asdict(point)
     item["timestamp"] = point.timestamp.isoformat()
-    node = _nodes.get(point.node_id)
-    item["display_name"] = node.display_name if node else point.node_id
+    item["display_name"] = row["display_name"]
     return item
 
 
-def _serialize_node(node: NodeInfo) -> dict[str, str | int]:
+def _serialize_node(row: sqlite3.Row) -> dict[str, str | int]:
+    node = NodeInfo(
+        node_id=row["node_id"],
+        display_name=row["display_name"],
+        os_name=row["os_name"],
+        cpu_cores=row["cpu_cores"],
+        ram_total_mb=row["ram_total_mb"],
+        ip_address=row["ip_address"],
+        last_seen=datetime.fromisoformat(row["last_seen"]),
+    )
     item = asdict(node)
     item["last_seen"] = node.last_seen.isoformat()
     return item
@@ -78,64 +149,105 @@ def _serialize_node(node: NodeInfo) -> dict[str, str | int]:
 
 @app.post("/api/metrics")
 def ingest_metric(metric: MetricIn) -> dict[str, str]:
-    timestamp = metric.timestamp or _utcnow()
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.replace(tzinfo=timezone.utc)
-
-    point = MetricPoint(
-        node_id=metric.node_id,
-        cpu_percent=metric.cpu_percent,
-        ram_percent=metric.ram_percent,
-        timestamp=timestamp.astimezone(timezone.utc),
-    )
-    points = _storage[metric.node_id]
-    points.append(point)
-    _prune(points, _utcnow())
-
-    existing_name = _nodes[metric.node_id].display_name if metric.node_id in _nodes else metric.node_id
-    _nodes[metric.node_id] = NodeInfo(
-        node_id=metric.node_id,
-        display_name=existing_name,
-        os_name=metric.os_name,
-        cpu_cores=metric.cpu_cores,
-        ram_total_mb=metric.ram_total_mb,
-        ip_address=metric.ip_address,
-        last_seen=point.timestamp,
-    )
+    timestamp = _normalize_timestamp(metric.timestamp)
+    with _connect() as connection:
+        _prune_expired(connection, _utcnow())
+        current_name = connection.execute(
+            "SELECT display_name FROM nodes WHERE node_id = ?",
+            (metric.node_id,),
+        ).fetchone()
+        display_name = current_name["display_name"] if current_name else metric.node_id
+        connection.execute(
+            """
+            INSERT INTO nodes (node_id, display_name, os_name, cpu_cores, ram_total_mb, ip_address, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(node_id) DO UPDATE SET
+                display_name = excluded.display_name,
+                os_name = excluded.os_name,
+                cpu_cores = excluded.cpu_cores,
+                ram_total_mb = excluded.ram_total_mb,
+                ip_address = excluded.ip_address,
+                last_seen = excluded.last_seen
+            """,
+            (
+                metric.node_id,
+                display_name,
+                metric.os_name,
+                metric.cpu_cores,
+                metric.ram_total_mb,
+                metric.ip_address,
+                timestamp.isoformat(),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO metrics (node_id, cpu_percent, ram_percent, timestamp) VALUES (?, ?, ?, ?)",
+            (metric.node_id, metric.cpu_percent, metric.ram_percent, timestamp.isoformat()),
+        )
     return {"status": "ok"}
 
 
 @app.get("/api/metrics")
 def list_metrics(node_id: str | None = None) -> dict[str, list[dict[str, str | float]]]:
     now = _utcnow()
-    if node_id:
-        points = _storage.get(node_id)
-        if points is None:
-            raise HTTPException(status_code=404, detail="Node not found")
-        _prune(points, now)
-        return {"items": [_serialize_metric(point) for point in list(points)[-RECENT_POINTS_LIMIT:]]}
+    with _connect() as connection:
+        _prune_expired(connection, now)
+        if node_id:
+            node = connection.execute("SELECT 1 FROM nodes WHERE node_id = ?", (node_id,)).fetchone()
+            if node is None:
+                raise HTTPException(status_code=404, detail="Node not found")
+            rows = connection.execute(
+                """
+                SELECT metrics.node_id, metrics.cpu_percent, metrics.ram_percent, metrics.timestamp, nodes.display_name
+                FROM metrics
+                JOIN nodes ON nodes.node_id = metrics.node_id
+                WHERE metrics.node_id = ?
+                ORDER BY metrics.timestamp DESC
+                LIMIT ?
+                """,
+                (node_id, RECENT_POINTS_LIMIT),
+            ).fetchall()
+            return {"items": [_serialize_metric(row) for row in reversed(rows)]}
 
-    items: list[dict[str, str | float]] = []
-    for points in _storage.values():
-        _prune(points, now)
-        items.extend(_serialize_metric(point) for point in list(points)[-RECENT_POINTS_LIMIT:])
-    items.sort(key=lambda item: item["timestamp"])
-    return {"items": items[-RECENT_POINTS_LIMIT:]}
+        rows = connection.execute(
+            """
+            SELECT node_id, cpu_percent, ram_percent, timestamp, display_name
+            FROM (
+                SELECT metrics.node_id, metrics.cpu_percent, metrics.ram_percent, metrics.timestamp, nodes.display_name
+                FROM metrics
+                JOIN nodes ON nodes.node_id = metrics.node_id
+                ORDER BY metrics.timestamp DESC
+                LIMIT ?
+            ) recent
+            ORDER BY timestamp ASC
+            """,
+            (RECENT_POINTS_LIMIT,),
+        ).fetchall()
+        return {"items": [_serialize_metric(row) for row in rows]}
 
 
 @app.get("/api/nodes")
 def list_nodes() -> dict[str, list[dict[str, str | int]]]:
-    nodes = sorted(_nodes.values(), key=lambda node: node.display_name.lower())
-    return {"items": [_serialize_node(node) for node in nodes]}
+    with _connect() as connection:
+        rows = connection.execute(
+            "SELECT node_id, display_name, os_name, cpu_cores, ram_total_mb, ip_address, last_seen FROM nodes ORDER BY lower(display_name)"
+        ).fetchall()
+    return {"items": [_serialize_node(row) for row in rows]}
 
 
 @app.patch("/api/nodes/{node_id}")
 def rename_node(node_id: str, payload: NodeRenameIn) -> dict[str, str | int]:
-    node = _nodes.get(node_id)
-    if node is None:
-        raise HTTPException(status_code=404, detail="Node not found")
-    node.display_name = payload.display_name
-    return _serialize_node(node)
+    with _connect() as connection:
+        cursor = connection.execute(
+            "UPDATE nodes SET display_name = ? WHERE node_id = ?",
+            (payload.display_name, node_id),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Node not found")
+        row = connection.execute(
+            "SELECT node_id, display_name, os_name, cpu_cores, ram_total_mb, ip_address, last_seen FROM nodes WHERE node_id = ?",
+            (node_id,),
+        ).fetchone()
+    return _serialize_node(row)
 
 
 @app.get("/", response_class=HTMLResponse)

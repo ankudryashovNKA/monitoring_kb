@@ -7,21 +7,21 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from main import (  # noqa: E402
     RECENT_POINTS_LIMIT,
-    _nodes,
-    _storage,
+    MetricIn,
+    NodeRenameIn,
     dashboard,
     ingest_metric,
+    init_db,
     list_metrics,
     list_nodes,
     rename_node,
-    MetricIn,
-    NodeRenameIn,
+    reset_db,
 )
 
 
 def setup_function() -> None:
-    _storage.clear()
-    _nodes.clear()
+    init_db()
+    reset_db()
 
 
 def test_ingest_and_list_metrics() -> None:
@@ -68,6 +68,29 @@ def test_nodes_list_and_rename() -> None:
     metrics = list_metrics(node_id="node-rename")["items"]
     assert metrics[-1]["display_name"] == "Database node"
 
+
+def test_data_persists_in_database() -> None:
+    ingest_metric(
+        MetricIn(
+            node_id="node-persist",
+            cpu_percent=12.5,
+            ram_percent=33.3,
+            os_name="Debian 12",
+            cpu_cores=2,
+            ram_total_mb=4096,
+            ip_address="10.10.0.5",
+        )
+    )
+    rename_node("node-persist", NodeRenameIn(display_name="Persistent node"))
+
+    init_db()
+
+    metrics = list_metrics(node_id="node-persist")["items"]
+    nodes = list_nodes()["items"]
+
+    assert len(metrics) == 1
+    assert metrics[0]["display_name"] == "Persistent node"
+    assert any(node["display_name"] == "Persistent node" for node in nodes)
 
 def test_dashboard_page_available() -> None:
     html = dashboard()
