@@ -7,8 +7,6 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from main import (  # noqa: E402
     RECENT_POINTS_LIMIT,
-    _nodes,
-    _storage,
     dashboard,
     ingest_metric,
     list_metrics,
@@ -17,11 +15,16 @@ from main import (  # noqa: E402
     MetricIn,
     NodeRenameIn,
 )
+from app.db.session import SessionLocal  # noqa: E402
+from app.models.metric import Metric  # noqa: E402
+from app.models.node import Node  # noqa: E402
 
 
 def setup_function() -> None:
-    _storage.clear()
-    _nodes.clear()
+    with SessionLocal() as db:
+        db.query(Metric).delete()
+        db.query(Node).delete()
+        db.commit()
 
 
 def test_ingest_and_list_metrics() -> None:
