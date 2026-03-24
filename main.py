@@ -6,6 +6,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Deque
 
 from fastapi import FastAPI, HTTPException
+
+from app.api.users import router as users_router
+from app.db.base import Base
+from app.db.session import engine
+import app.models.user  # noqa: F401
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -48,6 +53,13 @@ class NodeRenameIn(BaseModel):
 
 
 app = FastAPI(title="Monitoring KB MVP")
+app.include_router(users_router)
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    # For production use Alembic migrations instead of create_all.
+    Base.metadata.create_all(bind=engine)
 _storage: dict[str, Deque[MetricPoint]] = defaultdict(deque)
 _nodes: dict[str, NodeInfo] = {}
 
