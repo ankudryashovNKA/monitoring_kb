@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Deque
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 
 from app.api.users import router as users_router
 from app.db.base import Base
@@ -179,6 +179,40 @@ def list_metrics(node_id: str | None = None) -> dict[str, list[dict[str, str | f
         ]
         items.reverse()
         return {"items": items}
+
+
+@app.get("/api/metrics/history")
+def list_metric_history(
+    node_id: str,
+    metric_name: str = Query("cpu_percent", pattern="^(cpu_percent|ram_percent)$"),
+    interval_minutes: int = Query(15, ge=1, le=60),
+) -> dict[str, str | list[dict[str, str | float]]]:
+    now = _utcnow()
+    cutoff = max(now - RETENTION_PERIOD, now - timedelta(minutes=interval_minutes))
+
+    with SessionLocal() as db:
+        db.query(Metric).filter(Metric.timestamp < now - RETENTION_PERIOD).delete(synchronize_session=False)
+        db.commit()
+
+        node = db.query(Node).filter(Node.node_id == node_id).first()
+        if node is None:
+            raise HTTPException(status_code=404, detail="Node not found")
+
+        rows = (
+            db.query(Metric)
+            .filter(Metric.node_id == node_id, Metric.timestamp >= cutoff)
+            .order_by(Metric.timestamp.asc())
+            .all()
+        )
+        items = [
+            {
+                "timestamp": metric.timestamp.isoformat(),
+                "value": metric.cpu_percent if metric_name == "cpu_percent" else metric.ram_percent,
+            }
+            for metric in rows
+        ]
+
+        return {"node_id": node_id, "metric_name": metric_name, "items": items}
 
 
 @app.get("/api/nodes")
@@ -416,6 +450,7 @@ def dashboard() -> str:
             <nav class="nav">
                 <button class="nav-btn active" data-tab="latest" type="button"><span>📈</span><span class="nav-label">Latest data</span></button>
                 <button class="nav-btn" data-tab="nodes" type="button"><span>🖥️</span><span class="nav-label">Nodes</span></button>
+                <button class="nav-btn" data-tab="graphs" type="button"><span>📊</span><span class="nav-label">Graphs</span></button>
             </nav>
         </aside>
         <main class="content">
@@ -467,6 +502,44 @@ def dashboard() -> str:
                     <tbody id="nodes-body"></tbody>
                 </table>
             </section>
+
+            <section class="panel tab-panel" data-panel="graphs" hidden>
+                <div class="page-header">
+                    <h2>Graphs</h2>
+                    <p class="meta">Select node, metric and interval to inspect the trend.</p>
+                </div>
+                <div class="toolbar">
+                    <label>
+                        <span class="meta">Node</span><br />
+                        <select id="graph-node-select"></select>
+                    </label>
+                    <label>
+                        <span class="meta">Metric</span><br />
+                        <select id="graph-metric-select">
+                            <option value="cpu_percent">CPU %</option>
+                            <option value="ram_percent">RAM %</option>
+                        </select>
+                    </label>
+                    <label>
+                        <span class="meta">Interval</span><br />
+                        <select id="graph-interval-select">
+                            <option value="5">5 minutes</option>
+                            <option value="15" selected>15 minutes</option>
+                            <option value="30">30 minutes</option>
+                            <option value="60">60 minutes</option>
+                        </select>
+                    </label>
+                    <button id="refresh-graph" type="button">Refresh graph</button>
+                </div>
+                <div id="graph-status" class="status"></div>
+                <svg id="graph-canvas" viewBox="0 0 800 320" width="100%" height="320" role="img" aria-label="Metric graph">
+                    <rect x="0" y="0" width="800" height="320" fill="rgba(2, 6, 23, 0.35)" stroke="#334155"></rect>
+                    <line x1="50" y1="270" x2="760" y2="270" stroke="#334155" />
+                    <line x1="50" y1="30" x2="50" y2="270" stroke="#334155" />
+                    <polyline id="graph-line" fill="none" stroke="#38bdf8" stroke-width="3" points=""></polyline>
+                    <text id="graph-title" x="50" y="20" fill="#94a3b8">No data</text>
+                </svg>
+            </section>
         </main>
     </div>
 
@@ -511,17 +584,22 @@ def dashboard() -> str:
 
         function renderNodeOptions() {
             const select = document.getElementById('node-select');
+            const graphSelect = document.getElementById('graph-node-select');
             select.innerHTML = '';
+            graphSelect.innerHTML = '';
             if (!state.nodes.length) {
                 const option = document.createElement('option');
                 option.textContent = 'No nodes yet';
                 option.value = '';
                 select.appendChild(option);
+                graphSelect.appendChild(option.cloneNode(true));
                 select.disabled = true;
+                graphSelect.disabled = true;
                 return;
             }
 
             select.disabled = false;
+            graphSelect.disabled = false;
             if (!state.selectedNodeId || !state.nodes.some((node) => node.node_id === state.selectedNodeId)) {
                 state.selectedNodeId = state.nodes[0].node_id;
             }
@@ -532,7 +610,33 @@ def dashboard() -> str:
                 option.textContent = `${node.display_name} (${node.node_id})`;
                 option.selected = node.node_id === state.selectedNodeId;
                 select.appendChild(option);
+                graphSelect.appendChild(option.cloneNode(true));
             }
+        }
+
+        function renderGraph(items, metricName) {
+            const line = document.getElementById('graph-line');
+            const title = document.getElementById('graph-title');
+            if (!items.length) {
+                line.setAttribute('points', '');
+                title.textContent = 'No data for selected interval';
+                return;
+            }
+
+            const width = 710;
+            const height = 240;
+            const minX = 50;
+            const minY = 30;
+            const values = items.map((item) => item.value);
+            const maxValue = Math.max(...values, 100);
+            const points = items.map((item, index) => {
+                const x = minX + (items.length === 1 ? 0 : (index / (items.length - 1)) * width);
+                const y = minY + height - (item.value / maxValue) * height;
+                return `${x.toFixed(2)},${y.toFixed(2)}`;
+            });
+            line.setAttribute('points', points.join(' '));
+            const latestValue = items[items.length - 1].value.toFixed(2);
+            title.textContent = `${metricName === 'cpu_percent' ? 'CPU' : 'RAM'} trend, latest: ${latestValue}%`;
         }
 
         function renderLatestSummary(items, node) {
@@ -671,6 +775,27 @@ def dashboard() -> str:
             }
         }
 
+        async function loadGraph() {
+            const nodeId = document.getElementById('graph-node-select').value;
+            const metricName = document.getElementById('graph-metric-select').value;
+            const interval = document.getElementById('graph-interval-select').value;
+            if (!nodeId) {
+                renderGraph([], metricName);
+                setStatus('graph-status', 'Waiting for nodes to send data.');
+                return;
+            }
+            try {
+                const data = await fetchJson(
+                    `/api/metrics/history?node_id=${encodeURIComponent(nodeId)}&metric_name=${encodeURIComponent(metricName)}&interval_minutes=${encodeURIComponent(interval)}`
+                );
+                renderGraph(data.items, metricName);
+                setStatus('graph-status', data.items.length ? '' : 'No recent points for selected options.');
+            } catch (error) {
+                renderGraph([], metricName);
+                setStatus('graph-status', error.message, true);
+            }
+        }
+
         document.getElementById('sidebar-toggle').addEventListener('click', () => {
             document.getElementById('sidebar').classList.toggle('collapsed');
         });
@@ -685,13 +810,25 @@ def dashboard() -> str:
         document.getElementById('node-select').addEventListener('change', async (event) => {
             state.selectedNodeId = event.target.value;
             await loadLatestMetrics();
+            document.getElementById('graph-node-select').value = state.selectedNodeId;
+            await loadGraph();
         });
 
         document.getElementById('refresh-latest').addEventListener('click', loadLatestMetrics);
+        document.getElementById('refresh-graph').addEventListener('click', loadGraph);
+        document.getElementById('graph-node-select').addEventListener('change', async (event) => {
+            state.selectedNodeId = event.target.value;
+            document.getElementById('node-select').value = state.selectedNodeId;
+            await loadLatestMetrics();
+            await loadGraph();
+        });
+        document.getElementById('graph-metric-select').addEventListener('change', loadGraph);
+        document.getElementById('graph-interval-select').addEventListener('change', loadGraph);
 
         async function refreshAll() {
             await loadNodes();
             await loadLatestMetrics();
+            await loadGraph();
         }
 
         renderTabs();

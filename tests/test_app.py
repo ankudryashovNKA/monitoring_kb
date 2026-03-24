@@ -9,6 +9,7 @@ from main import (  # noqa: E402
     RECENT_POINTS_LIMIT,
     dashboard,
     ingest_metric,
+    list_metric_history,
     list_metrics,
     list_nodes,
     rename_node,
@@ -77,3 +78,35 @@ def test_dashboard_page_available() -> None:
     assert "Monitoring KB MVP" in html
     assert "Latest data" in html
     assert "Nodes" in html
+    assert "Graphs" in html
+
+
+def test_metric_history() -> None:
+    ingest_metric(
+        MetricIn(
+            node_id="node-graph",
+            cpu_percent=17.5,
+            ram_percent=66.0,
+            os_name="Ubuntu",
+            cpu_cores=4,
+            ram_total_mb=8192,
+            ip_address="10.0.0.11",
+        )
+    )
+    ingest_metric(
+        MetricIn(
+            node_id="node-graph",
+            cpu_percent=22.0,
+            ram_percent=64.0,
+            os_name="Ubuntu",
+            cpu_cores=4,
+            ram_total_mb=8192,
+            ip_address="10.0.0.11",
+        )
+    )
+
+    history = list_metric_history(node_id="node-graph", metric_name="cpu_percent", interval_minutes=60)
+    assert history["node_id"] == "node-graph"
+    assert history["metric_name"] == "cpu_percent"
+    assert len(history["items"]) == 2
+    assert history["items"][-1]["value"] == 22.0
