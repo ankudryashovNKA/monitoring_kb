@@ -546,7 +546,9 @@ def dashboard() -> str:
     <script>
         const state = {
             nodes: [],
-            selectedNodeId: '',
+            latestSelectedNodeId: '',
+            graphSelectedNodeId: '',
+            nodeNameDrafts: {},
             activeTab: 'latest',
         };
 
@@ -600,18 +602,22 @@ def dashboard() -> str:
 
             select.disabled = false;
             graphSelect.disabled = false;
-            if (!state.selectedNodeId || !state.nodes.some((node) => node.node_id === state.selectedNodeId)) {
-                state.selectedNodeId = state.nodes[0].node_id;
+            if (!state.latestSelectedNodeId || !state.nodes.some((node) => node.node_id === state.latestSelectedNodeId)) {
+                state.latestSelectedNodeId = state.nodes[0].node_id;
+            }
+            if (!state.graphSelectedNodeId || !state.nodes.some((node) => node.node_id === state.graphSelectedNodeId)) {
+                state.graphSelectedNodeId = state.latestSelectedNodeId;
             }
 
             for (const node of state.nodes) {
                 const option = document.createElement('option');
                 option.value = node.node_id;
                 option.textContent = `${node.display_name} (${node.node_id})`;
-                option.selected = node.node_id === state.selectedNodeId;
                 select.appendChild(option);
                 graphSelect.appendChild(option.cloneNode(true));
             }
+            select.value = state.latestSelectedNodeId;
+            graphSelect.value = state.graphSelectedNodeId;
         }
 
         function renderGraph(items, metricName) {
@@ -691,12 +697,15 @@ def dashboard() -> str:
             }
 
             for (const node of state.nodes) {
+                const inputValue = Object.prototype.hasOwnProperty.call(state.nodeNameDrafts, node.node_id)
+                    ? state.nodeNameDrafts[node.node_id]
+                    : node.display_name;
                 const row = document.createElement('tr');
                 row.innerHTML = `
                     <td>
                         <strong>${node.display_name}</strong>
                         <form class="rename-form" data-node-id="${node.node_id}">
-                            <input name="display_name" value="${node.display_name}" aria-label="Display name for ${node.node_id}" />
+                            <input name="display_name" value="${inputValue}" aria-label="Display name for ${node.node_id}" />
                             <button type="submit">Save</button>
                         </form>
                     </td>
@@ -711,6 +720,11 @@ def dashboard() -> str:
             }
 
             body.querySelectorAll('.rename-form').forEach((form) => {
+                const input = form.querySelector('input[name="display_name"]');
+                input.addEventListener('input', () => {
+                    const nodeId = form.dataset.nodeId;
+                    state.nodeNameDrafts[nodeId] = input.value;
+                });
                 form.addEventListener('submit', async (event) => {
                     event.preventDefault();
                     const nodeId = form.dataset.nodeId;
@@ -726,6 +740,7 @@ def dashboard() -> str:
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ display_name: displayName }),
                         });
+                        delete state.nodeNameDrafts[nodeId];
                         setStatus('nodes-status', `Saved new name for ${nodeId}.`);
                         await loadNodes();
                         await loadLatestMetrics();
@@ -755,7 +770,7 @@ def dashboard() -> str:
         }
 
         async function loadLatestMetrics() {
-            const node = state.nodes.find((item) => item.node_id === state.selectedNodeId);
+            const node = state.nodes.find((item) => item.node_id === state.latestSelectedNodeId);
             if (!node) {
                 renderLatestSummary([], null);
                 renderLatestTable([]);
@@ -776,7 +791,7 @@ def dashboard() -> str:
         }
 
         async function loadGraph() {
-            const nodeId = document.getElementById('graph-node-select').value;
+            const nodeId = state.graphSelectedNodeId;
             const metricName = document.getElementById('graph-metric-select').value;
             const interval = document.getElementById('graph-interval-select').value;
             if (!nodeId) {
@@ -808,18 +823,17 @@ def dashboard() -> str:
         });
 
         document.getElementById('node-select').addEventListener('change', async (event) => {
-            state.selectedNodeId = event.target.value;
+            state.latestSelectedNodeId = event.target.value;
+            state.graphSelectedNodeId = event.target.value;
+            document.getElementById('graph-node-select').value = state.graphSelectedNodeId;
             await loadLatestMetrics();
-            document.getElementById('graph-node-select').value = state.selectedNodeId;
             await loadGraph();
         });
 
         document.getElementById('refresh-latest').addEventListener('click', loadLatestMetrics);
         document.getElementById('refresh-graph').addEventListener('click', loadGraph);
         document.getElementById('graph-node-select').addEventListener('change', async (event) => {
-            state.selectedNodeId = event.target.value;
-            document.getElementById('node-select').value = state.selectedNodeId;
-            await loadLatestMetrics();
+            state.graphSelectedNodeId = event.target.value;
             await loadGraph();
         });
         document.getElementById('graph-metric-select').addEventListener('change', loadGraph);
