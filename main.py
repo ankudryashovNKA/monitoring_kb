@@ -532,12 +532,16 @@ def dashboard() -> str:
                     <button id="refresh-graph" type="button">Refresh graph</button>
                 </div>
                 <div id="graph-status" class="status"></div>
-                <svg id="graph-canvas" viewBox="0 0 800 320" width="100%" height="320" role="img" aria-label="Metric graph">
-                    <rect x="0" y="0" width="800" height="320" fill="rgba(2, 6, 23, 0.35)" stroke="#334155"></rect>
-                    <line x1="50" y1="270" x2="760" y2="270" stroke="#334155" />
-                    <line x1="50" y1="30" x2="50" y2="270" stroke="#334155" />
-                    <polyline id="graph-line" fill="none" stroke="#38bdf8" stroke-width="3" points=""></polyline>
-                    <text id="graph-title" x="50" y="20" fill="#94a3b8">No data</text>
+                <svg id="graph-canvas" viewBox="0 0 1200 360" width="100%" height="360" role="img" aria-label="Metric graph">
+                    <rect x="0" y="0" width="1200" height="360" fill="rgba(2, 6, 23, 0.35)" stroke="#334155"></rect>
+                    <g id="graph-y-grid"></g>
+                    <line x1="80" y1="300" x2="1160" y2="300" stroke="#334155" />
+                    <line x1="80" y1="40" x2="80" y2="300" stroke="#334155" />
+                    <g id="graph-y-labels"></g>
+                    <g id="graph-x-labels"></g>
+                    <polyline id="graph-line" fill="none" stroke="#38bdf8" stroke-width="1.5" points=""></polyline>
+                    <g id="graph-points"></g>
+                    <text id="graph-title" x="80" y="24" fill="#94a3b8">No data</text>
                 </svg>
             </section>
         </main>
@@ -620,29 +624,106 @@ def dashboard() -> str:
             graphSelect.value = state.graphSelectedNodeId;
         }
 
-        function renderGraph(items, metricName) {
+        function renderGraph(items, metricName, intervalMinutes) {
             const line = document.getElementById('graph-line');
+            const yGrid = document.getElementById('graph-y-grid');
+            const yLabels = document.getElementById('graph-y-labels');
+            const xLabels = document.getElementById('graph-x-labels');
+            const pointLayer = document.getElementById('graph-points');
             const title = document.getElementById('graph-title');
-            if (!items.length) {
+
+            const plotLeft = 80;
+            const plotTop = 40;
+            const plotWidth = 1080;
+            const plotHeight = 260;
+            const axisTicks = 5;
+            const safeInterval = Math.max(1, Number(intervalMinutes) || 15);
+            const endTimeMs = Date.now();
+            const startTimeMs = endTimeMs - safeInterval * 60 * 1000;
+
+            const sortedItems = items
+                .map((item) => ({ ...item, timeMs: new Date(item.timestamp).getTime() }))
+                .filter((item) => item.timeMs >= startTimeMs && item.timeMs <= endTimeMs)
+                .sort((a, b) => a.timeMs - b.timeMs);
+
+            const values = sortedItems.map((item) => item.value);
+            const rawMinValue = values.length ? Math.min(...values) : 0;
+            const rawMaxValue = values.length ? Math.max(...values) : 100;
+            const padded = Math.max((rawMaxValue - rawMinValue) * 0.1, 1);
+            const minValue = Math.max(0, rawMinValue - padded);
+            const maxValue = rawMaxValue + padded;
+
+            yGrid.innerHTML = '';
+            yLabels.innerHTML = '';
+            xLabels.innerHTML = '';
+            pointLayer.innerHTML = '';
+
+            for (let i = 0; i <= axisTicks; i += 1) {
+                const ratio = i / axisTicks;
+                const y = plotTop + plotHeight - ratio * plotHeight;
+                const tickValue = minValue + ratio * (maxValue - minValue);
+
+                const gridLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                gridLine.setAttribute('x1', String(plotLeft));
+                gridLine.setAttribute('y1', y.toFixed(2));
+                gridLine.setAttribute('x2', String(plotLeft + plotWidth));
+                gridLine.setAttribute('y2', y.toFixed(2));
+                gridLine.setAttribute('stroke', 'rgba(71, 85, 105, 0.45)');
+                gridLine.setAttribute('stroke-dasharray', '4 5');
+                yGrid.appendChild(gridLine);
+
+                const yLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                yLabel.setAttribute('x', String(plotLeft - 10));
+                yLabel.setAttribute('y', (y + 4).toFixed(2));
+                yLabel.setAttribute('fill', '#94a3b8');
+                yLabel.setAttribute('font-size', '12');
+                yLabel.setAttribute('text-anchor', 'end');
+                yLabel.textContent = tickValue.toFixed(1);
+                yLabels.appendChild(yLabel);
+            }
+
+            for (let i = 0; i <= axisTicks; i += 1) {
+                const ratio = i / axisTicks;
+                const x = plotLeft + ratio * plotWidth;
+                const tickMs = startTimeMs + ratio * (endTimeMs - startTimeMs);
+
+                const xLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                xLabel.setAttribute('x', x.toFixed(2));
+                xLabel.setAttribute('y', String(plotTop + plotHeight + 20));
+                xLabel.setAttribute('fill', '#94a3b8');
+                xLabel.setAttribute('font-size', '12');
+                xLabel.setAttribute('text-anchor', 'middle');
+                xLabel.textContent = new Date(tickMs).toLocaleTimeString('en-GB', {
+                    timeZone: 'UTC',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                });
+                xLabels.appendChild(xLabel);
+            }
+
+            if (!sortedItems.length) {
                 line.setAttribute('points', '');
-                title.textContent = 'No data for selected interval';
+                title.textContent = `No data for selected interval (${safeInterval} min)`;
                 return;
             }
 
-            const width = 710;
-            const height = 240;
-            const minX = 50;
-            const minY = 30;
-            const values = items.map((item) => item.value);
-            const maxValue = Math.max(...values, 100);
-            const points = items.map((item, index) => {
-                const x = minX + (items.length === 1 ? 0 : (index / (items.length - 1)) * width);
-                const y = minY + height - (item.value / maxValue) * height;
+            const toX = (timeMs) => plotLeft + ((timeMs - startTimeMs) / (endTimeMs - startTimeMs)) * plotWidth;
+            const toY = (value) => plotTop + plotHeight - ((value - minValue) / (maxValue - minValue)) * plotHeight;
+
+            const points = sortedItems.map((item) => {
+                const x = toX(item.timeMs);
+                const y = toY(item.value);
+                const point = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                point.setAttribute('cx', x.toFixed(2));
+                point.setAttribute('cy', y.toFixed(2));
+                point.setAttribute('r', '2.4');
+                point.setAttribute('fill', '#38bdf8');
+                pointLayer.appendChild(point);
                 return `${x.toFixed(2)},${y.toFixed(2)}`;
             });
             line.setAttribute('points', points.join(' '));
-            const latestValue = items[items.length - 1].value.toFixed(2);
-            title.textContent = `${metricName === 'cpu_percent' ? 'CPU' : 'RAM'} trend, latest: ${latestValue}%`;
+            const latestValue = sortedItems[sortedItems.length - 1].value.toFixed(2);
+            title.textContent = `${metricName === 'cpu_percent' ? 'CPU' : 'RAM'} trend (${safeInterval} min), latest: ${latestValue}%`;
         }
 
         function renderLatestSummary(items, node) {
@@ -795,7 +876,7 @@ def dashboard() -> str:
             const metricName = document.getElementById('graph-metric-select').value;
             const interval = document.getElementById('graph-interval-select').value;
             if (!nodeId) {
-                renderGraph([], metricName);
+                renderGraph([], metricName, interval);
                 setStatus('graph-status', 'Waiting for nodes to send data.');
                 return;
             }
@@ -803,10 +884,10 @@ def dashboard() -> str:
                 const data = await fetchJson(
                     `/api/metrics/history?node_id=${encodeURIComponent(nodeId)}&metric_name=${encodeURIComponent(metricName)}&interval_minutes=${encodeURIComponent(interval)}`
                 );
-                renderGraph(data.items, metricName);
+                renderGraph(data.items, metricName, interval);
                 setStatus('graph-status', data.items.length ? '' : 'No recent points for selected options.');
             } catch (error) {
-                renderGraph([], metricName);
+                renderGraph([], metricName, interval);
                 setStatus('graph-status', error.message, true);
             }
         }
