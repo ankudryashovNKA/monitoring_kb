@@ -6,8 +6,19 @@ from datetime import datetime, timedelta, timezone
 from typing import Deque
 
 from fastapi import FastAPI, HTTPException
+
+from app.api.users import router as users_router
+from app.db.base import Base
+from app.db.session import SessionLocal, engine
+import app.models.metric  # noqa: F401
+import app.models.node  # noqa: F401
+import app.models.user  # noqa: F401
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import func
+
+from app.models.metric import Metric
+from app.models.node import Node
 
 RETENTION_PERIOD = timedelta(hours=1)
 RECENT_POINTS_LIMIT = 10
@@ -48,8 +59,24 @@ class NodeRenameIn(BaseModel):
 
 
 app = FastAPI(title="Monitoring KB MVP")
+app.include_router(users_router)
+
+
+def init_db() -> None:
+    # For production use Alembic migrations instead of create_all.
+    Base.metadata.create_all(bind=engine)
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    init_db()
+
+
+# Backward-compatible placeholders used by legacy tests.
 _storage: dict[str, Deque[MetricPoint]] = defaultdict(deque)
 _nodes: dict[str, NodeInfo] = {}
+
+init_db()
 
 
 def _utcnow() -> datetime:
@@ -82,60 +109,116 @@ def ingest_metric(metric: MetricIn) -> dict[str, str]:
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=timezone.utc)
 
-    point = MetricPoint(
-        node_id=metric.node_id,
-        cpu_percent=metric.cpu_percent,
-        ram_percent=metric.ram_percent,
-        timestamp=timestamp.astimezone(timezone.utc),
-    )
-    points = _storage[metric.node_id]
-    points.append(point)
-    _prune(points, _utcnow())
+    normalized_timestamp = timestamp.astimezone(timezone.utc)
+    cutoff = _utcnow() - RETENTION_PERIOD
 
-    existing_name = _nodes[metric.node_id].display_name if metric.node_id in _nodes else metric.node_id
-    _nodes[metric.node_id] = NodeInfo(
-        node_id=metric.node_id,
-        display_name=existing_name,
-        os_name=metric.os_name,
-        cpu_cores=metric.cpu_cores,
-        ram_total_mb=metric.ram_total_mb,
-        ip_address=metric.ip_address,
-        last_seen=point.timestamp,
-    )
+    with SessionLocal() as db:
+        db.query(Metric).filter(Metric.timestamp < cutoff).delete(synchronize_session=False)
+
+        node = db.query(Node).filter(Node.node_id == metric.node_id).first()
+        if node is None:
+            node = Node(
+                node_id=metric.node_id,
+                display_name=metric.node_id,
+                os_name=metric.os_name,
+                cpu_cores=metric.cpu_cores,
+                ram_total_mb=metric.ram_total_mb,
+                ip_address=metric.ip_address,
+                last_seen=normalized_timestamp,
+            )
+            db.add(node)
+        else:
+            node.os_name = metric.os_name
+            node.cpu_cores = metric.cpu_cores
+            node.ram_total_mb = metric.ram_total_mb
+            node.ip_address = metric.ip_address
+            node.last_seen = normalized_timestamp
+
+        db.add(
+            Metric(
+                node_id=metric.node_id,
+                cpu_percent=metric.cpu_percent,
+                ram_percent=metric.ram_percent,
+                timestamp=normalized_timestamp,
+            )
+        )
+        db.commit()
     return {"status": "ok"}
 
 
 @app.get("/api/metrics")
 def list_metrics(node_id: str | None = None) -> dict[str, list[dict[str, str | float]]]:
     now = _utcnow()
-    if node_id:
-        points = _storage.get(node_id)
-        if points is None:
-            raise HTTPException(status_code=404, detail="Node not found")
-        _prune(points, now)
-        return {"items": [_serialize_metric(point) for point in list(points)[-RECENT_POINTS_LIMIT:]]}
+    cutoff = now - RETENTION_PERIOD
 
-    items: list[dict[str, str | float]] = []
-    for points in _storage.values():
-        _prune(points, now)
-        items.extend(_serialize_metric(point) for point in list(points)[-RECENT_POINTS_LIMIT:])
-    items.sort(key=lambda item: item["timestamp"])
-    return {"items": items[-RECENT_POINTS_LIMIT:]}
+    with SessionLocal() as db:
+        db.query(Metric).filter(Metric.timestamp < cutoff).delete(synchronize_session=False)
+        db.commit()
+
+        query = (
+            db.query(Metric, Node.display_name)
+            .join(Node, Node.node_id == Metric.node_id)
+            .filter(Metric.timestamp >= cutoff)
+        )
+        if node_id:
+            node_exists = db.query(Node.node_id).filter(Node.node_id == node_id).first()
+            if node_exists is None:
+                raise HTTPException(status_code=404, detail="Node not found")
+            query = query.filter(Metric.node_id == node_id)
+
+        rows = query.order_by(Metric.timestamp.desc()).limit(RECENT_POINTS_LIMIT).all()
+        items = [
+            {
+                "node_id": metric.node_id,
+                "cpu_percent": metric.cpu_percent,
+                "ram_percent": metric.ram_percent,
+                "timestamp": metric.timestamp.isoformat(),
+                "display_name": display_name,
+            }
+            for metric, display_name in rows
+        ]
+        items.reverse()
+        return {"items": items}
 
 
 @app.get("/api/nodes")
 def list_nodes() -> dict[str, list[dict[str, str | int]]]:
-    nodes = sorted(_nodes.values(), key=lambda node: node.display_name.lower())
-    return {"items": [_serialize_node(node) for node in nodes]}
+    with SessionLocal() as db:
+        nodes = db.query(Node).order_by(func.lower(Node.display_name)).all()
+        items = [
+            {
+                "node_id": node.node_id,
+                "display_name": node.display_name,
+                "os_name": node.os_name,
+                "cpu_cores": node.cpu_cores,
+                "ram_total_mb": node.ram_total_mb,
+                "ip_address": node.ip_address,
+                "last_seen": node.last_seen.isoformat(),
+            }
+            for node in nodes
+        ]
+        return {"items": items}
 
 
 @app.patch("/api/nodes/{node_id}")
 def rename_node(node_id: str, payload: NodeRenameIn) -> dict[str, str | int]:
-    node = _nodes.get(node_id)
-    if node is None:
-        raise HTTPException(status_code=404, detail="Node not found")
-    node.display_name = payload.display_name
-    return _serialize_node(node)
+    with SessionLocal() as db:
+        node = db.query(Node).filter(Node.node_id == node_id).first()
+        if node is None:
+            raise HTTPException(status_code=404, detail="Node not found")
+
+        node.display_name = payload.display_name
+        db.commit()
+        db.refresh(node)
+        return {
+            "node_id": node.node_id,
+            "display_name": node.display_name,
+            "os_name": node.os_name,
+            "cpu_cores": node.cpu_cores,
+            "ram_total_mb": node.ram_total_mb,
+            "ip_address": node.ip_address,
+            "last_seen": node.last_seen.isoformat(),
+        }
 
 
 @app.get("/", response_class=HTMLResponse)

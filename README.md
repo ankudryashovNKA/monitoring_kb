@@ -4,16 +4,34 @@ MVP системы мониторинга состоит из:
 
 - **FastAPI-сервера**, который принимает метрики CPU/RAM от удалённых узлов;
 - **агента** на `psutil`, который раз в минуту собирает данные и отправляет их на сервер;
-- **веб-дашборда** с левым скрываемым меню и вкладками `Latest data` / `Nodes`.
+- **веб-дашборда** с левым скрываемым меню и вкладками `Latest data` / `Nodes`;
+- **SQLAlchemy-подключения к Supabase PostgreSQL** и CRUD-примеров для `User`.
 
 ## Что реализовано
 
 - Приём метрик через `POST /api/metrics`.
-- Хранение метрик в памяти сервера в течение **1 часа**.
+- Хранение метрик и узлов в базе данных (Supabase PostgreSQL через SQLAlchemy).
+- Политика retention: метрики старше 1 часа удаляются при запросах/записи.
 - Получение последних значений через `GET /api/metrics`.
 - Получение списка узлов и их параметров через `GET /api/nodes`.
 - Переименование узла через `PATCH /api/nodes/{node_id}`.
-- Дашборд с выбором узла для просмотра **10 последних записей** и отдельной вкладкой со всеми узлами.
+- CRUD для пользователей:
+  - `POST /api/users`
+  - `GET /api/users`
+  - `GET /api/users/{user_id}`
+
+## Конфигурация БД (Supabase)
+
+1. Скопируйте `.env.example` в `.env` и заполните значения.
+2. Используются переменные:
+   - `SUPABASE_DB_HOST`
+   - `SUPABASE_DB_PORT`
+   - `SUPABASE_DB_NAME`
+   - `SUPABASE_DB_USER`
+   - `SUPABASE_DB_PASSWORD`
+3. `DATABASE_URL` собирается автоматически из этих переменных в `app/config.py`.
+
+> Примечание: если переменные не заданы, для локального запуска используется `sqlite:///./monitoring.db`.
 
 ## Запуск сервера
 
@@ -24,6 +42,9 @@ pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
+При старте вызывается `Base.metadata.create_all(...)` для создания таблиц.
+Для production рекомендуется использовать миграции (например, Alembic).
+
 ## Запуск агента
 
 ```bash
@@ -32,47 +53,24 @@ python agent.py --server-url http://127.0.0.1:8000 --node-id node-1
 
 По умолчанию агент отправляет данные каждые **60 секунд**.
 
-## API
+## Быстрая проверка User CRUD
 
-### Отправка метрик
+### Создать пользователя
 
 ```bash
-curl -X POST http://127.0.0.1:8000/api/metrics \
+curl -X POST http://127.0.0.1:8000/api/users \
   -H 'Content-Type: application/json' \
-  -d '{
-    "node_id": "node-1",
-    "cpu_percent": 17.2,
-    "ram_percent": 46.8,
-    "os_name": "Ubuntu 24.04",
-    "cpu_cores": 8,
-    "ram_total_mb": 16384,
-    "ip_address": "10.0.0.15"
-  }'
+  -d '{"email": "admin@example.com"}'
 ```
 
-### Получение последних метрик
+### Получить всех пользователей
 
 ```bash
-curl http://127.0.0.1:8000/api/metrics
-curl http://127.0.0.1:8000/api/metrics?node_id=node-1
+curl http://127.0.0.1:8000/api/users
 ```
 
-### Получение списка узлов
+### Получить пользователя по ID
 
 ```bash
-curl http://127.0.0.1:8000/api/nodes
+curl http://127.0.0.1:8000/api/users/1
 ```
-
-### Переименование узла
-
-```bash
-curl -X PATCH http://127.0.0.1:8000/api/nodes/node-1 \
-  -H 'Content-Type: application/json' \
-  -d '{"display_name": "Primary node"}'
-```
-
-## Ограничения MVP
-
-- Хранилище находится **в памяти процесса** и очищается при перезапуске.
-- Нет аутентификации агентов.
-- Нет базы данных и долгосрочного хранения.
