@@ -63,8 +63,14 @@ class NodeRenameIn(BaseModel):
 
 class TriggerCreateIn(BaseModel):
     node_id: str = Field(..., min_length=1, max_length=100)
+    name: str = Field("Trigger", min_length=1, max_length=120)
     metric_name: str = Field(..., pattern="^(cpu_percent|ram_percent)$")
     operator: str = Field(..., pattern="^(>|<)$")
+    threshold: float = Field(..., ge=0, le=100)
+
+
+class TriggerUpdateIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
     threshold: float = Field(..., ge=0, le=100)
 
 
@@ -134,6 +140,7 @@ def _serialize_trigger(
         "id": trigger.id,
         "node_id": trigger.node_id,
         "node_display_name": node_display_name,
+        "name": trigger.name,
         "metric_name": trigger.metric_name,
         "operator": trigger.operator,
         "threshold": trigger.threshold,
@@ -297,6 +304,17 @@ def rename_node(node_id: str, payload: NodeRenameIn) -> dict[str, str | int]:
         }
 
 
+@app.delete("/api/nodes/{node_id}")
+def delete_node(node_id: str) -> dict[str, str]:
+    with SessionLocal() as db:
+        node = db.query(Node).filter(Node.node_id == node_id).first()
+        if node is None:
+            raise HTTPException(status_code=404, detail="Node not found")
+        db.delete(node)
+        db.commit()
+    return {"status": "ok"}
+
+
 @app.post("/api/triggers")
 def create_trigger(payload: TriggerCreateIn) -> dict[str, str | float | int | bool | None]:
     with SessionLocal() as db:
@@ -306,6 +324,7 @@ def create_trigger(payload: TriggerCreateIn) -> dict[str, str | float | int | bo
 
         trigger = Trigger(
             node_id=payload.node_id,
+            name=payload.name,
             metric_name=payload.metric_name,
             operator=payload.operator,
             threshold=payload.threshold,
@@ -322,6 +341,42 @@ def create_trigger(payload: TriggerCreateIn) -> dict[str, str | float | int | bo
             .first()
         )
         return _serialize_trigger(trigger, node.display_name, latest_metric)
+
+
+@app.patch("/api/triggers/{trigger_id}")
+def update_trigger(trigger_id: int, payload: TriggerUpdateIn) -> dict[str, str | float | int | bool | None]:
+    with SessionLocal() as db:
+        trigger = db.query(Trigger).filter(Trigger.id == trigger_id).first()
+        if trigger is None:
+            raise HTTPException(status_code=404, detail="Trigger not found")
+
+        trigger.name = payload.name
+        trigger.threshold = payload.threshold
+        db.commit()
+        db.refresh(trigger)
+
+        node = db.query(Node).filter(Node.node_id == trigger.node_id).first()
+        if node is None:
+            raise HTTPException(status_code=404, detail="Node not found")
+
+        latest_metric = (
+            db.query(Metric)
+            .filter(Metric.node_id == trigger.node_id)
+            .order_by(Metric.timestamp.desc())
+            .first()
+        )
+        return _serialize_trigger(trigger, node.display_name, latest_metric)
+
+
+@app.delete("/api/triggers/{trigger_id}")
+def delete_trigger(trigger_id: int) -> dict[str, str]:
+    with SessionLocal() as db:
+        trigger = db.query(Trigger).filter(Trigger.id == trigger_id).first()
+        if trigger is None:
+            raise HTTPException(status_code=404, detail="Trigger not found")
+        db.delete(trigger)
+        db.commit()
+    return {"status": "ok"}
 
 
 @app.get("/api/triggers")
@@ -397,21 +452,21 @@ def dashboard() -> str:
     <style>
         :root {
             color-scheme: dark;
-            --bg: #020617;
-            --panel: #0f172a;
-            --panel-alt: #111827;
-            --border: #334155;
-            --text: #e2e8f0;
-            --muted: #94a3b8;
-            --accent: #38bdf8;
-            --accent-soft: rgba(56, 189, 248, 0.12);
-            --danger: #fb7185;
+            --bg: #111317;
+            --panel: #1b1f26;
+            --panel-alt: #232832;
+            --border: #3d4350;
+            --text: #eef1f6;
+            --muted: #a9b1c0;
+            --accent: #6f8fbd;
+            --accent-soft: rgba(111, 143, 189, 0.2);
+            --danger: #d47b7b;
         }
         * { box-sizing: border-box; }
         body {
             margin: 0;
             font-family: Arial, sans-serif;
-            background: linear-gradient(180deg, #020617 0%, #0f172a 100%);
+            background: linear-gradient(180deg, #0f1217 0%, #171c24 100%);
             color: var(--text);
         }
         .layout {
@@ -420,7 +475,7 @@ def dashboard() -> str:
         }
         .sidebar {
             width: 260px;
-            background: rgba(15, 23, 42, 0.98);
+            background: rgba(24, 28, 35, 0.98);
             border-right: 1px solid var(--border);
             padding: 1.25rem 1rem;
             transition: width 0.25s ease, padding 0.25s ease;
@@ -446,9 +501,9 @@ def dashboard() -> str:
             display: none;
         }
         .toggle-btn, .nav-btn, button, select, input {
-            border-radius: 0.75rem;
+            border-radius: 0.65rem;
             border: 1px solid var(--border);
-            background: #0b1120;
+            background: #262c37;
             color: var(--text);
         }
         .toggle-btn, .nav-btn, button {
@@ -485,11 +540,11 @@ def dashboard() -> str:
             padding: 2rem;
         }
         .panel {
-            background: rgba(15, 23, 42, 0.85);
+            background: rgba(27, 31, 38, 0.92);
             border: 1px solid var(--border);
             border-radius: 1.25rem;
             padding: 1.5rem;
-            box-shadow: 0 20px 45px rgba(2, 6, 23, 0.35);
+            box-shadow: 0 16px 28px rgba(0, 0, 0, 0.25);
         }
         .page-header {
             margin-bottom: 1.25rem;
@@ -513,6 +568,10 @@ def dashboard() -> str:
             background: var(--accent-soft);
             border-color: var(--accent);
         }
+        button.danger {
+            border-color: var(--danger);
+            background: rgba(212, 123, 123, 0.16);
+        }
         button.secondary {
             background: transparent;
             border-color: var(--border);
@@ -521,7 +580,7 @@ def dashboard() -> str:
             width: 100%;
             border-collapse: collapse;
             margin-top: 1rem;
-            background: rgba(2, 6, 23, 0.35);
+            background: rgba(17, 19, 23, 0.55);
             border-radius: 1rem;
             overflow: hidden;
         }
@@ -532,7 +591,7 @@ def dashboard() -> str:
             vertical-align: top;
         }
         th {
-            background: rgba(30, 41, 59, 0.8);
+            background: rgba(42, 48, 58, 0.88);
         }
         tr:last-child td { border-bottom: none; }
         .grid {
@@ -542,18 +601,35 @@ def dashboard() -> str:
             margin-bottom: 1rem;
         }
         .stat {
-            background: rgba(2, 6, 23, 0.35);
+            background: rgba(17, 19, 23, 0.55);
             border: 1px solid var(--border);
             border-radius: 1rem;
             padding: 1rem;
         }
         .stat-label { color: var(--muted); font-size: 0.9rem; }
         .stat-value { font-size: 1.5rem; font-weight: bold; margin-top: 0.35rem; }
-        .rename-form {
+        .menu-cell {
+            position: relative;
+            text-align: right;
+            width: 64px;
+        }
+        .menu-btn {
+            min-height: 34px;
+            padding: 0.3rem 0.6rem;
+            line-height: 1;
+        }
+        .menu-popover {
+            position: absolute;
+            right: 0.5rem;
+            top: 2.5rem;
+            z-index: 4;
             display: flex;
-            gap: 0.5rem;
-            flex-wrap: wrap;
-            margin-top: 0.5rem;
+            flex-direction: column;
+            gap: 0.35rem;
+            padding: 0.5rem;
+            border: 1px solid var(--border);
+            border-radius: 0.65rem;
+            background: #202630;
         }
         .empty, .status {
             color: var(--muted);
@@ -578,11 +654,11 @@ def dashboard() -> str:
                 <button id="sidebar-toggle" class="toggle-btn" type="button" aria-label="Toggle menu">☰</button>
             </div>
             <nav class="nav">
-                <button class="nav-btn active" data-tab="latest" type="button"><span>📈</span><span class="nav-label">Latest data</span></button>
-                <button class="nav-btn" data-tab="nodes" type="button"><span>🖥️</span><span class="nav-label">Nodes</span></button>
-                <button class="nav-btn" data-tab="graphs" type="button"><span>📊</span><span class="nav-label">Graphs</span></button>
-                <button class="nav-btn" data-tab="triggers" type="button"><span>🚨</span><span class="nav-label">Triggers</span></button>
-                <button class="nav-btn" data-tab="problems" type="button"><span>❗</span><span class="nav-label">Problems</span></button>
+                <button class="nav-btn active" data-tab="latest" type="button"><span class="nav-label">Latest data</span></button>
+                <button class="nav-btn" data-tab="nodes" type="button"><span class="nav-label">Nodes</span></button>
+                <button class="nav-btn" data-tab="graphs" type="button"><span class="nav-label">Graphs</span></button>
+                <button class="nav-btn" data-tab="triggers" type="button"><span class="nav-label">Triggers</span></button>
+                <button class="nav-btn" data-tab="problems" type="button"><span class="nav-label">Problems</span></button>
             </nav>
         </aside>
         <main class="content">
@@ -623,12 +699,12 @@ def dashboard() -> str:
                     <thead>
                         <tr>
                             <th>Name</th>
-                            <th>Node ID</th>
                             <th>OS</th>
                             <th>CPU cores</th>
                             <th>RAM</th>
                             <th>IP</th>
                             <th>Last seen (UTC)</th>
+                            <th></th>
                         </tr>
                     </thead>
                     <tbody id="nodes-body"></tbody>
@@ -688,6 +764,10 @@ def dashboard() -> str:
                         <select id="trigger-node-select" required></select>
                     </label>
                     <label>
+                        <span class="meta">Name</span><br />
+                        <input id="trigger-name-input" type="text" maxlength="120" value="Resource threshold" required />
+                    </label>
+                    <label>
                         <span class="meta">Metric</span><br />
                         <select id="trigger-metric-select">
                             <option value="cpu_percent">CPU %</option>
@@ -711,12 +791,13 @@ def dashboard() -> str:
                 <table>
                     <thead>
                         <tr>
-                            <th>ID</th>
                             <th>Node</th>
+                            <th>Name</th>
                             <th>Condition</th>
                             <th>Latest value</th>
                             <th>Status</th>
                             <th>Created (UTC)</th>
+                            <th></th>
                         </tr>
                     </thead>
                     <tbody id="triggers-body"></tbody>
@@ -735,8 +816,8 @@ def dashboard() -> str:
                 <table>
                     <thead>
                         <tr>
-                            <th>Trigger ID</th>
                             <th>Node</th>
+                            <th>Trigger</th>
                             <th>Condition</th>
                             <th>Latest value</th>
                             <th>Created (UTC)</th>
@@ -756,7 +837,7 @@ def dashboard() -> str:
             latestSelectedNodeId: '',
             graphSelectedNodeId: '',
             triggerSelectedNodeId: '',
-            nodeNameDrafts: {},
+            activeMenuKey: '',
             activeTab: 'latest',
         };
 
@@ -828,7 +909,7 @@ def dashboard() -> str:
             for (const node of state.nodes) {
                 const option = document.createElement('option');
                 option.value = node.node_id;
-                option.textContent = `${node.display_name} (${node.node_id})`;
+                option.textContent = node.display_name;
                 select.appendChild(option);
                 graphSelect.appendChild(option.cloneNode(true));
                 triggerSelect.appendChild(option.cloneNode(true));
@@ -975,7 +1056,7 @@ def dashboard() -> str:
                 const row = document.createElement('tr');
                 row.innerHTML = `
                     <td>${formatUtc(item.timestamp)}</td>
-                    <td>${item.display_name || item.node_id}</td>
+                    <td>${item.display_name || 'Unknown node'}</td>
                     <td>${item.cpu_percent.toFixed(2)}</td>
                     <td>${item.ram_percent.toFixed(2)}</td>
                 `;
@@ -992,58 +1073,27 @@ def dashboard() -> str:
             }
 
             for (const node of state.nodes) {
-                const inputValue = Object.prototype.hasOwnProperty.call(state.nodeNameDrafts, node.node_id)
-                    ? state.nodeNameDrafts[node.node_id]
-                    : node.display_name;
                 const row = document.createElement('tr');
+                const menuKey = `node:${node.node_id}`;
                 row.innerHTML = `
                     <td>
                         <strong>${node.display_name}</strong>
-                        <form class="rename-form" data-node-id="${node.node_id}">
-                            <input name="display_name" value="${inputValue}" aria-label="Display name for ${node.node_id}" />
-                            <button type="submit">Save</button>
-                        </form>
                     </td>
-                    <td>${node.node_id}</td>
                     <td>${node.os_name}</td>
                     <td>${node.cpu_cores}</td>
                     <td>${formatRamMb(node.ram_total_mb)}</td>
                     <td>${node.ip_address}</td>
                     <td>${formatUtc(node.last_seen)}</td>
+                    <td class="menu-cell">
+                        <button type="button" class="menu-btn secondary" data-menu-toggle="${menuKey}" aria-label="Node actions">...</button>
+                        <div class="menu-popover" data-menu="${menuKey}" hidden>
+                            <button type="button" data-node-action="rename" data-node-id="${node.node_id}">Rename</button>
+                            <button type="button" class="danger" data-node-action="delete" data-node-id="${node.node_id}">Delete</button>
+                        </div>
+                    </td>
                 `;
                 body.appendChild(row);
             }
-
-            body.querySelectorAll('.rename-form').forEach((form) => {
-                const input = form.querySelector('input[name="display_name"]');
-                input.addEventListener('input', () => {
-                    const nodeId = form.dataset.nodeId;
-                    state.nodeNameDrafts[nodeId] = input.value;
-                });
-                form.addEventListener('submit', async (event) => {
-                    event.preventDefault();
-                    const nodeId = form.dataset.nodeId;
-                    const formData = new FormData(form);
-                    const displayName = String(formData.get('display_name') || '').trim();
-                    if (!displayName) {
-                        setStatus('nodes-status', 'Display name cannot be empty.', true);
-                        return;
-                    }
-                    try {
-                        await fetchJson(`/api/nodes/${encodeURIComponent(nodeId)}`, {
-                            method: 'PATCH',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ display_name: displayName }),
-                        });
-                        delete state.nodeNameDrafts[nodeId];
-                        setStatus('nodes-status', `Saved new name for ${nodeId}.`);
-                        await loadNodes();
-                        await loadLatestMetrics();
-                    } catch (error) {
-                        setStatus('nodes-status', error.message, true);
-                    }
-                });
-            });
         }
 
         function metricLabel(metricName) {
@@ -1054,19 +1104,27 @@ def dashboard() -> str:
             const body = document.getElementById('triggers-body');
             body.innerHTML = '';
             if (!state.triggers.length) {
-                body.innerHTML = '<tr><td colspan="6" class="empty">No triggers created for the selected node.</td></tr>';
+                body.innerHTML = '<tr><td colspan="7" class="empty">No triggers created for the selected node.</td></tr>';
                 return;
             }
             for (const trigger of state.triggers) {
                 const latestValue = trigger.latest_value == null ? 'No data' : `${Number(trigger.latest_value).toFixed(2)}%`;
+                const menuKey = `trigger:${trigger.id}`;
                 const row = document.createElement('tr');
                 row.innerHTML = `
-                    <td>${trigger.id}</td>
-                    <td>${trigger.node_display_name} (${trigger.node_id})</td>
+                    <td>${trigger.node_display_name}</td>
+                    <td>${trigger.name}</td>
                     <td>${metricLabel(trigger.metric_name)} ${trigger.operator} ${Number(trigger.threshold).toFixed(2)}%</td>
                     <td>${latestValue}</td>
                     <td>${trigger.is_active ? 'Active' : 'OK'}</td>
                     <td>${formatUtc(trigger.created_at)}</td>
+                    <td class="menu-cell">
+                        <button type="button" class="menu-btn secondary" data-menu-toggle="${menuKey}" aria-label="Trigger actions">...</button>
+                        <div class="menu-popover" data-menu="${menuKey}" hidden>
+                            <button type="button" data-trigger-action="edit" data-trigger-id="${trigger.id}" data-trigger-name="${trigger.name}" data-trigger-threshold="${trigger.threshold}">Edit</button>
+                            <button type="button" class="danger" data-trigger-action="delete" data-trigger-id="${trigger.id}">Delete</button>
+                        </div>
+                    </td>
                 `;
                 body.appendChild(row);
             }
@@ -1083,8 +1141,8 @@ def dashboard() -> str:
                 const latestValue = trigger.latest_value == null ? 'No data' : `${Number(trigger.latest_value).toFixed(2)}%`;
                 const row = document.createElement('tr');
                 row.innerHTML = `
-                    <td>${trigger.id}</td>
-                    <td>${trigger.node_display_name} (${trigger.node_id})</td>
+                    <td>${trigger.node_display_name}</td>
+                    <td>${trigger.name}</td>
                     <td>${metricLabel(trigger.metric_name)} ${trigger.operator} ${Number(trigger.threshold).toFixed(2)}%</td>
                     <td>${latestValue}</td>
                     <td>${formatUtc(trigger.created_at)}</td>
@@ -1097,6 +1155,13 @@ def dashboard() -> str:
             const element = document.getElementById(id);
             element.textContent = message;
             element.classList.toggle('error', isError);
+        }
+
+        function closeAllMenus() {
+            document.querySelectorAll('.menu-popover').forEach((menu) => {
+                menu.hidden = true;
+            });
+            state.activeMenuKey = '';
         }
 
         async function loadNodes() {
@@ -1225,6 +1290,11 @@ def dashboard() -> str:
                 setStatus('triggers-status', 'Choose a node first.', true);
                 return;
             }
+            const triggerName = document.getElementById('trigger-name-input').value.trim();
+            if (!triggerName) {
+                setStatus('triggers-status', 'Trigger name cannot be empty.', true);
+                return;
+            }
             const threshold = Number(document.getElementById('trigger-threshold-input').value);
             if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) {
                 setStatus('triggers-status', 'Threshold must be between 0 and 100.', true);
@@ -1236,6 +1306,7 @@ def dashboard() -> str:
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         node_id: state.triggerSelectedNodeId,
+                        name: triggerName,
                         metric_name: document.getElementById('trigger-metric-select').value,
                         operator: document.getElementById('trigger-operator-select').value,
                         threshold,
@@ -1249,6 +1320,100 @@ def dashboard() -> str:
             }
         });
         document.getElementById('refresh-problems').addEventListener('click', loadProblems);
+        document.addEventListener('click', async (event) => {
+            const toggleButton = event.target.closest('[data-menu-toggle]');
+            if (toggleButton) {
+                const key = toggleButton.dataset.menuToggle;
+                const menu = document.querySelector(`[data-menu="${key}"]`);
+                const shouldOpen = state.activeMenuKey !== key;
+                closeAllMenus();
+                if (menu && shouldOpen) {
+                    menu.hidden = false;
+                    state.activeMenuKey = key;
+                }
+                return;
+            }
+
+            const nodeActionButton = event.target.closest('[data-node-action]');
+            if (nodeActionButton) {
+                closeAllMenus();
+                const action = nodeActionButton.dataset.nodeAction;
+                const nodeId = nodeActionButton.dataset.nodeId;
+                if (action === 'rename') {
+                    const node = state.nodes.find((item) => item.node_id === nodeId);
+                    const nextName = window.prompt('Enter new node name:', node ? node.display_name : '');
+                    if (!nextName) return;
+                    try {
+                        await fetchJson(`/api/nodes/${encodeURIComponent(nodeId)}`, {
+                            method: 'PATCH',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ display_name: nextName.trim() }),
+                        });
+                        setStatus('nodes-status', 'Node renamed.');
+                        await loadNodes();
+                    } catch (error) {
+                        setStatus('nodes-status', error.message, true);
+                    }
+                }
+                if (action === 'delete') {
+                    if (!window.confirm('Delete node with all related data?')) return;
+                    try {
+                        await fetchJson(`/api/nodes/${encodeURIComponent(nodeId)}`, { method: 'DELETE' });
+                        setStatus('nodes-status', 'Node deleted.');
+                        await refreshAll();
+                    } catch (error) {
+                        setStatus('nodes-status', error.message, true);
+                    }
+                }
+                return;
+            }
+
+            const triggerActionButton = event.target.closest('[data-trigger-action]');
+            if (triggerActionButton) {
+                closeAllMenus();
+                const action = triggerActionButton.dataset.triggerAction;
+                const triggerId = triggerActionButton.dataset.triggerId;
+                if (action === 'edit') {
+                    const nextName = window.prompt('Trigger name:', triggerActionButton.dataset.triggerName || '');
+                    if (!nextName) return;
+                    const thresholdRaw = window.prompt('Threshold (0-100):', triggerActionButton.dataset.triggerThreshold || '');
+                    if (!thresholdRaw) return;
+                    const threshold = Number(thresholdRaw);
+                    if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) {
+                        setStatus('triggers-status', 'Threshold must be between 0 and 100.', true);
+                        return;
+                    }
+                    try {
+                        await fetchJson(`/api/triggers/${encodeURIComponent(triggerId)}`, {
+                            method: 'PATCH',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ name: nextName.trim(), threshold }),
+                        });
+                        setStatus('triggers-status', 'Trigger updated.');
+                        await loadTriggers();
+                        await loadProblems();
+                    } catch (error) {
+                        setStatus('triggers-status', error.message, true);
+                    }
+                }
+                if (action === 'delete') {
+                    if (!window.confirm('Delete this trigger?')) return;
+                    try {
+                        await fetchJson(`/api/triggers/${encodeURIComponent(triggerId)}`, { method: 'DELETE' });
+                        setStatus('triggers-status', 'Trigger deleted.');
+                        await loadTriggers();
+                        await loadProblems();
+                    } catch (error) {
+                        setStatus('triggers-status', error.message, true);
+                    }
+                }
+                return;
+            }
+
+            if (!event.target.closest('.menu-popover')) {
+                closeAllMenus();
+            }
+        });
 
         async function refreshAll() {
             await loadNodes();
