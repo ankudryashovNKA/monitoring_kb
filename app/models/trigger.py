@@ -13,6 +13,7 @@ class Trigger(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     node_id: Mapped[str] = mapped_column(String(100), ForeignKey("nodes.node_id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
     metric_name: Mapped[str] = mapped_column(String(20), nullable=False)
     operator: Mapped[str] = mapped_column(String(2), nullable=False)
     threshold: Mapped[float] = mapped_column(Float, nullable=False)
