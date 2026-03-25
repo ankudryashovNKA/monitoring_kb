@@ -7,9 +7,11 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from main import (  # noqa: E402
     RECENT_POINTS_LIMIT,
+    _normalize_kb_results,
     TriggerCreateIn,
     create_trigger,
     dashboard,
+    get_knowledge_base,
     ingest_metric,
     list_metric_history,
     list_metrics,
@@ -87,6 +89,7 @@ def test_dashboard_page_available() -> None:
     assert "Graphs" in html
     assert "Triggers" in html
     assert "Problems" in html
+    assert "Knowledge Base" in html
 
 
 def test_metric_history() -> None:
@@ -153,3 +156,31 @@ def test_triggers_and_problems() -> None:
     problems = list_problems()["items"]
     assert len(problems) == 1
     assert problems[0]["node_id"] == "node-alert"
+
+
+def test_knowledge_base_normalization_and_endpoint() -> None:
+    payload = {
+        "id": 4206,
+        "date": "Wednesday, March 25, 2026",
+        "presetName": "Monitoring server",
+        "presetId": 733,
+        "results": [
+            {
+                "key": 8972,
+                "id": 5071,
+                "name": "Утечка памяти",
+                "description": "",
+                "explanatorySet": [
+                    {"fakeId": 22823, "id": 5074, "name": "Memory_Utilization", "description": ""},
+                    {"fakeId": 22824, "id": 5079, "name": "Swap_Usage", "description": ""},
+                ],
+            }
+        ],
+    }
+    normalized = _normalize_kb_results(payload)
+    assert normalized[0]["name"] == "Утечка памяти"
+    assert normalized[0]["explanatory_set"][0]["name"] == "Memory_Utilization"
+
+    response = get_knowledge_base()
+    assert "status" in response
+    assert "items" in response

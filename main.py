@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+import contextlib
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+import asyncio
+import logging
 import operator
 from typing import Deque
 
 from fastapi import FastAPI, HTTPException, Query
+import httpx
 
 from app.api.users import router as users_router
+from app.config import settings
 from app.db.base import Base
 from app.db.session import SessionLocal, engine
 import app.models.metric  # noqa: F401
@@ -25,6 +30,9 @@ from app.models.trigger import Trigger
 
 RETENTION_PERIOD = timedelta(hours=1)
 RECENT_POINTS_LIMIT = 10
+KB_POLL_INTERVAL_SECONDS = 600
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -74,8 +82,27 @@ class TriggerUpdateIn(BaseModel):
     threshold: float = Field(..., ge=0, le=100)
 
 
+class KBExplanatoryItem(BaseModel):
+    name: str
+    description: str = ""
+
+
+class KBResultItem(BaseModel):
+    name: str
+    description: str = ""
+    explanatorySet: list[KBExplanatoryItem] = Field(default_factory=list)
+
+
+class KBSolveResponse(BaseModel):
+    results: list[KBResultItem] = Field(default_factory=list)
+
+
 app = FastAPI(title="Monitoring KB MVP")
 app.include_router(users_router)
+
+_kb_results_cache: list[dict[str, str | list[dict[str, str]]]] = []
+_kb_last_updated: datetime | None = None
+_kb_last_error: str | None = None
 
 
 def init_db() -> None:
@@ -83,9 +110,78 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
 
 
+def _knowledge_base_enabled() -> bool:
+    return bool(settings.kb_id and settings.kb_jwt_token)
+
+
+def _normalize_kb_results(payload: dict) -> list[dict[str, str | list[dict[str, str]]]]:
+    response = KBSolveResponse.model_validate(payload)
+    return [
+        {
+            "name": result.name,
+            "description": result.description,
+            "explanatory_set": [
+                {"name": explanatory.name, "description": explanatory.description}
+                for explanatory in result.explanatorySet
+            ],
+        }
+        for result in response.results
+    ]
+
+
+async def _fetch_knowledge_base_once() -> None:
+    global _kb_results_cache, _kb_last_updated, _kb_last_error
+    if not _knowledge_base_enabled():
+        _kb_last_error = "Knowledge Base integration disabled: missing KB_ID or KB_JWT_TOKEN."
+        return
+
+    assert settings.kb_id is not None
+    assert settings.kb_jwt_token is not None
+    url = f"{settings.kb_api_base_url.rstrip('/')}/solve/{settings.kb_id}"
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.post(
+            url,
+            headers={
+                "accept": "*/*",
+                "Authorization": settings.kb_jwt_token,
+                "Content-Type": "application/json-patch+json",
+            },
+            json={"presetName": settings.kb_preset_name},
+        )
+        response.raise_for_status()
+        _kb_results_cache = _normalize_kb_results(response.json())
+        _kb_last_updated = _utcnow()
+        _kb_last_error = None
+
+
+async def _knowledge_base_polling_loop() -> None:
+    while True:
+        try:
+            await _fetch_knowledge_base_once()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Knowledge Base sync failed")
+            global _kb_last_error
+            _kb_last_error = str(exc)
+        await asyncio.sleep(KB_POLL_INTERVAL_SECONDS)
+
+
 @app.on_event("startup")
-def on_startup() -> None:
+async def on_startup() -> None:
     init_db()
+    if _knowledge_base_enabled():
+        app.state.kb_poller_task = asyncio.create_task(_knowledge_base_polling_loop())
+    else:
+        global _kb_last_error
+        _kb_last_error = "Knowledge Base integration disabled: missing KB_ID or KB_JWT_TOKEN."
+
+
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    task = getattr(app.state, "kb_poller_task", None)
+    if task is not None:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 # Backward-compatible placeholders used by legacy tests.
@@ -440,6 +536,19 @@ def list_problems() -> dict[str, list[dict[str, str | float | int | bool | None]
         return {"items": active}
 
 
+@app.get("/api/knowledge-base")
+def get_knowledge_base() -> dict[str, str | list[dict[str, str | list[dict[str, str]]]] | None]:
+    status = "ok" if _kb_last_error is None else "error"
+    if not _knowledge_base_enabled():
+        status = "disabled"
+    return {
+        "status": status,
+        "last_updated": _kb_last_updated.isoformat() if _kb_last_updated else None,
+        "error": _kb_last_error,
+        "items": _kb_results_cache,
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> str:
     return """
@@ -659,6 +768,7 @@ def dashboard() -> str:
                 <button class="nav-btn" data-tab="graphs" type="button"><span class="nav-label">Graphs</span></button>
                 <button class="nav-btn" data-tab="triggers" type="button"><span class="nav-label">Triggers</span></button>
                 <button class="nav-btn" data-tab="problems" type="button"><span class="nav-label">Problems</span></button>
+                <button class="nav-btn" data-tab="knowledge-base" type="button"><span class="nav-label">Knowledge Base</span></button>
             </nav>
         </aside>
         <main class="content">
@@ -826,6 +936,27 @@ def dashboard() -> str:
                     <tbody id="problems-body"></tbody>
                 </table>
             </section>
+
+            <section class="panel tab-panel" data-panel="knowledge-base" hidden>
+                <div class="page-header">
+                    <h2>Knowledge Base</h2>
+                    <p class="meta">Results from Hippocrates KB sync (updated every 10 minutes on the backend).</p>
+                </div>
+                <div class="toolbar">
+                    <button id="refresh-knowledge-base" type="button">Refresh now</button>
+                </div>
+                <div id="knowledge-base-status" class="status"></div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Result name</th>
+                            <th>Description</th>
+                            <th>Explanatory set</th>
+                        </tr>
+                    </thead>
+                    <tbody id="knowledge-base-body"></tbody>
+                </table>
+            </section>
         </main>
     </div>
 
@@ -834,6 +965,7 @@ def dashboard() -> str:
             nodes: [],
             triggers: [],
             problems: [],
+            knowledgeBase: [],
             latestSelectedNodeId: '',
             graphSelectedNodeId: '',
             triggerSelectedNodeId: '',
@@ -1151,6 +1283,28 @@ def dashboard() -> str:
             }
         }
 
+        function renderKnowledgeBaseTable() {
+            const body = document.getElementById('knowledge-base-body');
+            body.innerHTML = '';
+            if (!state.knowledgeBase.length) {
+                body.innerHTML = '<tr><td colspan="3" class="empty">No Knowledge Base results yet.</td></tr>';
+                return;
+            }
+            for (const item of state.knowledgeBase) {
+                const explanatorySet = item.explanatory_set || [];
+                const explanations = explanatorySet.length
+                    ? `<ul>${explanatorySet.map((row) => `<li><strong>${row.name}</strong>${row.description ? `: ${row.description}` : ''}</li>`).join('')}</ul>`
+                    : '<span class="meta">No explanatory signals</span>';
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${item.name || '-'}</td>
+                    <td>${item.description || '-'}</td>
+                    <td>${explanations}</td>
+                `;
+                body.appendChild(row);
+            }
+        }
+
         function setStatus(id, message, isError = false) {
             const element = document.getElementById(id);
             element.textContent = message;
@@ -1250,6 +1404,31 @@ def dashboard() -> str:
             }
         }
 
+        async function loadKnowledgeBase() {
+            try {
+                const data = await fetchJson('/api/knowledge-base');
+                state.knowledgeBase = data.items || [];
+                renderKnowledgeBaseTable();
+                if (data.status === 'disabled') {
+                    setStatus('knowledge-base-status', data.error || 'Knowledge Base integration is disabled.');
+                } else if (data.status === 'error') {
+                    setStatus('knowledge-base-status', data.error || 'Failed to load Knowledge Base data.', true);
+                } else {
+                    const updated = data.last_updated ? formatUtc(data.last_updated) : 'never';
+                    setStatus(
+                        'knowledge-base-status',
+                        state.knowledgeBase.length
+                            ? `Last updated (UTC): ${updated}`
+                            : `No results yet. Last updated (UTC): ${updated}`
+                    );
+                }
+            } catch (error) {
+                state.knowledgeBase = [];
+                renderKnowledgeBaseTable();
+                setStatus('knowledge-base-status', error.message, true);
+            }
+        }
+
         document.getElementById('sidebar-toggle').addEventListener('click', () => {
             document.getElementById('sidebar').classList.toggle('collapsed');
         });
@@ -1320,6 +1499,7 @@ def dashboard() -> str:
             }
         });
         document.getElementById('refresh-problems').addEventListener('click', loadProblems);
+        document.getElementById('refresh-knowledge-base').addEventListener('click', loadKnowledgeBase);
         document.addEventListener('click', async (event) => {
             const toggleButton = event.target.closest('[data-menu-toggle]');
             if (toggleButton) {
@@ -1421,6 +1601,7 @@ def dashboard() -> str:
             await loadGraph();
             await loadTriggers();
             await loadProblems();
+            await loadKnowledgeBase();
         }
 
         renderTabs();
