@@ -5,6 +5,7 @@ MVP системы мониторинга состоит из:
 - **FastAPI-сервера**, который принимает метрики CPU/RAM от удалённых узлов;
 - **агента** на `psutil`, который раз в минуту собирает данные и отправляет их на сервер;
 - **веб-дашборда** с левым скрываемым меню и вкладками `Latest data` / `Nodes`;
+- **интеграции с Knowledge Base API** (Hippocrates) и вкладкой `Knowledge Base`;
 - **SQLAlchemy-подключения к Supabase PostgreSQL** и CRUD-примеров для `User`.
 
 ## Что реализовано
@@ -15,6 +16,8 @@ MVP системы мониторинга состоит из:
 - Получение последних значений через `GET /api/metrics`.
 - Получение списка узлов и их параметров через `GET /api/nodes`.
 - Переименование узла через `PATCH /api/nodes/{node_id}`.
+- Фоновая синхронизация Knowledge Base (`POST /solve/{KB_ID}` каждые 10 минут).
+- Выдача результатов Knowledge Base для UI через `GET /api/knowledge-base`.
 - CRUD для пользователей:
   - `POST /api/users`
   - `GET /api/users`
@@ -29,6 +32,9 @@ MVP системы мониторинга состоит из:
    - `SUPABASE_DB_NAME`
    - `SUPABASE_DB_USER`
    - `SUPABASE_DB_PASSWORD`
+   - `KB_ID`
+   - `KB_JWT_TOKEN`
+   - (опционально) `KB_API_BASE_URL` и `KB_PRESET_NAME`
 3. `DATABASE_URL` собирается автоматически из этих переменных в `app/config.py`.
 
 > Примечание: если переменные не заданы, для локального запуска используется `sqlite:///./monitoring.db`.

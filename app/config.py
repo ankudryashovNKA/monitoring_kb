@@ -13,6 +13,10 @@ class Settings:
     supabase_db_name: str | None
     supabase_db_user: str | None
     supabase_db_password: str | None
+    kb_id: str | None
+    kb_jwt_token: str | None
+    kb_api_base_url: str
+    kb_preset_name: str
 
     @property
     def database_url(self) -> str:
@@ -38,4 +42,8 @@ settings = Settings(
     supabase_db_name=os.getenv("SUPABASE_DB_NAME"),
     supabase_db_user=os.getenv("SUPABASE_DB_USER"),
     supabase_db_password=os.getenv("SUPABASE_DB_PASSWORD"),
+    kb_id=os.getenv("KB_ID"),
+    kb_jwt_token=os.getenv("KB_JWT_TOKEN"),
+    kb_api_base_url=os.getenv("KB_API_BASE_URL", "https://kb.ai-hippocrates.ru/kbapi"),
+    kb_preset_name=os.getenv("KB_PRESET_NAME", "Monitoring server"),
 )
