@@ -7,11 +7,15 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from main import (  # noqa: E402
     RECENT_POINTS_LIMIT,
+    TriggerCreateIn,
+    create_trigger,
     dashboard,
     ingest_metric,
     list_metric_history,
     list_metrics,
     list_nodes,
+    list_problems,
+    list_triggers,
     rename_node,
     MetricIn,
     NodeRenameIn,
@@ -19,11 +23,13 @@ from main import (  # noqa: E402
 from app.db.session import SessionLocal  # noqa: E402
 from app.models.metric import Metric  # noqa: E402
 from app.models.node import Node  # noqa: E402
+from app.models.trigger import Trigger  # noqa: E402
 
 
 def setup_function() -> None:
     with SessionLocal() as db:
         db.query(Metric).delete()
+        db.query(Trigger).delete()
         db.query(Node).delete()
         db.commit()
 
@@ -79,6 +85,8 @@ def test_dashboard_page_available() -> None:
     assert "Latest data" in html
     assert "Nodes" in html
     assert "Graphs" in html
+    assert "Triggers" in html
+    assert "Problems" in html
 
 
 def test_metric_history() -> None:
@@ -110,3 +118,38 @@ def test_metric_history() -> None:
     assert history["metric_name"] == "cpu_percent"
     assert len(history["items"]) == 2
     assert history["items"][-1]["value"] == 22.0
+
+
+def test_triggers_and_problems() -> None:
+    ingest_metric(
+        MetricIn(
+            node_id="node-alert",
+            cpu_percent=91.0,
+            ram_percent=40.0,
+            os_name="Ubuntu",
+            cpu_cores=4,
+            ram_total_mb=8192,
+            ip_address="10.0.0.12",
+        )
+    )
+
+    created = create_trigger(
+        TriggerCreateIn(
+            node_id="node-alert",
+            metric_name="cpu_percent",
+            operator=">",
+            threshold=85.0,
+        )
+    )
+    assert created["is_active"] is True
+
+    triggers = list_triggers(node_id="node-alert")["items"]
+    assert len(triggers) == 1
+    assert triggers[0]["metric_name"] == "cpu_percent"
+    assert triggers[0]["operator"] == ">"
+    assert triggers[0]["threshold"] == 85.0
+    assert triggers[0]["is_active"] is True
+
+    problems = list_problems()["items"]
+    assert len(problems) == 1
+    assert problems[0]["node_id"] == "node-alert"

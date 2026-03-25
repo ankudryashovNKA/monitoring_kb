@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+import operator
 from typing import Deque
 
 from fastapi import FastAPI, HTTPException, Query
@@ -12,6 +13,7 @@ from app.db.base import Base
 from app.db.session import SessionLocal, engine
 import app.models.metric  # noqa: F401
 import app.models.node  # noqa: F401
+import app.models.trigger  # noqa: F401
 import app.models.user  # noqa: F401
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -19,6 +21,7 @@ from sqlalchemy import func
 
 from app.models.metric import Metric
 from app.models.node import Node
+from app.models.trigger import Trigger
 
 RETENTION_PERIOD = timedelta(hours=1)
 RECENT_POINTS_LIMIT = 10
@@ -56,6 +59,13 @@ class MetricIn(BaseModel):
 
 class NodeRenameIn(BaseModel):
     display_name: str = Field(..., min_length=1, max_length=100)
+
+
+class TriggerCreateIn(BaseModel):
+    node_id: str = Field(..., min_length=1, max_length=100)
+    metric_name: str = Field(..., pattern="^(cpu_percent|ram_percent)$")
+    operator: str = Field(..., pattern="^(>|<)$")
+    threshold: float = Field(..., ge=0, le=100)
 
 
 app = FastAPI(title="Monitoring KB MVP")
@@ -101,6 +111,38 @@ def _serialize_node(node: NodeInfo) -> dict[str, str | int]:
     item = asdict(node)
     item["last_seen"] = node.last_seen.isoformat()
     return item
+
+
+def _is_trigger_active(trigger: Trigger, metric: Metric | None) -> bool:
+    if metric is None:
+        return False
+    comparator = operator.gt if trigger.operator == ">" else operator.lt
+    metric_value = metric.cpu_percent if trigger.metric_name == "cpu_percent" else metric.ram_percent
+    return comparator(metric_value, trigger.threshold)
+
+
+def _serialize_trigger(
+    trigger: Trigger,
+    node_display_name: str,
+    metric: Metric | None,
+    include_latest: bool = True,
+) -> dict[str, str | float | int | bool | None]:
+    latest_value = None
+    if metric is not None:
+        latest_value = metric.cpu_percent if trigger.metric_name == "cpu_percent" else metric.ram_percent
+    payload: dict[str, str | float | int | bool | None] = {
+        "id": trigger.id,
+        "node_id": trigger.node_id,
+        "node_display_name": node_display_name,
+        "metric_name": trigger.metric_name,
+        "operator": trigger.operator,
+        "threshold": trigger.threshold,
+        "is_active": _is_trigger_active(trigger, metric),
+        "created_at": trigger.created_at.isoformat(),
+    }
+    if include_latest:
+        payload["latest_value"] = latest_value
+    return payload
 
 
 @app.post("/api/metrics")
@@ -253,6 +295,94 @@ def rename_node(node_id: str, payload: NodeRenameIn) -> dict[str, str | int]:
             "ip_address": node.ip_address,
             "last_seen": node.last_seen.isoformat(),
         }
+
+
+@app.post("/api/triggers")
+def create_trigger(payload: TriggerCreateIn) -> dict[str, str | float | int | bool | None]:
+    with SessionLocal() as db:
+        node = db.query(Node).filter(Node.node_id == payload.node_id).first()
+        if node is None:
+            raise HTTPException(status_code=404, detail="Node not found")
+
+        trigger = Trigger(
+            node_id=payload.node_id,
+            metric_name=payload.metric_name,
+            operator=payload.operator,
+            threshold=payload.threshold,
+            created_at=_utcnow(),
+        )
+        db.add(trigger)
+        db.commit()
+        db.refresh(trigger)
+
+        latest_metric = (
+            db.query(Metric)
+            .filter(Metric.node_id == payload.node_id)
+            .order_by(Metric.timestamp.desc())
+            .first()
+        )
+        return _serialize_trigger(trigger, node.display_name, latest_metric)
+
+
+@app.get("/api/triggers")
+def list_triggers(node_id: str | None = None) -> dict[str, list[dict[str, str | float | int | bool | None]]]:
+    with SessionLocal() as db:
+        query = db.query(Trigger, Node.display_name).join(Node, Node.node_id == Trigger.node_id)
+        if node_id:
+            node_exists = db.query(Node.node_id).filter(Node.node_id == node_id).first()
+            if node_exists is None:
+                raise HTTPException(status_code=404, detail="Node not found")
+            query = query.filter(Trigger.node_id == node_id)
+
+        rows = query.order_by(Trigger.created_at.desc(), Trigger.id.desc()).all()
+        latest_metrics_by_node: dict[str, Metric] = {}
+        for trigger, _display_name in rows:
+            if trigger.node_id in latest_metrics_by_node:
+                continue
+            metric = (
+                db.query(Metric)
+                .filter(Metric.node_id == trigger.node_id)
+                .order_by(Metric.timestamp.desc())
+                .first()
+            )
+            if metric is not None:
+                latest_metrics_by_node[trigger.node_id] = metric
+
+        items = [
+            _serialize_trigger(trigger, display_name, latest_metrics_by_node.get(trigger.node_id))
+            for trigger, display_name in rows
+        ]
+        return {"items": items}
+
+
+@app.get("/api/problems")
+def list_problems() -> dict[str, list[dict[str, str | float | int | bool | None]]]:
+    with SessionLocal() as db:
+        rows = (
+            db.query(Trigger, Node.display_name)
+            .join(Node, Node.node_id == Trigger.node_id)
+            .order_by(Trigger.created_at.desc(), Trigger.id.desc())
+            .all()
+        )
+        latest_metrics_by_node: dict[str, Metric] = {}
+        for trigger, _display_name in rows:
+            if trigger.node_id in latest_metrics_by_node:
+                continue
+            metric = (
+                db.query(Metric)
+                .filter(Metric.node_id == trigger.node_id)
+                .order_by(Metric.timestamp.desc())
+                .first()
+            )
+            if metric is not None:
+                latest_metrics_by_node[trigger.node_id] = metric
+
+        active = []
+        for trigger, display_name in rows:
+            metric = latest_metrics_by_node.get(trigger.node_id)
+            if _is_trigger_active(trigger, metric):
+                active.append(_serialize_trigger(trigger, display_name, metric))
+        return {"items": active}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -451,6 +581,8 @@ def dashboard() -> str:
                 <button class="nav-btn active" data-tab="latest" type="button"><span>📈</span><span class="nav-label">Latest data</span></button>
                 <button class="nav-btn" data-tab="nodes" type="button"><span>🖥️</span><span class="nav-label">Nodes</span></button>
                 <button class="nav-btn" data-tab="graphs" type="button"><span>📊</span><span class="nav-label">Graphs</span></button>
+                <button class="nav-btn" data-tab="triggers" type="button"><span>🚨</span><span class="nav-label">Triggers</span></button>
+                <button class="nav-btn" data-tab="problems" type="button"><span>❗</span><span class="nav-label">Problems</span></button>
             </nav>
         </aside>
         <main class="content">
@@ -544,14 +676,86 @@ def dashboard() -> str:
                     <text id="graph-title" x="80" y="24" fill="#94a3b8">No data</text>
                 </svg>
             </section>
+
+            <section class="panel tab-panel" data-panel="triggers" hidden>
+                <div class="page-header">
+                    <h2>Triggers</h2>
+                    <p class="meta">Create trigger rules for a node and inspect existing trigger definitions.</p>
+                </div>
+                <form id="create-trigger-form" class="toolbar">
+                    <label>
+                        <span class="meta">Node</span><br />
+                        <select id="trigger-node-select" required></select>
+                    </label>
+                    <label>
+                        <span class="meta">Metric</span><br />
+                        <select id="trigger-metric-select">
+                            <option value="cpu_percent">CPU %</option>
+                            <option value="ram_percent">RAM %</option>
+                        </select>
+                    </label>
+                    <label>
+                        <span class="meta">Operator</span><br />
+                        <select id="trigger-operator-select">
+                            <option value=">">&gt;</option>
+                            <option value="<">&lt;</option>
+                        </select>
+                    </label>
+                    <label>
+                        <span class="meta">Threshold (%)</span><br />
+                        <input id="trigger-threshold-input" type="number" min="0" max="100" step="0.1" value="80" required />
+                    </label>
+                    <button type="submit">Create trigger</button>
+                </form>
+                <div id="triggers-status" class="status"></div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Node</th>
+                            <th>Condition</th>
+                            <th>Latest value</th>
+                            <th>Status</th>
+                            <th>Created (UTC)</th>
+                        </tr>
+                    </thead>
+                    <tbody id="triggers-body"></tbody>
+                </table>
+            </section>
+
+            <section class="panel tab-panel" data-panel="problems" hidden>
+                <div class="page-header">
+                    <h2>Problems</h2>
+                    <p class="meta">All currently active triggers across all nodes.</p>
+                </div>
+                <div class="toolbar">
+                    <button id="refresh-problems" type="button">Refresh problems</button>
+                </div>
+                <div id="problems-status" class="status"></div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Trigger ID</th>
+                            <th>Node</th>
+                            <th>Condition</th>
+                            <th>Latest value</th>
+                            <th>Created (UTC)</th>
+                        </tr>
+                    </thead>
+                    <tbody id="problems-body"></tbody>
+                </table>
+            </section>
         </main>
     </div>
 
     <script>
         const state = {
             nodes: [],
+            triggers: [],
+            problems: [],
             latestSelectedNodeId: '',
             graphSelectedNodeId: '',
+            triggerSelectedNodeId: '',
             nodeNameDrafts: {},
             activeTab: 'latest',
         };
@@ -591,26 +795,34 @@ def dashboard() -> str:
         function renderNodeOptions() {
             const select = document.getElementById('node-select');
             const graphSelect = document.getElementById('graph-node-select');
+            const triggerSelect = document.getElementById('trigger-node-select');
             select.innerHTML = '';
             graphSelect.innerHTML = '';
+            triggerSelect.innerHTML = '';
             if (!state.nodes.length) {
                 const option = document.createElement('option');
                 option.textContent = 'No nodes yet';
                 option.value = '';
                 select.appendChild(option);
                 graphSelect.appendChild(option.cloneNode(true));
+                triggerSelect.appendChild(option.cloneNode(true));
                 select.disabled = true;
                 graphSelect.disabled = true;
+                triggerSelect.disabled = true;
                 return;
             }
 
             select.disabled = false;
             graphSelect.disabled = false;
+            triggerSelect.disabled = false;
             if (!state.latestSelectedNodeId || !state.nodes.some((node) => node.node_id === state.latestSelectedNodeId)) {
                 state.latestSelectedNodeId = state.nodes[0].node_id;
             }
             if (!state.graphSelectedNodeId || !state.nodes.some((node) => node.node_id === state.graphSelectedNodeId)) {
                 state.graphSelectedNodeId = state.latestSelectedNodeId;
+            }
+            if (!state.triggerSelectedNodeId || !state.nodes.some((node) => node.node_id === state.triggerSelectedNodeId)) {
+                state.triggerSelectedNodeId = state.latestSelectedNodeId;
             }
 
             for (const node of state.nodes) {
@@ -619,9 +831,11 @@ def dashboard() -> str:
                 option.textContent = `${node.display_name} (${node.node_id})`;
                 select.appendChild(option);
                 graphSelect.appendChild(option.cloneNode(true));
+                triggerSelect.appendChild(option.cloneNode(true));
             }
             select.value = state.latestSelectedNodeId;
             graphSelect.value = state.graphSelectedNodeId;
+            triggerSelect.value = state.triggerSelectedNodeId;
         }
 
         function renderGraph(items, metricName, intervalMinutes) {
@@ -832,6 +1046,53 @@ def dashboard() -> str:
             });
         }
 
+        function metricLabel(metricName) {
+            return metricName === 'cpu_percent' ? 'CPU %' : 'RAM %';
+        }
+
+        function renderTriggersTable() {
+            const body = document.getElementById('triggers-body');
+            body.innerHTML = '';
+            if (!state.triggers.length) {
+                body.innerHTML = '<tr><td colspan="6" class="empty">No triggers created for the selected node.</td></tr>';
+                return;
+            }
+            for (const trigger of state.triggers) {
+                const latestValue = trigger.latest_value == null ? 'No data' : `${Number(trigger.latest_value).toFixed(2)}%`;
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${trigger.id}</td>
+                    <td>${trigger.node_display_name} (${trigger.node_id})</td>
+                    <td>${metricLabel(trigger.metric_name)} ${trigger.operator} ${Number(trigger.threshold).toFixed(2)}%</td>
+                    <td>${latestValue}</td>
+                    <td>${trigger.is_active ? 'Active' : 'OK'}</td>
+                    <td>${formatUtc(trigger.created_at)}</td>
+                `;
+                body.appendChild(row);
+            }
+        }
+
+        function renderProblemsTable() {
+            const body = document.getElementById('problems-body');
+            body.innerHTML = '';
+            if (!state.problems.length) {
+                body.innerHTML = '<tr><td colspan="5" class="empty">No active triggers now.</td></tr>';
+                return;
+            }
+            for (const trigger of state.problems) {
+                const latestValue = trigger.latest_value == null ? 'No data' : `${Number(trigger.latest_value).toFixed(2)}%`;
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${trigger.id}</td>
+                    <td>${trigger.node_display_name} (${trigger.node_id})</td>
+                    <td>${metricLabel(trigger.metric_name)} ${trigger.operator} ${Number(trigger.threshold).toFixed(2)}%</td>
+                    <td>${latestValue}</td>
+                    <td>${formatUtc(trigger.created_at)}</td>
+                `;
+                body.appendChild(row);
+            }
+        }
+
         function setStatus(id, message, isError = false) {
             const element = document.getElementById(id);
             element.textContent = message;
@@ -892,6 +1153,38 @@ def dashboard() -> str:
             }
         }
 
+        async function loadTriggers() {
+            if (!state.triggerSelectedNodeId) {
+                state.triggers = [];
+                renderTriggersTable();
+                setStatus('triggers-status', 'Waiting for nodes to send data.');
+                return;
+            }
+            try {
+                const data = await fetchJson(`/api/triggers?node_id=${encodeURIComponent(state.triggerSelectedNodeId)}`);
+                state.triggers = data.items;
+                renderTriggersTable();
+                setStatus('triggers-status', state.triggers.length ? '' : 'No triggers yet for this node.');
+            } catch (error) {
+                state.triggers = [];
+                renderTriggersTable();
+                setStatus('triggers-status', error.message, true);
+            }
+        }
+
+        async function loadProblems() {
+            try {
+                const data = await fetchJson('/api/problems');
+                state.problems = data.items;
+                renderProblemsTable();
+                setStatus('problems-status', state.problems.length ? '' : 'No active triggers.');
+            } catch (error) {
+                state.problems = [];
+                renderProblemsTable();
+                setStatus('problems-status', error.message, true);
+            }
+        }
+
         document.getElementById('sidebar-toggle').addEventListener('click', () => {
             document.getElementById('sidebar').classList.toggle('collapsed');
         });
@@ -906,9 +1199,12 @@ def dashboard() -> str:
         document.getElementById('node-select').addEventListener('change', async (event) => {
             state.latestSelectedNodeId = event.target.value;
             state.graphSelectedNodeId = event.target.value;
+            state.triggerSelectedNodeId = event.target.value;
             document.getElementById('graph-node-select').value = state.graphSelectedNodeId;
+            document.getElementById('trigger-node-select').value = state.triggerSelectedNodeId;
             await loadLatestMetrics();
             await loadGraph();
+            await loadTriggers();
         });
 
         document.getElementById('refresh-latest').addEventListener('click', loadLatestMetrics);
@@ -919,11 +1215,47 @@ def dashboard() -> str:
         });
         document.getElementById('graph-metric-select').addEventListener('change', loadGraph);
         document.getElementById('graph-interval-select').addEventListener('change', loadGraph);
+        document.getElementById('trigger-node-select').addEventListener('change', async (event) => {
+            state.triggerSelectedNodeId = event.target.value;
+            await loadTriggers();
+        });
+        document.getElementById('create-trigger-form').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            if (!state.triggerSelectedNodeId) {
+                setStatus('triggers-status', 'Choose a node first.', true);
+                return;
+            }
+            const threshold = Number(document.getElementById('trigger-threshold-input').value);
+            if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) {
+                setStatus('triggers-status', 'Threshold must be between 0 and 100.', true);
+                return;
+            }
+            try {
+                await fetchJson('/api/triggers', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        node_id: state.triggerSelectedNodeId,
+                        metric_name: document.getElementById('trigger-metric-select').value,
+                        operator: document.getElementById('trigger-operator-select').value,
+                        threshold,
+                    }),
+                });
+                setStatus('triggers-status', 'Trigger created.');
+                await loadTriggers();
+                await loadProblems();
+            } catch (error) {
+                setStatus('triggers-status', error.message, true);
+            }
+        });
+        document.getElementById('refresh-problems').addEventListener('click', loadProblems);
 
         async function refreshAll() {
             await loadNodes();
             await loadLatestMetrics();
             await loadGraph();
+            await loadTriggers();
+            await loadProblems();
         }
 
         renderTabs();
