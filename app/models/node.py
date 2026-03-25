@@ -20,3 +20,4 @@ class Node(Base):
     last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     metrics = relationship("Metric", back_populates="node", cascade="all, delete-orphan")
+    triggers = relationship("Trigger", back_populates="node", cascade="all, delete-orphan")
