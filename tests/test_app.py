@@ -15,22 +15,28 @@ from main import (  # noqa: E402
     ingest_metric,
     list_metric_history,
     list_metrics,
+    list_logs,
     list_nodes,
     list_problems,
     list_triggers,
     rename_node,
     MetricIn,
     NodeRenameIn,
+    LogEntryIn,
+    LogsIn,
+    ingest_logs,
 )
 from app.db.session import SessionLocal  # noqa: E402
 from app.models.metric import Metric  # noqa: E402
 from app.models.node import Node  # noqa: E402
+from app.models.log_entry import LogEntry  # noqa: E402
 from app.models.trigger import Trigger  # noqa: E402
 
 
 def setup_function() -> None:
     with SessionLocal() as db:
         db.query(Metric).delete()
+        db.query(LogEntry).delete()
         db.query(Trigger).delete()
         db.query(Node).delete()
         db.commit()
@@ -89,6 +95,7 @@ def test_dashboard_page_available() -> None:
     assert "Graphs" in html
     assert "Triggers" in html
     assert "Problems" in html
+    assert "Logs" in html
     assert "Knowledge Base" in html
 
 
@@ -184,3 +191,35 @@ def test_knowledge_base_normalization_and_endpoint() -> None:
     response = get_knowledge_base()
     assert "status" in response
     assert "items" in response
+
+
+def test_logs_ingest_and_list() -> None:
+    ingest_metric(
+        MetricIn(
+            node_id="node-logs",
+            cpu_percent=10.0,
+            ram_percent=20.0,
+            os_name="Ubuntu",
+            cpu_cores=4,
+            ram_total_mb=4096,
+            ip_address="10.0.0.13",
+        )
+    )
+    ingest_logs(
+        LogsIn(
+            node_id="node-logs",
+            os_name="Ubuntu 24.04",
+            cpu_cores=4,
+            ram_total_mb=4096,
+            ip_address="10.0.0.13",
+            entries=[
+                LogEntryIn(source="linux-syslog", message="kernel: boot complete"),
+                LogEntryIn(source="linux-syslog", message="sshd: accepted publickey"),
+            ],
+        )
+    )
+
+    response = list_logs(node_id="node-logs")
+    assert response["node_id"] == "node-logs"
+    assert response["os_name"] == "Ubuntu 24.04"
+    assert len(response["items"]) == 2
