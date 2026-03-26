@@ -18,6 +18,7 @@ from app.db.base import Base
 from app.db.session import SessionLocal, engine
 import app.models.metric  # noqa: F401
 import app.models.node  # noqa: F401
+import app.models.log_entry  # noqa: F401
 import app.models.trigger  # noqa: F401
 import app.models.user  # noqa: F401
 from fastapi.responses import HTMLResponse
@@ -26,10 +27,13 @@ from sqlalchemy import func
 
 from app.models.metric import Metric
 from app.models.node import Node
+from app.models.log_entry import LogEntry
 from app.models.trigger import Trigger
 
 RETENTION_PERIOD = timedelta(hours=1)
 RECENT_POINTS_LIMIT = 10
+LOG_POINTS_LIMIT = 100
+MAX_STORED_LOGS_PER_NODE = 2000
 KB_POLL_INTERVAL_SECONDS = 600
 
 logger = logging.getLogger(__name__)
@@ -67,6 +71,21 @@ class MetricIn(BaseModel):
 
 class NodeRenameIn(BaseModel):
     display_name: str = Field(..., min_length=1, max_length=100)
+
+
+class LogEntryIn(BaseModel):
+    source: str = Field(..., min_length=1, max_length=120)
+    message: str = Field(..., min_length=1, max_length=8000)
+    captured_at: datetime | None = None
+
+
+class LogsIn(BaseModel):
+    node_id: str = Field(..., min_length=1, max_length=100)
+    os_name: str = Field(..., min_length=1, max_length=200)
+    cpu_cores: int = Field(..., ge=1, le=4096)
+    ram_total_mb: int = Field(..., ge=1)
+    ip_address: str = Field(..., min_length=1, max_length=100)
+    entries: list[LogEntryIn] = Field(default_factory=list, max_length=LOG_POINTS_LIMIT)
 
 
 class TriggerCreateIn(BaseModel):
@@ -289,6 +308,91 @@ def ingest_metric(metric: MetricIn) -> dict[str, str]:
         )
         db.commit()
     return {"status": "ok"}
+
+
+@app.post("/api/logs")
+def ingest_logs(payload: LogsIn) -> dict[str, str | int]:
+    now = _utcnow()
+    with SessionLocal() as db:
+        node = db.query(Node).filter(Node.node_id == payload.node_id).first()
+        if node is None:
+            node = Node(
+                node_id=payload.node_id,
+                display_name=payload.node_id,
+                os_name=payload.os_name,
+                cpu_cores=payload.cpu_cores,
+                ram_total_mb=payload.ram_total_mb,
+                ip_address=payload.ip_address,
+                last_seen=now,
+            )
+            db.add(node)
+        else:
+            node.os_name = payload.os_name
+            node.cpu_cores = payload.cpu_cores
+            node.ram_total_mb = payload.ram_total_mb
+            node.ip_address = payload.ip_address
+            node.last_seen = now
+
+        inserted_count = 0
+        for entry in payload.entries:
+            captured_at = entry.captured_at or now
+            if captured_at.tzinfo is None:
+                captured_at = captured_at.replace(tzinfo=timezone.utc)
+            db.add(
+                LogEntry(
+                    node_id=payload.node_id,
+                    source=entry.source,
+                    message=entry.message,
+                    captured_at=captured_at.astimezone(timezone.utc),
+                )
+            )
+            inserted_count += 1
+
+        overflow_ids = [
+            row[0]
+            for row in (
+                db.query(LogEntry.id)
+                .filter(LogEntry.node_id == payload.node_id)
+                .order_by(LogEntry.captured_at.desc(), LogEntry.id.desc())
+                .offset(MAX_STORED_LOGS_PER_NODE)
+                .all()
+            )
+        ]
+        if overflow_ids:
+            db.query(LogEntry).filter(LogEntry.id.in_(overflow_ids)).delete(synchronize_session=False)
+
+        db.commit()
+    return {"status": "ok", "inserted": inserted_count}
+
+
+@app.get("/api/logs")
+def list_logs(node_id: str) -> dict[str, str | list[dict[str, str]]]:
+    with SessionLocal() as db:
+        node = db.query(Node).filter(Node.node_id == node_id).first()
+        if node is None:
+            raise HTTPException(status_code=404, detail="Node not found")
+
+        rows = (
+            db.query(LogEntry)
+            .filter(LogEntry.node_id == node_id)
+            .order_by(LogEntry.captured_at.desc(), LogEntry.id.desc())
+            .limit(LOG_POINTS_LIMIT)
+            .all()
+        )
+        items = [
+            {
+                "source": row.source,
+                "message": row.message,
+                "captured_at": row.captured_at.isoformat(),
+            }
+            for row in rows
+        ]
+        return {
+            "node_id": node.node_id,
+            "display_name": node.display_name,
+            "os_name": node.os_name,
+            "items": items,
+        }
 
 
 @app.get("/api/metrics")
@@ -768,6 +872,7 @@ def dashboard() -> str:
                 <button class="nav-btn" data-tab="graphs" type="button"><span class="nav-label">Graphs</span></button>
                 <button class="nav-btn" data-tab="triggers" type="button"><span class="nav-label">Triggers</span></button>
                 <button class="nav-btn" data-tab="problems" type="button"><span class="nav-label">Problems</span></button>
+                <button class="nav-btn" data-tab="logs" type="button"><span class="nav-label">Logs</span></button>
                 <button class="nav-btn" data-tab="knowledge-base" type="button"><span class="nav-label">Knowledge Base</span></button>
             </nav>
         </aside>
@@ -937,6 +1042,31 @@ def dashboard() -> str:
                 </table>
             </section>
 
+            <section class="panel tab-panel" data-panel="logs" hidden>
+                <div class="page-header">
+                    <h2>Logs</h2>
+                    <p class="meta">Latest 100 important system log entries sent by the selected node.</p>
+                </div>
+                <div class="toolbar">
+                    <label>
+                        <span class="meta">Node</span><br />
+                        <select id="logs-node-select"></select>
+                    </label>
+                    <button id="refresh-logs" type="button">Refresh logs</button>
+                </div>
+                <div id="logs-status" class="status"></div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Time (UTC)</th>
+                            <th>Source</th>
+                            <th>Entry</th>
+                        </tr>
+                    </thead>
+                    <tbody id="logs-body"></tbody>
+                </table>
+            </section>
+
             <section class="panel tab-panel" data-panel="knowledge-base" hidden>
                 <div class="page-header">
                     <h2>Knowledge Base</h2>
@@ -969,6 +1099,7 @@ def dashboard() -> str:
             latestSelectedNodeId: '',
             graphSelectedNodeId: '',
             triggerSelectedNodeId: '',
+            logsSelectedNodeId: '',
             activeMenuKey: '',
             activeTab: 'latest',
         };
@@ -1009,9 +1140,11 @@ def dashboard() -> str:
             const select = document.getElementById('node-select');
             const graphSelect = document.getElementById('graph-node-select');
             const triggerSelect = document.getElementById('trigger-node-select');
+            const logsSelect = document.getElementById('logs-node-select');
             select.innerHTML = '';
             graphSelect.innerHTML = '';
             triggerSelect.innerHTML = '';
+            logsSelect.innerHTML = '';
             if (!state.nodes.length) {
                 const option = document.createElement('option');
                 option.textContent = 'No nodes yet';
@@ -1019,15 +1152,18 @@ def dashboard() -> str:
                 select.appendChild(option);
                 graphSelect.appendChild(option.cloneNode(true));
                 triggerSelect.appendChild(option.cloneNode(true));
+                logsSelect.appendChild(option.cloneNode(true));
                 select.disabled = true;
                 graphSelect.disabled = true;
                 triggerSelect.disabled = true;
+                logsSelect.disabled = true;
                 return;
             }
 
             select.disabled = false;
             graphSelect.disabled = false;
             triggerSelect.disabled = false;
+            logsSelect.disabled = false;
             if (!state.latestSelectedNodeId || !state.nodes.some((node) => node.node_id === state.latestSelectedNodeId)) {
                 state.latestSelectedNodeId = state.nodes[0].node_id;
             }
@@ -1037,6 +1173,9 @@ def dashboard() -> str:
             if (!state.triggerSelectedNodeId || !state.nodes.some((node) => node.node_id === state.triggerSelectedNodeId)) {
                 state.triggerSelectedNodeId = state.latestSelectedNodeId;
             }
+            if (!state.logsSelectedNodeId || !state.nodes.some((node) => node.node_id === state.logsSelectedNodeId)) {
+                state.logsSelectedNodeId = state.latestSelectedNodeId;
+            }
 
             for (const node of state.nodes) {
                 const option = document.createElement('option');
@@ -1045,10 +1184,12 @@ def dashboard() -> str:
                 select.appendChild(option);
                 graphSelect.appendChild(option.cloneNode(true));
                 triggerSelect.appendChild(option.cloneNode(true));
+                logsSelect.appendChild(option.cloneNode(true));
             }
             select.value = state.latestSelectedNodeId;
             graphSelect.value = state.graphSelectedNodeId;
             triggerSelect.value = state.triggerSelectedNodeId;
+            logsSelect.value = state.logsSelectedNodeId;
         }
 
         function renderGraph(items, metricName, intervalMinutes) {
@@ -1305,6 +1446,24 @@ def dashboard() -> str:
             }
         }
 
+        function renderLogsTable(items) {
+            const body = document.getElementById('logs-body');
+            body.innerHTML = '';
+            if (!items.length) {
+                body.innerHTML = '<tr><td colspan="3" class="empty">No logs received from this node yet.</td></tr>';
+                return;
+            }
+            for (const entry of items) {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${formatUtc(entry.captured_at)}</td>
+                    <td>${entry.source}</td>
+                    <td>${entry.message}</td>
+                `;
+                body.appendChild(row);
+            }
+        }
+
         function setStatus(id, message, isError = false) {
             const element = document.getElementById(id);
             element.textContent = message;
@@ -1429,6 +1588,23 @@ def dashboard() -> str:
             }
         }
 
+        async function loadLogs() {
+            if (!state.logsSelectedNodeId) {
+                renderLogsTable([]);
+                setStatus('logs-status', 'Waiting for nodes to send data.');
+                return;
+            }
+            try {
+                const data = await fetchJson(`/api/logs?node_id=${encodeURIComponent(state.logsSelectedNodeId)}`);
+                renderLogsTable(data.items || []);
+                const osLabel = data.os_name || 'Unknown OS';
+                setStatus('logs-status', data.items.length ? `Source node OS: ${osLabel}` : `No logs yet. Source node OS: ${osLabel}`);
+            } catch (error) {
+                renderLogsTable([]);
+                setStatus('logs-status', error.message, true);
+            }
+        }
+
         document.getElementById('sidebar-toggle').addEventListener('click', () => {
             document.getElementById('sidebar').classList.toggle('collapsed');
         });
@@ -1444,11 +1620,14 @@ def dashboard() -> str:
             state.latestSelectedNodeId = event.target.value;
             state.graphSelectedNodeId = event.target.value;
             state.triggerSelectedNodeId = event.target.value;
+            state.logsSelectedNodeId = event.target.value;
             document.getElementById('graph-node-select').value = state.graphSelectedNodeId;
             document.getElementById('trigger-node-select').value = state.triggerSelectedNodeId;
+            document.getElementById('logs-node-select').value = state.logsSelectedNodeId;
             await loadLatestMetrics();
             await loadGraph();
             await loadTriggers();
+            await loadLogs();
         });
 
         document.getElementById('refresh-latest').addEventListener('click', loadLatestMetrics);
@@ -1499,6 +1678,11 @@ def dashboard() -> str:
             }
         });
         document.getElementById('refresh-problems').addEventListener('click', loadProblems);
+        document.getElementById('refresh-logs').addEventListener('click', loadLogs);
+        document.getElementById('logs-node-select').addEventListener('change', async (event) => {
+            state.logsSelectedNodeId = event.target.value;
+            await loadLogs();
+        });
         document.getElementById('refresh-knowledge-base').addEventListener('click', loadKnowledgeBase);
         document.addEventListener('click', async (event) => {
             const toggleButton = event.target.closest('[data-menu-toggle]');
@@ -1601,6 +1785,7 @@ def dashboard() -> str:
             await loadGraph();
             await loadTriggers();
             await loadProblems();
+            await loadLogs();
             await loadKnowledgeBase();
         }
 

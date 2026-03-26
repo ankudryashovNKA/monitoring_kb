@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
+import json
+import os
 import platform
 import socket
+import subprocess
 import time
 from datetime import datetime, timezone
 
@@ -10,6 +14,7 @@ import psutil
 import requests
 
 DEFAULT_INTERVAL_SECONDS = 60
+MAX_LOG_ENTRIES = 100
 
 
 def detect_primary_ip() -> str:
@@ -22,16 +27,105 @@ def detect_primary_ip() -> str:
 
 
 def collect_metrics(node_id: str) -> dict[str, str | float | int]:
+    os_name = detect_os_name()
     virtual_memory = psutil.virtual_memory()
     return {
         "node_id": node_id,
         "cpu_percent": psutil.cpu_percent(interval=1),
         "ram_percent": virtual_memory.percent,
-        "os_name": f"{platform.system()} {platform.release()}",
+        "os_name": os_name,
         "cpu_cores": psutil.cpu_count() or 1,
         "ram_total_mb": int(virtual_memory.total / (1024 * 1024)),
         "ip_address": detect_primary_ip(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def detect_os_name() -> str:
+    system = platform.system()
+    if system != "Linux":
+        return f"{system} {platform.release()}"
+
+    distro = "Linux"
+    os_release = "/etc/os-release"
+    if os.path.exists(os_release):
+        try:
+            data: dict[str, str] = {}
+            with open(os_release, encoding="utf-8") as file:
+                for line in file:
+                    line = line.strip()
+                    if not line or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    data[key] = value.strip('"')
+            distro = data.get("PRETTY_NAME") or data.get("NAME") or distro
+        except OSError:
+            distro = "Linux"
+    return f"{distro} ({platform.release()})"
+
+
+def _linux_log_source() -> tuple[str, str]:
+    distro_id = ""
+    distro_like = ""
+    try:
+        with open("/etc/os-release", encoding="utf-8") as file:
+            for raw in file:
+                if raw.startswith("ID="):
+                    distro_id = raw.split("=", 1)[1].strip().strip('"').lower()
+                if raw.startswith("ID_LIKE="):
+                    distro_like = raw.split("=", 1)[1].strip().strip('"').lower()
+    except OSError:
+        pass
+
+    signature = f"{distro_id} {distro_like}"
+    if any(name in signature for name in ("debian", "ubuntu", "mint")) and os.path.exists("/var/log/syslog"):
+        return "/var/log/syslog", "linux-syslog"
+    if any(name in signature for name in ("rhel", "fedora", "centos", "rocky", "almalinux")) and os.path.exists("/var/log/messages"):
+        return "/var/log/messages", "linux-messages"
+    if os.path.exists("/var/log/syslog"):
+        return "/var/log/syslog", "linux-syslog"
+    if os.path.exists("/var/log/messages"):
+        return "/var/log/messages", "linux-messages"
+    return "journalctl", "linux-journalctl"
+
+
+def _tail_file(path: str, limit: int) -> list[str]:
+    with open(path, encoding="utf-8", errors="replace") as file:
+        return [line.strip() for line in deque(file, maxlen=limit) if line.strip()]
+
+
+def collect_logs() -> list[dict[str, str]]:
+    system = platform.system().lower()
+    if system == "windows":
+        command = ["wevtutil", "qe", "System", "/rd:true", f"/c:{MAX_LOG_ENTRIES}", "/f:text"]
+        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+        text = completed.stdout if completed.returncode == 0 else completed.stderr
+        lines = [line.strip() for line in text.splitlines() if line.strip()][:MAX_LOG_ENTRIES]
+        return [{"source": "windows-eventlog", "message": line} for line in lines]
+
+    path, source = _linux_log_source()
+    if path == "journalctl":
+        command = ["journalctl", "-n", str(MAX_LOG_ENTRIES), "--no-pager", "--output=short-iso"]
+        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+        text = completed.stdout if completed.returncode == 0 else completed.stderr
+        lines = [line.strip() for line in text.splitlines() if line.strip()][:MAX_LOG_ENTRIES]
+        return [{"source": source, "message": line} for line in lines]
+
+    try:
+        return [{"source": source, "message": line} for line in _tail_file(path, MAX_LOG_ENTRIES)]
+    except OSError as error:
+        return [{"source": source, "message": f"Failed to read {path}: {error}"}]
+
+
+def collect_logs_payload(node_id: str) -> dict[str, str | int | list[dict[str, str]]]:
+    virtual_memory = psutil.virtual_memory()
+    return {
+        "node_id": node_id,
+        "os_name": detect_os_name(),
+        "cpu_cores": psutil.cpu_count() or 1,
+        "ram_total_mb": int(virtual_memory.total / (1024 * 1024)),
+        "ip_address": detect_primary_ip(),
+        "entries": collect_logs(),
     }
 
 
@@ -43,11 +137,16 @@ def main() -> None:
     args = parser.parse_args()
 
     endpoint = args.server_url.rstrip("/") + "/api/metrics"
+    logs_endpoint = args.server_url.rstrip("/") + "/api/logs"
     while True:
-        payload = collect_metrics(args.node_id)
-        response = requests.post(endpoint, json=payload, timeout=10)
-        response.raise_for_status()
-        print(f"Sent metrics: {payload}")
+        metrics_payload = collect_metrics(args.node_id)
+        logs_payload = collect_logs_payload(args.node_id)
+        metrics_response = requests.post(endpoint, json=metrics_payload, timeout=10)
+        metrics_response.raise_for_status()
+        logs_response = requests.post(logs_endpoint, json=logs_payload, timeout=20)
+        logs_response.raise_for_status()
+        print(f"Sent metrics: {json.dumps(metrics_payload)}")
+        print(f"Sent logs entries: {len(logs_payload['entries'])}")
         time.sleep(args.interval)
 
 
