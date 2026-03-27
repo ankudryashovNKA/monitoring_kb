@@ -116,6 +116,10 @@ class KBSolveResponse(BaseModel):
     results: list[KBResultItem] = Field(default_factory=list)
 
 
+class LLMGenerateIn(BaseModel):
+    prompt: str = Field(..., min_length=1, max_length=20000)
+
+
 app = FastAPI(title="Monitoring KB MVP")
 app.include_router(users_router)
 
@@ -653,6 +657,22 @@ def get_knowledge_base() -> dict[str, str | list[dict[str, str | list[dict[str, 
     }
 
 
+@app.post("/api/llm/generate")
+async def generate_llm(payload: LLMGenerateIn) -> dict[str, str]:
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                "http://localhost:11434/api/generate",
+                json={"model": "gemma3:4b", "prompt": payload.prompt, "stream": False},
+            )
+            response.raise_for_status()
+            data = response.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"LLM service error: {exc}") from exc
+
+    return {"response": str(data.get("response", ""))}
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> str:
     return """
@@ -713,7 +733,7 @@ def dashboard() -> str:
         .brand-subtitle, .sidebar.collapsed .nav-label, .sidebar.collapsed .brand-copy {
             display: none;
         }
-        .toggle-btn, .nav-btn, button, select, input {
+        .toggle-btn, .nav-btn, button, select, input, textarea {
             border-radius: 0.65rem;
             border: 1px solid var(--border);
             background: #262c37;
@@ -771,9 +791,20 @@ def dashboard() -> str:
             align-items: center;
             margin-bottom: 1rem;
         }
-        select, input {
+        select, input, textarea {
             min-height: 42px;
             padding: 0.65rem 0.8rem;
+        }
+        textarea {
+            width: 100%;
+            min-height: 220px;
+            resize: vertical;
+            font-family: inherit;
+        }
+        .llm-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(280px, 1fr));
+            gap: 1rem;
         }
         button {
             min-height: 42px;
@@ -853,6 +884,7 @@ def dashboard() -> str:
         @media (max-width: 900px) {
             .content { padding: 1rem; }
             .sidebar { position: sticky; top: 0; height: 100vh; }
+            .llm-grid { grid-template-columns: 1fr; }
         }
     </style>
 </head>
@@ -874,6 +906,7 @@ def dashboard() -> str:
                 <button class="nav-btn" data-tab="problems" type="button"><span class="nav-label">Problems</span></button>
                 <button class="nav-btn" data-tab="logs" type="button"><span class="nav-label">Logs</span></button>
                 <button class="nav-btn" data-tab="knowledge-base" type="button"><span class="nav-label">Knowledge Base</span></button>
+                <button class="nav-btn" data-tab="llm" type="button"><span class="nav-label">LLM</span></button>
             </nav>
         </aside>
         <main class="content">
@@ -1086,6 +1119,27 @@ def dashboard() -> str:
                     </thead>
                     <tbody id="knowledge-base-body"></tbody>
                 </table>
+            </section>
+
+            <section class="panel tab-panel" data-panel="llm" hidden>
+                <div class="page-header">
+                    <h2>LLM</h2>
+                    <p class="meta">Input: введите промпт, Output: получите ответ локальной модели gemma3:4b.</p>
+                </div>
+                <div class="toolbar">
+                    <button id="run-llm" type="button">Run LLM</button>
+                </div>
+                <div class="llm-grid">
+                    <label>
+                        <span class="meta">Input</span><br />
+                        <textarea id="llm-input" placeholder="Введите текст..."></textarea>
+                    </label>
+                    <label>
+                        <span class="meta">Output</span><br />
+                        <textarea id="llm-output" readonly placeholder="Ответ модели..."></textarea>
+                    </label>
+                </div>
+                <div id="llm-status" class="status"></div>
             </section>
         </main>
     </div>
@@ -1605,6 +1659,28 @@ def dashboard() -> str:
             }
         }
 
+        async function runLlm() {
+            const prompt = document.getElementById('llm-input').value.trim();
+            if (!prompt) {
+                setStatus('llm-status', 'Введите текст в input.', true);
+                return;
+            }
+            setStatus('llm-status', 'Generating...');
+            document.getElementById('llm-output').value = '';
+            try {
+                const data = await fetchJson('/api/llm/generate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ prompt }),
+                });
+                document.getElementById('llm-output').value = data.response || '';
+                setStatus('llm-status', 'Done.');
+            } catch (error) {
+                document.getElementById('llm-output').value = '';
+                setStatus('llm-status', error.message, true);
+            }
+        }
+
         document.getElementById('sidebar-toggle').addEventListener('click', () => {
             document.getElementById('sidebar').classList.toggle('collapsed');
         });
@@ -1684,6 +1760,7 @@ def dashboard() -> str:
             await loadLogs();
         });
         document.getElementById('refresh-knowledge-base').addEventListener('click', loadKnowledgeBase);
+        document.getElementById('run-llm').addEventListener('click', runLlm);
         document.addEventListener('click', async (event) => {
             const toggleButton = event.target.closest('[data-menu-toggle]');
             if (toggleButton) {
