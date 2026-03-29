@@ -684,22 +684,25 @@ def dashboard() -> str:
     <title>Monitoring KB MVP</title>
     <style>
         :root {
-            color-scheme: dark;
-            --bg: #111317;
-            --panel: #1b1f26;
-            --panel-alt: #232832;
-            --border: #3d4350;
-            --text: #eef1f6;
-            --muted: #a9b1c0;
-            --accent: #6f8fbd;
-            --accent-soft: rgba(111, 143, 189, 0.2);
-            --danger: #d47b7b;
+            color-scheme: light;
+            --bg: #f4f7fb;
+            --bg-gradient-start: #f8fbff;
+            --bg-gradient-end: #eef3fa;
+            --panel: #ffffff;
+            --panel-alt: #f8fbff;
+            --border: #dbe3ef;
+            --text: #1f2d3d;
+            --muted: #6f7f95;
+            --accent: #0173b2;
+            --accent-soft: rgba(1, 115, 178, 0.1);
+            --danger: #cf4557;
+            --shadow: 0 14px 28px rgba(31, 45, 61, 0.08);
         }
         * { box-sizing: border-box; }
         body {
             margin: 0;
-            font-family: Arial, sans-serif;
-            background: linear-gradient(180deg, #0f1217 0%, #171c24 100%);
+            font-family: Inter, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: linear-gradient(180deg, var(--bg-gradient-start) 0%, var(--bg-gradient-end) 100%);
             color: var(--text);
         }
         .layout {
@@ -708,11 +711,16 @@ def dashboard() -> str:
         }
         .sidebar {
             width: 260px;
-            background: rgba(24, 28, 35, 0.98);
+            position: sticky;
+            top: 0;
+            height: 100vh;
+            overflow-y: auto;
+            background: rgba(255, 255, 255, 0.96);
             border-right: 1px solid var(--border);
             padding: 1.25rem 1rem;
             transition: width 0.25s ease, padding 0.25s ease;
-            overflow: hidden;
+            box-shadow: 6px 0 24px rgba(20, 41, 77, 0.06);
+            z-index: 10;
         }
         .sidebar.collapsed {
             width: 84px;
@@ -734,9 +742,9 @@ def dashboard() -> str:
             display: none;
         }
         .toggle-btn, .nav-btn, button, select, input, textarea {
-            border-radius: 0.65rem;
+            border-radius: 0.45rem;
             border: 1px solid var(--border);
-            background: #262c37;
+            background: #fff;
             color: var(--text);
         }
         .toggle-btn, .nav-btn, button {
@@ -756,13 +764,18 @@ def dashboard() -> str:
             align-items: center;
             gap: 0.75rem;
             width: 100%;
-            padding: 0.85rem 1rem;
+            padding: 0.7rem 0.85rem;
             text-align: left;
             transition: background 0.2s ease, border-color 0.2s ease;
+        }
+        .nav-btn:hover {
+            border-color: #c2d2e9;
+            background: #f7faff;
         }
         .nav-btn.active {
             background: var(--accent-soft);
             border-color: var(--accent);
+            color: #005489;
         }
         .sidebar.collapsed .nav-btn {
             justify-content: center;
@@ -773,11 +786,11 @@ def dashboard() -> str:
             padding: 2rem;
         }
         .panel {
-            background: rgba(27, 31, 38, 0.92);
+            background: var(--panel);
             border: 1px solid var(--border);
-            border-radius: 1.25rem;
+            border-radius: 0.9rem;
             padding: 1.5rem;
-            box-shadow: 0 16px 28px rgba(0, 0, 0, 0.25);
+            box-shadow: var(--shadow);
         }
         .page-header {
             margin-bottom: 1.25rem;
@@ -788,12 +801,17 @@ def dashboard() -> str:
             display: flex;
             flex-wrap: wrap;
             gap: 0.75rem;
-            align-items: center;
+            align-items: flex-end;
             margin-bottom: 1rem;
         }
+        .toolbar label {
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
+        }
         select, input, textarea {
-            min-height: 42px;
-            padding: 0.65rem 0.8rem;
+            min-height: 38px;
+            padding: 0.5rem 0.65rem;
         }
         textarea {
             width: 100%;
@@ -807,14 +825,21 @@ def dashboard() -> str:
             gap: 1rem;
         }
         button {
-            min-height: 42px;
-            padding: 0.65rem 1rem;
+            min-height: 38px;
+            padding: 0.45rem 0.8rem;
             background: var(--accent-soft);
             border-color: var(--accent);
+            font-weight: 600;
+            transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
+        }
+        button:hover {
+            background: rgba(1, 115, 178, 0.16);
+            border-color: #016198;
+            transform: translateY(-1px);
         }
         button.danger {
             border-color: var(--danger);
-            background: rgba(212, 123, 123, 0.16);
+            background: rgba(207, 69, 87, 0.1);
         }
         button.secondary {
             background: transparent;
@@ -824,9 +849,8 @@ def dashboard() -> str:
             width: 100%;
             border-collapse: collapse;
             margin-top: 1rem;
-            background: rgba(17, 19, 23, 0.55);
-            border-radius: 1rem;
-            overflow: hidden;
+            background: #fff;
+            border-radius: 0.8rem;
         }
         th, td {
             padding: 0.85rem;
@@ -835,7 +859,10 @@ def dashboard() -> str:
             vertical-align: top;
         }
         th {
-            background: rgba(42, 48, 58, 0.88);
+            background: #f2f7fc;
+        }
+        tr:hover td {
+            background: #fbfdff;
         }
         tr:last-child td { border-bottom: none; }
         .grid {
@@ -845,9 +872,9 @@ def dashboard() -> str:
             margin-bottom: 1rem;
         }
         .stat {
-            background: rgba(17, 19, 23, 0.55);
+            background: var(--panel-alt);
             border: 1px solid var(--border);
-            border-radius: 1rem;
+            border-radius: 0.8rem;
             padding: 1rem;
         }
         .stat-label { color: var(--muted); font-size: 0.9rem; }
@@ -858,23 +885,25 @@ def dashboard() -> str:
             width: 64px;
         }
         .menu-btn {
-            min-height: 34px;
-            padding: 0.3rem 0.6rem;
+            min-height: 30px;
+            padding: 0.25rem 0.45rem;
             line-height: 1;
         }
         .menu-popover {
-            position: absolute;
-            right: 0.5rem;
-            top: 2.5rem;
-            z-index: 4;
+            position: fixed;
+            z-index: 9999;
             display: flex;
             flex-direction: column;
             gap: 0.35rem;
             padding: 0.5rem;
             border: 1px solid var(--border);
-            border-radius: 0.65rem;
-            background: #202630;
+            border-radius: 0.55rem;
+            background: #fff;
+            min-width: 146px;
+            box-shadow: 0 14px 30px rgba(31, 45, 61, 0.16);
         }
+        .menu-popover button { width: 100%; text-align: left; }
+        #global-menu[hidden] { display: none !important; }
         .empty, .status {
             color: var(--muted);
             padding: 1rem 0;
@@ -883,7 +912,7 @@ def dashboard() -> str:
         [hidden] { display: none !important; }
         @media (max-width: 900px) {
             .content { padding: 1rem; }
-            .sidebar { position: sticky; top: 0; height: 100vh; }
+            .sidebar { position: fixed; }
             .llm-grid { grid-template-columns: 1fr; }
         }
     </style>
@@ -989,15 +1018,15 @@ def dashboard() -> str:
                 </div>
                 <div id="graph-status" class="status"></div>
                 <svg id="graph-canvas" viewBox="0 0 1200 360" width="100%" height="360" role="img" aria-label="Metric graph">
-                    <rect x="0" y="0" width="1200" height="360" fill="rgba(2, 6, 23, 0.35)" stroke="#334155"></rect>
+                    <rect x="0" y="0" width="1200" height="360" fill="#f8fbff" stroke="#c9d8ea"></rect>
                     <g id="graph-y-grid"></g>
-                    <line x1="80" y1="300" x2="1160" y2="300" stroke="#334155" />
-                    <line x1="80" y1="40" x2="80" y2="300" stroke="#334155" />
+                    <line x1="80" y1="300" x2="1160" y2="300" stroke="#c9d8ea" />
+                    <line x1="80" y1="40" x2="80" y2="300" stroke="#c9d8ea" />
                     <g id="graph-y-labels"></g>
                     <g id="graph-x-labels"></g>
-                    <polyline id="graph-line" fill="none" stroke="#38bdf8" stroke-width="1.5" points=""></polyline>
+                    <polyline id="graph-line" fill="none" stroke="#0173b2" stroke-width="1.8" points=""></polyline>
                     <g id="graph-points"></g>
-                    <text id="graph-title" x="80" y="24" fill="#94a3b8">No data</text>
+                    <text id="graph-title" x="80" y="24" fill="#6f7f95">No data</text>
                 </svg>
             </section>
 
@@ -1143,6 +1172,7 @@ def dashboard() -> str:
             </section>
         </main>
     </div>
+    <div id="global-menu" class="menu-popover" hidden></div>
 
     <script>
         const state = {
@@ -1155,6 +1185,7 @@ def dashboard() -> str:
             triggerSelectedNodeId: '',
             logsSelectedNodeId: '',
             activeMenuKey: '',
+            activeMenuData: null,
             activeTab: 'latest',
         };
 
@@ -1290,14 +1321,14 @@ def dashboard() -> str:
                 gridLine.setAttribute('y1', y.toFixed(2));
                 gridLine.setAttribute('x2', String(plotLeft + plotWidth));
                 gridLine.setAttribute('y2', y.toFixed(2));
-                gridLine.setAttribute('stroke', 'rgba(71, 85, 105, 0.45)');
+                gridLine.setAttribute('stroke', 'rgba(111, 127, 149, 0.5)');
                 gridLine.setAttribute('stroke-dasharray', '4 5');
                 yGrid.appendChild(gridLine);
 
                 const yLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
                 yLabel.setAttribute('x', String(plotLeft - 10));
                 yLabel.setAttribute('y', (y + 4).toFixed(2));
-                yLabel.setAttribute('fill', '#94a3b8');
+                yLabel.setAttribute('fill', '#6f7f95');
                 yLabel.setAttribute('font-size', '12');
                 yLabel.setAttribute('text-anchor', 'end');
                 yLabel.textContent = tickValue.toFixed(1);
@@ -1312,7 +1343,7 @@ def dashboard() -> str:
                 const xLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
                 xLabel.setAttribute('x', x.toFixed(2));
                 xLabel.setAttribute('y', String(plotTop + plotHeight + 20));
-                xLabel.setAttribute('fill', '#94a3b8');
+                xLabel.setAttribute('fill', '#6f7f95');
                 xLabel.setAttribute('font-size', '12');
                 xLabel.setAttribute('text-anchor', 'middle');
                 xLabel.textContent = new Date(tickMs).toLocaleTimeString('en-GB', {
@@ -1339,7 +1370,7 @@ def dashboard() -> str:
                 point.setAttribute('cx', x.toFixed(2));
                 point.setAttribute('cy', y.toFixed(2));
                 point.setAttribute('r', '2.4');
-                point.setAttribute('fill', '#38bdf8');
+                point.setAttribute('fill', '#0173b2');
                 pointLayer.appendChild(point);
                 return `${x.toFixed(2)},${y.toFixed(2)}`;
             });
@@ -1412,11 +1443,14 @@ def dashboard() -> str:
                     <td>${node.ip_address}</td>
                     <td>${formatUtc(node.last_seen)}</td>
                     <td class="menu-cell">
-                        <button type="button" class="menu-btn secondary" data-menu-toggle="${menuKey}" aria-label="Node actions">...</button>
-                        <div class="menu-popover" data-menu="${menuKey}" hidden>
-                            <button type="button" data-node-action="rename" data-node-id="${node.node_id}">Rename</button>
-                            <button type="button" class="danger" data-node-action="delete" data-node-id="${node.node_id}">Delete</button>
-                        </div>
+                        <button
+                            type="button"
+                            class="menu-btn secondary"
+                            data-menu-toggle="${menuKey}"
+                            data-menu-type="node"
+                            data-node-id="${node.node_id}"
+                            aria-label="Node actions"
+                        >...</button>
                     </td>
                 `;
                 body.appendChild(row);
@@ -1446,11 +1480,16 @@ def dashboard() -> str:
                     <td>${trigger.is_active ? 'Active' : 'OK'}</td>
                     <td>${formatUtc(trigger.created_at)}</td>
                     <td class="menu-cell">
-                        <button type="button" class="menu-btn secondary" data-menu-toggle="${menuKey}" aria-label="Trigger actions">...</button>
-                        <div class="menu-popover" data-menu="${menuKey}" hidden>
-                            <button type="button" data-trigger-action="edit" data-trigger-id="${trigger.id}" data-trigger-name="${trigger.name}" data-trigger-threshold="${trigger.threshold}">Edit</button>
-                            <button type="button" class="danger" data-trigger-action="delete" data-trigger-id="${trigger.id}">Delete</button>
-                        </div>
+                        <button
+                            type="button"
+                            class="menu-btn secondary"
+                            data-menu-toggle="${menuKey}"
+                            data-menu-type="trigger"
+                            data-trigger-id="${trigger.id}"
+                            data-trigger-name="${trigger.name}"
+                            data-trigger-threshold="${trigger.threshold}"
+                            aria-label="Trigger actions"
+                        >...</button>
                     </td>
                 `;
                 body.appendChild(row);
@@ -1525,10 +1564,43 @@ def dashboard() -> str:
         }
 
         function closeAllMenus() {
-            document.querySelectorAll('.menu-popover').forEach((menu) => {
-                menu.hidden = true;
-            });
+            const menu = document.getElementById('global-menu');
+            menu.hidden = true;
+            menu.innerHTML = '';
             state.activeMenuKey = '';
+            state.activeMenuData = null;
+        }
+
+        function openGlobalMenu(toggleButton) {
+            const menu = document.getElementById('global-menu');
+            const rect = toggleButton.getBoundingClientRect();
+            const key = toggleButton.dataset.menuToggle;
+            const type = toggleButton.dataset.menuType;
+            if (!key || !type) return;
+
+            if (type === 'node') {
+                const nodeId = toggleButton.dataset.nodeId;
+                menu.innerHTML = `
+                    <button type="button" data-node-action="rename" data-node-id="${nodeId}">Rename</button>
+                    <button type="button" class="danger" data-node-action="delete" data-node-id="${nodeId}">Delete</button>
+                `;
+            } else if (type === 'trigger') {
+                const triggerId = toggleButton.dataset.triggerId;
+                const triggerName = toggleButton.dataset.triggerName || '';
+                const triggerThreshold = toggleButton.dataset.triggerThreshold || '';
+                menu.innerHTML = `
+                    <button type="button" data-trigger-action="edit" data-trigger-id="${triggerId}" data-trigger-name="${triggerName}" data-trigger-threshold="${triggerThreshold}">Edit</button>
+                    <button type="button" class="danger" data-trigger-action="delete" data-trigger-id="${triggerId}">Delete</button>
+                `;
+            } else {
+                return;
+            }
+
+            menu.style.top = `${Math.min(window.innerHeight - 120, rect.bottom + 6)}px`;
+            menu.style.left = `${Math.max(8, rect.right - 160)}px`;
+            menu.hidden = false;
+            state.activeMenuKey = key;
+            state.activeMenuData = { type };
         }
 
         async function loadNodes() {
@@ -1765,12 +1837,10 @@ def dashboard() -> str:
             const toggleButton = event.target.closest('[data-menu-toggle]');
             if (toggleButton) {
                 const key = toggleButton.dataset.menuToggle;
-                const menu = document.querySelector(`[data-menu="${key}"]`);
                 const shouldOpen = state.activeMenuKey !== key;
                 closeAllMenus();
-                if (menu && shouldOpen) {
-                    menu.hidden = false;
-                    state.activeMenuKey = key;
+                if (shouldOpen) {
+                    openGlobalMenu(toggleButton);
                 }
                 return;
             }
