@@ -9,18 +9,25 @@ import logging
 import operator
 from typing import Deque
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 import httpx
 
 from app.api.users import router as users_router
 from app.config import settings
 from app.db.base import Base
 from app.db.session import SessionLocal, engine
+from app.models.agent import Agent
 import app.models.metric  # noqa: F401
 import app.models.node  # noqa: F401
 import app.models.log_entry  # noqa: F401
 import app.models.trigger  # noqa: F401
 import app.models.user  # noqa: F401
+import app.models.agent  # noqa: F401
+from app.security.agent_auth import (
+    register_agent,
+    rotate_agent_secret,
+    validate_agent_request,
+)
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func
@@ -238,6 +245,16 @@ def _serialize_node(node: NodeInfo) -> dict[str, str | int]:
     return item
 
 
+def _serialize_agent(agent: Agent) -> dict[str, str | bool | None]:
+    return {
+        "agent_id": agent.agent_id,
+        "enabled": agent.enabled,
+        "created_at": agent.created_at.isoformat(),
+        "updated_at": agent.updated_at.isoformat(),
+        "last_seen": agent.last_seen.isoformat() if agent.last_seen else None,
+    }
+
+
 def _is_trigger_active(trigger: Trigger, metric: Metric | None) -> bool:
     if metric is None:
         return False
@@ -314,6 +331,16 @@ def ingest_metric(metric: MetricIn) -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/api/agent/metrics")
+async def ingest_metric_from_agent(request: Request) -> dict[str, str]:
+    raw_body = await request.body()
+    request.state.raw_body = raw_body
+    metric = MetricIn.model_validate_json(raw_body)
+    with SessionLocal() as db:
+        _agent = validate_agent_request(request, db)
+    return ingest_metric(metric)
+
+
 @app.post("/api/logs")
 def ingest_logs(payload: LogsIn) -> dict[str, str | int]:
     now = _utcnow()
@@ -367,6 +394,16 @@ def ingest_logs(payload: LogsIn) -> dict[str, str | int]:
 
         db.commit()
     return {"status": "ok", "inserted": inserted_count}
+
+
+@app.post("/api/agent/logs")
+async def ingest_logs_from_agent(request: Request) -> dict[str, str | int]:
+    raw_body = await request.body()
+    request.state.raw_body = raw_body
+    payload = LogsIn.model_validate_json(raw_body)
+    with SessionLocal() as db:
+        _agent = validate_agent_request(request, db)
+    return ingest_logs(payload)
 
 
 @app.get("/api/logs")
@@ -517,6 +554,54 @@ def delete_node(node_id: str) -> dict[str, str]:
         db.delete(node)
         db.commit()
     return {"status": "ok"}
+
+
+@app.get("/api/agents")
+def list_agents() -> dict[str, list[dict[str, str | bool | None]]]:
+    with SessionLocal() as db:
+        rows = db.query(Agent).order_by(Agent.created_at.desc()).all()
+        return {"items": [_serialize_agent(agent) for agent in rows]}
+
+
+@app.post("/api/agents/register")
+def register_new_agent() -> dict[str, str]:
+    with SessionLocal() as db:
+        agent_id, secret = register_agent(db)
+        return {"agent_id": agent_id, "secret": secret}
+
+
+@app.post("/api/agents/{agent_id}/disable")
+def disable_agent(agent_id: str) -> dict[str, str | bool]:
+    with SessionLocal() as db:
+        agent = db.query(Agent).filter(Agent.agent_id == agent_id).first()
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        agent.enabled = False
+        agent.updated_at = _utcnow()
+        db.commit()
+        return {"agent_id": agent.agent_id, "enabled": agent.enabled}
+
+
+@app.post("/api/agents/{agent_id}/enable")
+def enable_agent(agent_id: str) -> dict[str, str | bool]:
+    with SessionLocal() as db:
+        agent = db.query(Agent).filter(Agent.agent_id == agent_id).first()
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        agent.enabled = True
+        agent.updated_at = _utcnow()
+        db.commit()
+        return {"agent_id": agent.agent_id, "enabled": agent.enabled}
+
+
+@app.post("/api/agents/{agent_id}/rotate-secret")
+def rotate_agent_secret_endpoint(agent_id: str) -> dict[str, str]:
+    with SessionLocal() as db:
+        agent = db.query(Agent).filter(Agent.agent_id == agent_id).first()
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        secret = rotate_agent_secret(db, agent)
+        return {"agent_id": agent.agent_id, "secret": secret}
 
 
 @app.post("/api/triggers")
@@ -971,7 +1056,11 @@ def dashboard() -> str:
                     <h2>Nodes</h2>
                     <p class="meta">Connected nodes with system info and the ability to rename them.</p>
                 </div>
+                <div class="toolbar">
+                    <button id="register-node-agent" type="button">Register new node</button>
+                </div>
                 <div id="nodes-status" class="status"></div>
+                <div id="agents-status" class="status"></div>
                 <table>
                     <thead>
                         <tr>
@@ -985,6 +1074,19 @@ def dashboard() -> str:
                         </tr>
                     </thead>
                     <tbody id="nodes-body"></tbody>
+                </table>
+                <h3>Agent credentials</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Agent ID</th>
+                            <th>Status</th>
+                            <th>Last seen (UTC)</th>
+                            <th>Updated (UTC)</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="agents-body"></tbody>
                 </table>
             </section>
 
@@ -1177,6 +1279,7 @@ def dashboard() -> str:
     <script>
         const state = {
             nodes: [],
+            agents: [],
             triggers: [],
             problems: [],
             knowledgeBase: [],
@@ -1457,6 +1560,30 @@ def dashboard() -> str:
             }
         }
 
+        function renderAgentsTable() {
+            const body = document.getElementById('agents-body');
+            body.innerHTML = '';
+            if (!state.agents.length) {
+                body.innerHTML = '<tr><td colspan="5" class="empty">No registered agents yet.</td></tr>';
+                return;
+            }
+            for (const agent of state.agents) {
+                const row = document.createElement('tr');
+                const actionLabel = agent.enabled ? 'Disable' : 'Enable';
+                row.innerHTML = `
+                    <td><code>${agent.agent_id}</code></td>
+                    <td>${agent.enabled ? 'Enabled' : 'Disabled'}</td>
+                    <td>${agent.last_seen ? formatUtc(agent.last_seen) : 'Never'}</td>
+                    <td>${formatUtc(agent.updated_at)}</td>
+                    <td>
+                        <button type="button" class="secondary" data-agent-action="${agent.enabled ? 'disable' : 'enable'}" data-agent-id="${agent.agent_id}">${actionLabel}</button>
+                        <button type="button" data-agent-action="rotate" data-agent-id="${agent.agent_id}">Rotate secret</button>
+                    </td>
+                `;
+                body.appendChild(row);
+            }
+        }
+
         function metricLabel(metricName) {
             return metricName === 'cpu_percent' ? 'CPU %' : 'RAM %';
         }
@@ -1612,6 +1739,30 @@ def dashboard() -> str:
                 setStatus('nodes-status', state.nodes.length ? '' : 'Waiting for nodes to send data.');
             } catch (error) {
                 setStatus('nodes-status', error.message, true);
+            }
+        }
+
+        async function loadAgents() {
+            try {
+                const data = await fetchJson('/api/agents');
+                state.agents = data.items || [];
+                renderAgentsTable();
+                setStatus('agents-status', state.agents.length ? '' : 'No agents registered yet.');
+            } catch (error) {
+                state.agents = [];
+                renderAgentsTable();
+                setStatus('agents-status', error.message, true);
+            }
+        }
+
+        async function registerAgent() {
+            try {
+                const data = await fetchJson('/api/agents/register', { method: 'POST' });
+                setStatus('agents-status', 'Agent created. Save credentials now.', false);
+                window.alert(`Copy once:\\nAGENT_ID=${data.agent_id}\\nAGENT_SECRET=${data.secret}`);
+                await loadAgents();
+            } catch (error) {
+                setStatus('agents-status', error.message, true);
             }
         }
 
@@ -1779,6 +1930,7 @@ def dashboard() -> str:
         });
 
         document.getElementById('refresh-latest').addEventListener('click', loadLatestMetrics);
+        document.getElementById('register-node-agent').addEventListener('click', registerAgent);
         document.getElementById('refresh-graph').addEventListener('click', loadGraph);
         document.getElementById('graph-node-select').addEventListener('change', async (event) => {
             state.graphSelectedNodeId = event.target.value;
@@ -1921,6 +2073,27 @@ def dashboard() -> str:
                 return;
             }
 
+            const agentActionButton = event.target.closest('[data-agent-action]');
+            if (agentActionButton) {
+                const action = agentActionButton.dataset.agentAction;
+                const agentId = agentActionButton.dataset.agentId;
+                try {
+                    if (action === 'disable' || action === 'enable') {
+                        await fetchJson(`/api/agents/${encodeURIComponent(agentId)}/${action}`, { method: 'POST' });
+                        setStatus('agents-status', `Agent ${action}d.`);
+                    }
+                    if (action === 'rotate') {
+                        const data = await fetchJson(`/api/agents/${encodeURIComponent(agentId)}/rotate-secret`, { method: 'POST' });
+                        setStatus('agents-status', 'Secret rotated. Save new secret now.');
+                        window.alert(`New secret for ${data.agent_id}:\\nAGENT_SECRET=${data.secret}`);
+                    }
+                    await loadAgents();
+                } catch (error) {
+                    setStatus('agents-status', error.message, true);
+                }
+                return;
+            }
+
             if (!event.target.closest('.menu-popover')) {
                 closeAllMenus();
             }
@@ -1928,6 +2101,7 @@ def dashboard() -> str:
 
         async function refreshAll() {
             await loadNodes();
+            await loadAgents();
             await loadLatestMetrics();
             await loadGraph();
             await loadTriggers();

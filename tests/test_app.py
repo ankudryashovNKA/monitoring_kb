@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import sys
+import time
 from pathlib import Path
+
+from fastapi.testclient import TestClient
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from main import (  # noqa: E402
+    app,
     RECENT_POINTS_LIMIT,
     _normalize_kb_results,
     TriggerCreateIn,
@@ -27,10 +34,12 @@ from main import (  # noqa: E402
     ingest_logs,
 )
 from app.db.session import SessionLocal  # noqa: E402
+from app.models.agent import Agent  # noqa: E402
 from app.models.metric import Metric  # noqa: E402
 from app.models.node import Node  # noqa: E402
 from app.models.log_entry import LogEntry  # noqa: E402
 from app.models.trigger import Trigger  # noqa: E402
+from app.security.agent_auth import register_agent  # noqa: E402
 
 
 def setup_function() -> None:
@@ -39,7 +48,15 @@ def setup_function() -> None:
         db.query(LogEntry).delete()
         db.query(Trigger).delete()
         db.query(Node).delete()
+        db.query(Agent).delete()
         db.commit()
+
+
+def _signed_headers(agent_id: str, secret: str, path: str, raw_body: bytes, timestamp: int | None = None) -> dict[str, str]:
+    ts = str(timestamp if timestamp is not None else int(time.time()))
+    payload = f"POST\n{path}\n{ts}\n".encode("utf-8") + raw_body
+    signature = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+    return {"X-Agent-ID": agent_id, "X-Timestamp": ts, "X-Signature": signature, "Content-Type": "application/json"}
 
 
 def test_ingest_and_list_metrics() -> None:
@@ -223,3 +240,107 @@ def test_logs_ingest_and_list() -> None:
     assert response["node_id"] == "node-logs"
     assert response["os_name"] == "Ubuntu 24.04"
     assert len(response["items"]) == 2
+
+
+def test_agent_auth_success() -> None:
+    with SessionLocal() as db:
+        agent_id, secret = register_agent(db)
+    client = TestClient(app)
+
+    payload = {
+        "node_id": "node-auth",
+        "cpu_percent": 11.0,
+        "ram_percent": 22.0,
+        "os_name": "Ubuntu",
+        "cpu_cores": 2,
+        "ram_total_mb": 4096,
+        "ip_address": "10.0.0.30",
+        "timestamp": "2026-03-30T00:00:00+00:00",
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    headers = _signed_headers(agent_id, secret, "/api/agent/metrics", raw)
+    response = client.post("/api/agent/metrics", data=raw, headers=headers)
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_agent_auth_invalid_signature() -> None:
+    with SessionLocal() as db:
+        agent_id, secret = register_agent(db)
+    client = TestClient(app)
+    payload = {
+        "node_id": "node-auth",
+        "cpu_percent": 11.0,
+        "ram_percent": 22.0,
+        "os_name": "Ubuntu",
+        "cpu_cores": 2,
+        "ram_total_mb": 4096,
+        "ip_address": "10.0.0.30",
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    headers = _signed_headers(agent_id, secret + "invalid", "/api/agent/metrics", raw)
+    response = client.post("/api/agent/metrics", data=raw, headers=headers)
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid signature"
+
+
+def test_agent_auth_unknown_agent() -> None:
+    client = TestClient(app)
+    payload = {
+        "node_id": "node-auth",
+        "cpu_percent": 11.0,
+        "ram_percent": 22.0,
+        "os_name": "Ubuntu",
+        "cpu_cores": 2,
+        "ram_total_mb": 4096,
+        "ip_address": "10.0.0.30",
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    headers = _signed_headers("unknown-agent", "secret", "/api/agent/metrics", raw)
+    response = client.post("/api/agent/metrics", data=raw, headers=headers)
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Unknown agent"
+
+
+def test_agent_auth_disabled_agent() -> None:
+    with SessionLocal() as db:
+        agent_id, secret = register_agent(db)
+        agent = db.query(Agent).filter(Agent.agent_id == agent_id).first()
+        assert agent is not None
+        agent.enabled = False
+        db.commit()
+    client = TestClient(app)
+    payload = {
+        "node_id": "node-auth",
+        "cpu_percent": 11.0,
+        "ram_percent": 22.0,
+        "os_name": "Ubuntu",
+        "cpu_cores": 2,
+        "ram_total_mb": 4096,
+        "ip_address": "10.0.0.30",
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    headers = _signed_headers(agent_id, secret, "/api/agent/metrics", raw)
+    response = client.post("/api/agent/metrics", data=raw, headers=headers)
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Agent is disabled"
+
+
+def test_agent_auth_expired_timestamp() -> None:
+    with SessionLocal() as db:
+        agent_id, secret = register_agent(db)
+    client = TestClient(app)
+    payload = {
+        "node_id": "node-auth",
+        "cpu_percent": 11.0,
+        "ram_percent": 22.0,
+        "os_name": "Ubuntu",
+        "cpu_cores": 2,
+        "ram_total_mb": 4096,
+        "ip_address": "10.0.0.30",
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    headers = _signed_headers(agent_id, secret, "/api/agent/metrics", raw, timestamp=int(time.time()) - 601)
+    response = client.post("/api/agent/metrics", data=raw, headers=headers)
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Authentication timestamp is outside allowed window"
