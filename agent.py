@@ -108,18 +108,43 @@ def _tail_file(path: str, limit: int) -> list[str]:
         return [line.strip() for line in deque(file, maxlen=limit) if line.strip()]
 
 
+def _collect_windows_eventlog() -> list[dict[str, str]]:
+    command = ["wevtutil", "qe", "System", "/rd:true", f"/c:{MAX_LOG_ENTRIES}", "/f:text"]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        error_message = _sanitize_log_text(completed.stderr.strip())
+        return [{"source": "windows-eventlog", "message": error_message}] if error_message else []
+
+    raw_lines = [line.rstrip() for line in completed.stdout.splitlines()]
+    events: list[list[str]] = []
+    current_event: list[str] = []
+    for raw_line in raw_lines:
+        sanitized_line = _sanitize_log_text(raw_line.strip())
+        if not sanitized_line:
+            continue
+        if sanitized_line.startswith("Event["):
+            if current_event:
+                events.append(current_event)
+            current_event = [sanitized_line]
+            continue
+        if not current_event:
+            current_event = [sanitized_line]
+            continue
+        current_event.append(sanitized_line)
+
+    if current_event:
+        events.append(current_event)
+
+    return [
+        {"source": "windows-eventlog", "message": "\n".join(event_lines)}
+        for event_lines in events[:MAX_LOG_ENTRIES]
+    ]
+
+
 def collect_logs() -> list[dict[str, str]]:
     system = platform.system().lower()
     if system == "windows":
-        command = ["wevtutil", "qe", "System", "/rd:true", f"/c:{MAX_LOG_ENTRIES}", "/f:text"]
-        completed = subprocess.run(command, capture_output=True, text=True, check=False)
-        text = completed.stdout if completed.returncode == 0 else completed.stderr
-        lines = [
-            _sanitize_log_text(line.strip())
-            for line in text.splitlines()
-            if line.strip()
-        ][:MAX_LOG_ENTRIES]
-        return [{"source": "windows-eventlog", "message": line} for line in lines]
+        return _collect_windows_eventlog()
 
     path, source = _linux_log_source()
     if path == "journalctl":
