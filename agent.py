@@ -31,11 +31,12 @@ def detect_primary_ip() -> str:
         return "127.0.0.1"
 
 
-def collect_metrics(node_id: str) -> dict[str, str | float | int]:
+def collect_metrics(display_name: str, agent_id: str) -> dict[str, str | float | int]:
     os_name = detect_os_name()
     virtual_memory = psutil.virtual_memory()
     return {
-        "node_id": node_id,
+        "node_id": display_name,
+        "agent_id": agent_id,
         "cpu_percent": psutil.cpu_percent(interval=1),
         "ram_percent": virtual_memory.percent,
         "os_name": os_name,
@@ -122,10 +123,11 @@ def collect_logs() -> list[dict[str, str]]:
         return [{"source": source, "message": f"Failed to read {path}: {error}"}]
 
 
-def collect_logs_payload(node_id: str) -> dict[str, str | int | list[dict[str, str]]]:
+def collect_logs_payload(display_name: str, agent_id: str) -> dict[str, str | int | list[dict[str, str]]]:
     virtual_memory = psutil.virtual_memory()
     return {
-        "node_id": node_id,
+        "node_id": display_name,
+        "agent_id": agent_id,
         "os_name": detect_os_name(),
         "cpu_cores": psutil.cpu_count() or 1,
         "ram_total_mb": int(virtual_memory.total / (1024 * 1024)),
@@ -177,7 +179,11 @@ def post_signed_json(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Monitoring agent")
     parser.add_argument("--server-url", default=os.getenv("SERVER_URL"), help="FastAPI server URL, e.g. http://localhost:8000")
-    parser.add_argument("--node-id", default=os.getenv("NODE_ID", socket.gethostname()), help="Node identifier")
+    parser.add_argument(
+        "--display-name",
+        default=os.getenv("DISPLAY_NAME", os.getenv("NODE_ID", socket.gethostname())),
+        help="Display name shown in dashboard",
+    )
     parser.add_argument("--agent-id", default=os.getenv("AGENT_ID"), help="Registered agent ID")
     parser.add_argument("--agent-secret", default=os.getenv("AGENT_SECRET"), help="Registered agent secret")
     parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL_SECONDS, help="Send interval in seconds")
@@ -193,8 +199,8 @@ def main() -> None:
     metrics_path = "/api/agent/metrics"
     logs_path = "/api/agent/logs"
     while True:
-        metrics_payload = collect_metrics(args.node_id)
-        logs_payload = collect_logs_payload(args.node_id)
+        metrics_payload = collect_metrics(args.display_name, args.agent_id)
+        logs_payload = collect_logs_payload(args.display_name, args.agent_id)
         metrics_response = post_signed_json(
             server_url=args.server_url,
             endpoint_path=metrics_path,
