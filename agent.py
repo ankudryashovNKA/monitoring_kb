@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+import hashlib
+import hmac
 import json
 import os
 import platform
@@ -12,9 +14,12 @@ from datetime import datetime, timezone
 
 import psutil
 import requests
+from dotenv import load_dotenv
 
 DEFAULT_INTERVAL_SECONDS = 60
 MAX_LOG_ENTRIES = 100
+
+load_dotenv()
 
 
 def detect_primary_ip() -> str:
@@ -129,21 +134,84 @@ def collect_logs_payload(node_id: str) -> dict[str, str | int | list[dict[str, s
     }
 
 
+def build_signed_headers(
+    *,
+    method: str,
+    endpoint_path: str,
+    payload_bytes: bytes,
+    agent_id: str,
+    agent_secret: str,
+) -> dict[str, str]:
+    timestamp = str(int(time.time()))
+    canonical_payload = f"{method}\n{endpoint_path}\n{timestamp}\n".encode("utf-8") + payload_bytes
+    signature = hmac.new(agent_secret.encode("utf-8"), canonical_payload, hashlib.sha256).hexdigest()
+    return {
+        "Content-Type": "application/json",
+        "X-Agent-ID": agent_id,
+        "X-Timestamp": timestamp,
+        "X-Signature": signature,
+    }
+
+
+def post_signed_json(
+    *,
+    server_url: str,
+    endpoint_path: str,
+    payload: dict[str, object],
+    timeout: int,
+    agent_id: str,
+    agent_secret: str,
+) -> requests.Response:
+    raw_body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    headers = build_signed_headers(
+        method="POST",
+        endpoint_path=endpoint_path,
+        payload_bytes=raw_body,
+        agent_id=agent_id,
+        agent_secret=agent_secret,
+    )
+    url = server_url.rstrip("/") + endpoint_path
+    return requests.post(url, data=raw_body, headers=headers, timeout=timeout)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Monitoring agent")
-    parser.add_argument("--server-url", required=True, help="FastAPI server URL, e.g. http://localhost:8000")
-    parser.add_argument("--node-id", default=socket.gethostname(), help="Node identifier")
+    parser.add_argument("--server-url", default=os.getenv("SERVER_URL"), help="FastAPI server URL, e.g. http://localhost:8000")
+    parser.add_argument("--node-id", default=os.getenv("NODE_ID", socket.gethostname()), help="Node identifier")
+    parser.add_argument("--agent-id", default=os.getenv("AGENT_ID"), help="Registered agent ID")
+    parser.add_argument("--agent-secret", default=os.getenv("AGENT_SECRET"), help="Registered agent secret")
     parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL_SECONDS, help="Send interval in seconds")
     args = parser.parse_args()
 
-    endpoint = args.server_url.rstrip("/") + "/api/metrics"
-    logs_endpoint = args.server_url.rstrip("/") + "/api/logs"
+    if not args.server_url:
+        raise SystemExit("SERVER_URL is required (env SERVER_URL or --server-url).")
+    if not args.agent_id:
+        raise SystemExit("AGENT_ID is required (env AGENT_ID or --agent-id).")
+    if not args.agent_secret:
+        raise SystemExit("AGENT_SECRET is required (env AGENT_SECRET or --agent-secret).")
+
+    metrics_path = "/api/agent/metrics"
+    logs_path = "/api/agent/logs"
     while True:
         metrics_payload = collect_metrics(args.node_id)
         logs_payload = collect_logs_payload(args.node_id)
-        metrics_response = requests.post(endpoint, json=metrics_payload, timeout=10)
+        metrics_response = post_signed_json(
+            server_url=args.server_url,
+            endpoint_path=metrics_path,
+            payload=metrics_payload,
+            timeout=10,
+            agent_id=args.agent_id,
+            agent_secret=args.agent_secret,
+        )
         metrics_response.raise_for_status()
-        logs_response = requests.post(logs_endpoint, json=logs_payload, timeout=20)
+        logs_response = post_signed_json(
+            server_url=args.server_url,
+            endpoint_path=logs_path,
+            payload=logs_payload,
+            timeout=20,
+            agent_id=args.agent_id,
+            agent_secret=args.agent_secret,
+        )
         logs_response.raise_for_status()
         print(f"Sent metrics: {json.dumps(metrics_payload)}")
         print(f"Sent logs entries: {len(logs_payload['entries'])}")
