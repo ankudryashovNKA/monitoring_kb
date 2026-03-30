@@ -506,9 +506,14 @@ def list_metric_history(
 
 
 @app.get("/api/nodes")
-def list_nodes() -> dict[str, list[dict[str, str | int]]]:
+def list_nodes() -> dict[str, list[dict[str, str | int | bool | None]]]:
     with SessionLocal() as db:
-        nodes = db.query(Node).order_by(func.lower(Node.display_name)).all()
+        rows = (
+            db.query(Node, Agent)
+            .outerjoin(Agent, Agent.agent_id == Node.node_id)
+            .order_by(func.lower(Node.display_name))
+            .all()
+        )
         items = [
             {
                 "node_id": node.node_id,
@@ -518,8 +523,10 @@ def list_nodes() -> dict[str, list[dict[str, str | int]]]:
                 "ram_total_mb": node.ram_total_mb,
                 "ip_address": node.ip_address,
                 "last_seen": node.last_seen.isoformat(),
+                "agent_id": agent.agent_id if agent else None,
+                "agent_enabled": agent.enabled if agent else None,
             }
-            for node in nodes
+            for node, agent in rows
         ]
         return {"items": items}
 
@@ -994,6 +1001,37 @@ def dashboard() -> str:
             padding: 1rem 0;
         }
         .error { color: var(--danger); }
+        .modal-backdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(18, 33, 53, 0.45);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
+            z-index: 10000;
+        }
+        .modal {
+            width: min(560px, 100%);
+            background: #fff;
+            border: 1px solid var(--border);
+            border-radius: 0.8rem;
+            padding: 1rem;
+            box-shadow: var(--shadow);
+        }
+        .modal h3 { margin-bottom: 0.75rem; }
+        .credentials-grid {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 0.5rem;
+            align-items: end;
+        }
+        .credentials-grid input { width: 100%; font-family: monospace; }
+        .modal-actions {
+            display: flex;
+            justify-content: flex-end;
+            margin-top: 0.75rem;
+        }
         [hidden] { display: none !important; }
         @media (max-width: 900px) {
             .content { padding: 1rem; }
@@ -1060,7 +1098,6 @@ def dashboard() -> str:
                     <button id="register-node-agent" type="button">Register new node</button>
                 </div>
                 <div id="nodes-status" class="status"></div>
-                <div id="agents-status" class="status"></div>
                 <table>
                     <thead>
                         <tr>
@@ -1070,23 +1107,11 @@ def dashboard() -> str:
                             <th>RAM</th>
                             <th>IP</th>
                             <th>Last seen (UTC)</th>
+                            <th>Agent status</th>
                             <th></th>
                         </tr>
                     </thead>
                     <tbody id="nodes-body"></tbody>
-                </table>
-                <h3>Agent credentials</h3>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Agent ID</th>
-                            <th>Status</th>
-                            <th>Last seen (UTC)</th>
-                            <th>Updated (UTC)</th>
-                            <th>Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody id="agents-body"></tbody>
                 </table>
             </section>
 
@@ -1275,6 +1300,27 @@ def dashboard() -> str:
         </main>
     </div>
     <div id="global-menu" class="menu-popover" hidden></div>
+    <div id="credentials-modal-backdrop" class="modal-backdrop" hidden>
+        <div class="modal">
+            <h3 id="credentials-modal-title">Agent credentials</h3>
+            <p class="meta">Скопируйте значения и сохраните в безопасном месте.</p>
+            <div class="credentials-grid">
+                <label>
+                    <span class="meta">AGENT_ID</span><br />
+                    <input id="credentials-agent-id" type="text" readonly />
+                </label>
+                <button id="copy-agent-id" type="button" class="secondary">Copy</button>
+                <label>
+                    <span class="meta">AGENT_SECRET</span><br />
+                    <input id="credentials-agent-secret" type="text" readonly />
+                </label>
+                <button id="copy-agent-secret" type="button" class="secondary">Copy</button>
+            </div>
+            <div class="modal-actions">
+                <button id="close-credentials-modal" type="button">Close</button>
+            </div>
+        </div>
+    </div>
 
     <script>
         const state = {
@@ -1529,13 +1575,16 @@ def dashboard() -> str:
             const body = document.getElementById('nodes-body');
             body.innerHTML = '';
             if (!state.nodes.length) {
-                body.innerHTML = '<tr><td colspan="7" class="empty">No nodes have sent data yet.</td></tr>';
+                body.innerHTML = '<tr><td colspan="8" class="empty">No nodes have sent data yet.</td></tr>';
                 return;
             }
 
             for (const node of state.nodes) {
                 const row = document.createElement('tr');
                 const menuKey = `node:${node.node_id}`;
+                const statusLabel = node.agent_id
+                    ? (node.agent_enabled ? 'Enabled' : 'Disabled')
+                    : 'Not linked';
                 row.innerHTML = `
                     <td>
                         <strong>${node.display_name}</strong>
@@ -1545,6 +1594,7 @@ def dashboard() -> str:
                     <td>${formatRamMb(node.ram_total_mb)}</td>
                     <td>${node.ip_address}</td>
                     <td>${formatUtc(node.last_seen)}</td>
+                    <td>${statusLabel}</td>
                     <td class="menu-cell">
                         <button
                             type="button"
@@ -1552,32 +1602,10 @@ def dashboard() -> str:
                             data-menu-toggle="${menuKey}"
                             data-menu-type="node"
                             data-node-id="${node.node_id}"
+                            data-agent-id="${node.agent_id || ''}"
+                            data-agent-enabled="${node.agent_enabled == null ? '' : node.agent_enabled}"
                             aria-label="Node actions"
                         >...</button>
-                    </td>
-                `;
-                body.appendChild(row);
-            }
-        }
-
-        function renderAgentsTable() {
-            const body = document.getElementById('agents-body');
-            body.innerHTML = '';
-            if (!state.agents.length) {
-                body.innerHTML = '<tr><td colspan="5" class="empty">No registered agents yet.</td></tr>';
-                return;
-            }
-            for (const agent of state.agents) {
-                const row = document.createElement('tr');
-                const actionLabel = agent.enabled ? 'Disable' : 'Enable';
-                row.innerHTML = `
-                    <td><code>${agent.agent_id}</code></td>
-                    <td>${agent.enabled ? 'Enabled' : 'Disabled'}</td>
-                    <td>${agent.last_seen ? formatUtc(agent.last_seen) : 'Never'}</td>
-                    <td>${formatUtc(agent.updated_at)}</td>
-                    <td>
-                        <button type="button" class="secondary" data-agent-action="${agent.enabled ? 'disable' : 'enable'}" data-agent-id="${agent.agent_id}">${actionLabel}</button>
-                        <button type="button" data-agent-action="rotate" data-agent-id="${agent.agent_id}">Rotate secret</button>
                     </td>
                 `;
                 body.appendChild(row);
@@ -1698,6 +1726,30 @@ def dashboard() -> str:
             state.activeMenuData = null;
         }
 
+        function showCredentialsModal({ title, agentId, secret }) {
+            document.getElementById('credentials-modal-title').textContent = title;
+            document.getElementById('credentials-agent-id').value = agentId || '';
+            document.getElementById('credentials-agent-secret').value = secret || '';
+            document.getElementById('credentials-modal-backdrop').hidden = false;
+        }
+
+        function hideCredentialsModal() {
+            document.getElementById('credentials-modal-backdrop').hidden = true;
+        }
+
+        async function copyCredentialsField(inputId) {
+            const input = document.getElementById(inputId);
+            const value = input.value || '';
+            if (!value) return;
+            try {
+                await navigator.clipboard.writeText(value);
+            } catch (error) {
+                input.focus();
+                input.select();
+                document.execCommand('copy');
+            }
+        }
+
         function openGlobalMenu(toggleButton) {
             const menu = document.getElementById('global-menu');
             const rect = toggleButton.getBoundingClientRect();
@@ -1707,8 +1759,17 @@ def dashboard() -> str:
 
             if (type === 'node') {
                 const nodeId = toggleButton.dataset.nodeId;
+                const agentId = toggleButton.dataset.agentId;
+                const hasAgent = Boolean(agentId);
+                const isEnabled = toggleButton.dataset.agentEnabled === 'true';
                 menu.innerHTML = `
                     <button type="button" data-node-action="rename" data-node-id="${nodeId}">Rename</button>
+                    ${
+                        hasAgent
+                            ? `<button type="button" data-node-action="${isEnabled ? 'disable-agent' : 'enable-agent'}" data-node-id="${nodeId}" data-agent-id="${agentId}">${isEnabled ? 'Disable agent' : 'Enable agent'}</button>
+                               <button type="button" data-node-action="rotate-agent-secret" data-node-id="${nodeId}" data-agent-id="${agentId}">Rotate secret</button>`
+                            : ''
+                    }
                     <button type="button" class="danger" data-node-action="delete" data-node-id="${nodeId}">Delete</button>
                 `;
             } else if (type === 'trigger') {
@@ -1746,23 +1807,25 @@ def dashboard() -> str:
             try {
                 const data = await fetchJson('/api/agents');
                 state.agents = data.items || [];
-                renderAgentsTable();
-                setStatus('agents-status', state.agents.length ? '' : 'No agents registered yet.');
             } catch (error) {
                 state.agents = [];
-                renderAgentsTable();
-                setStatus('agents-status', error.message, true);
+                setStatus('nodes-status', `Agents loading failed: ${error.message}`, true);
             }
         }
 
         async function registerAgent() {
             try {
                 const data = await fetchJson('/api/agents/register', { method: 'POST' });
-                setStatus('agents-status', 'Agent created. Save credentials now.', false);
-                window.alert(`Copy once:\\nAGENT_ID=${data.agent_id}\\nAGENT_SECRET=${data.secret}`);
+                setStatus('nodes-status', 'Agent created. Save credentials now.', false);
+                showCredentialsModal({
+                    title: 'New agent credentials',
+                    agentId: data.agent_id,
+                    secret: data.secret,
+                });
                 await loadAgents();
+                await loadNodes();
             } catch (error) {
-                setStatus('agents-status', error.message, true);
+                setStatus('nodes-status', error.message, true);
             }
         }
 
@@ -1985,6 +2048,14 @@ def dashboard() -> str:
         });
         document.getElementById('refresh-knowledge-base').addEventListener('click', loadKnowledgeBase);
         document.getElementById('run-llm').addEventListener('click', runLlm);
+        document.getElementById('close-credentials-modal').addEventListener('click', hideCredentialsModal);
+        document.getElementById('credentials-modal-backdrop').addEventListener('click', (event) => {
+            if (event.target.id === 'credentials-modal-backdrop') {
+                hideCredentialsModal();
+            }
+        });
+        document.getElementById('copy-agent-id').addEventListener('click', async () => copyCredentialsField('credentials-agent-id'));
+        document.getElementById('copy-agent-secret').addEventListener('click', async () => copyCredentialsField('credentials-agent-secret'));
         document.addEventListener('click', async (event) => {
             const toggleButton = event.target.closest('[data-menu-toggle]');
             if (toggleButton) {
@@ -2002,6 +2073,7 @@ def dashboard() -> str:
                 closeAllMenus();
                 const action = nodeActionButton.dataset.nodeAction;
                 const nodeId = nodeActionButton.dataset.nodeId;
+                const agentId = nodeActionButton.dataset.agentId;
                 if (action === 'rename') {
                     const node = state.nodes.find((item) => item.node_id === nodeId);
                     const nextName = window.prompt('Enter new node name:', node ? node.display_name : '');
@@ -2013,6 +2085,31 @@ def dashboard() -> str:
                             body: JSON.stringify({ display_name: nextName.trim() }),
                         });
                         setStatus('nodes-status', 'Node renamed.');
+                        await loadNodes();
+                    } catch (error) {
+                        setStatus('nodes-status', error.message, true);
+                    }
+                }
+                if (action === 'disable-agent' || action === 'enable-agent') {
+                    try {
+                        await fetchJson(`/api/agents/${encodeURIComponent(agentId)}/${action === 'disable-agent' ? 'disable' : 'enable'}`, { method: 'POST' });
+                        setStatus('nodes-status', `Agent ${action === 'disable-agent' ? 'disabled' : 'enabled'}.`);
+                        await loadAgents();
+                        await loadNodes();
+                    } catch (error) {
+                        setStatus('nodes-status', error.message, true);
+                    }
+                }
+                if (action === 'rotate-agent-secret') {
+                    try {
+                        const data = await fetchJson(`/api/agents/${encodeURIComponent(agentId)}/rotate-secret`, { method: 'POST' });
+                        setStatus('nodes-status', 'Secret rotated. Save new secret now.');
+                        showCredentialsModal({
+                            title: `Rotated secret for ${data.agent_id}`,
+                            agentId: data.agent_id,
+                            secret: data.secret,
+                        });
+                        await loadAgents();
                         await loadNodes();
                     } catch (error) {
                         setStatus('nodes-status', error.message, true);
@@ -2069,27 +2166,6 @@ def dashboard() -> str:
                     } catch (error) {
                         setStatus('triggers-status', error.message, true);
                     }
-                }
-                return;
-            }
-
-            const agentActionButton = event.target.closest('[data-agent-action]');
-            if (agentActionButton) {
-                const action = agentActionButton.dataset.agentAction;
-                const agentId = agentActionButton.dataset.agentId;
-                try {
-                    if (action === 'disable' || action === 'enable') {
-                        await fetchJson(`/api/agents/${encodeURIComponent(agentId)}/${action}`, { method: 'POST' });
-                        setStatus('agents-status', `Agent ${action}d.`);
-                    }
-                    if (action === 'rotate') {
-                        const data = await fetchJson(`/api/agents/${encodeURIComponent(agentId)}/rotate-secret`, { method: 'POST' });
-                        setStatus('agents-status', 'Secret rotated. Save new secret now.');
-                        window.alert(`New secret for ${data.agent_id}:\\nAGENT_SECRET=${data.secret}`);
-                    }
-                    await loadAgents();
-                } catch (error) {
-                    setStatus('agents-status', error.message, true);
                 }
                 return;
             }
