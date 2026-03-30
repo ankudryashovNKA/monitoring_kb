@@ -6,4 +6,4 @@ httpx==0.28.1
 sqlalchemy==2.0.44
 psycopg2-binary==2.9.10
 email-validator==2.3.0
-dotenv==1.2.2
+python-dotenv==1.0.1
