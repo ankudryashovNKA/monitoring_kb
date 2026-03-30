@@ -22,6 +22,14 @@ MAX_LOG_ENTRIES = 100
 load_dotenv()
 
 
+def _sanitize_log_text(value: str) -> str:
+    """Remove control characters that can break API validation/storage."""
+    if not value:
+        return ""
+    cleaned = value.replace("\x00", "")
+    return "".join(ch for ch in cleaned if ch >= " " or ch in "\t\r\n")
+
+
 def detect_primary_ip() -> str:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
@@ -106,7 +114,11 @@ def collect_logs() -> list[dict[str, str]]:
         command = ["wevtutil", "qe", "System", "/rd:true", f"/c:{MAX_LOG_ENTRIES}", "/f:text"]
         completed = subprocess.run(command, capture_output=True, text=True, check=False)
         text = completed.stdout if completed.returncode == 0 else completed.stderr
-        lines = [line.strip() for line in text.splitlines() if line.strip()][:MAX_LOG_ENTRIES]
+        lines = [
+            _sanitize_log_text(line.strip())
+            for line in text.splitlines()
+            if line.strip()
+        ][:MAX_LOG_ENTRIES]
         return [{"source": "windows-eventlog", "message": line} for line in lines]
 
     path, source = _linux_log_source()
@@ -114,11 +126,18 @@ def collect_logs() -> list[dict[str, str]]:
         command = ["journalctl", "-n", str(MAX_LOG_ENTRIES), "--no-pager", "--output=short-iso"]
         completed = subprocess.run(command, capture_output=True, text=True, check=False)
         text = completed.stdout if completed.returncode == 0 else completed.stderr
-        lines = [line.strip() for line in text.splitlines() if line.strip()][:MAX_LOG_ENTRIES]
+        lines = [
+            _sanitize_log_text(line.strip())
+            for line in text.splitlines()
+            if line.strip()
+        ][:MAX_LOG_ENTRIES]
         return [{"source": source, "message": line} for line in lines]
 
     try:
-        return [{"source": source, "message": line} for line in _tail_file(path, MAX_LOG_ENTRIES)]
+        return [
+            {"source": source, "message": _sanitize_log_text(line)}
+            for line in _tail_file(path, MAX_LOG_ENTRIES)
+        ]
     except OSError as error:
         return [{"source": source, "message": f"Failed to read {path}: {error}"}]
 
