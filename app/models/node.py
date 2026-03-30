@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String
+from sqlalchemy import DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -11,8 +11,13 @@ from app.db.base import Base
 class Node(Base):
     __tablename__ = "nodes"
 
-    node_id: Mapped[str] = mapped_column(String(100), primary_key=True)
-    display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(100), primary_key=True)
+    agent_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("agents.agent_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     os_name: Mapped[str] = mapped_column(String(200), nullable=False)
     cpu_cores: Mapped[int] = mapped_column(Integer, nullable=False)
     ram_total_mb: Mapped[int] = mapped_column(Integer, nullable=False)

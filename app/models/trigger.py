@@ -12,7 +12,7 @@ class Trigger(Base):
     __tablename__ = "triggers"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    node_id: Mapped[str] = mapped_column(String(100), ForeignKey("nodes.node_id", ondelete="CASCADE"), index=True)
+    node_id: Mapped[str] = mapped_column(String(100), ForeignKey("nodes.display_name", ondelete="CASCADE"), index=True)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     metric_name: Mapped[str] = mapped_column(String(20), nullable=False)
     operator: Mapped[str] = mapped_column(String(2), nullable=False)

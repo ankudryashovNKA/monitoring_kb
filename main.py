@@ -67,6 +67,7 @@ class NodeInfo:
 
 class MetricIn(BaseModel):
     node_id: str = Field(..., min_length=1, max_length=100)
+    agent_id: str | None = Field(default=None, min_length=1, max_length=64)
     cpu_percent: float = Field(..., ge=0, le=100)
     ram_percent: float = Field(..., ge=0, le=100)
     os_name: str = Field(..., min_length=1, max_length=200)
@@ -88,6 +89,7 @@ class LogEntryIn(BaseModel):
 
 class LogsIn(BaseModel):
     node_id: str = Field(..., min_length=1, max_length=100)
+    agent_id: str | None = Field(default=None, min_length=1, max_length=64)
     os_name: str = Field(..., min_length=1, max_length=200)
     cpu_cores: int = Field(..., ge=1, le=4096)
     ram_total_mb: int = Field(..., ge=1)
@@ -300,11 +302,11 @@ def ingest_metric(metric: MetricIn) -> dict[str, str]:
     with SessionLocal() as db:
         db.query(Metric).filter(Metric.timestamp < cutoff).delete(synchronize_session=False)
 
-        node = db.query(Node).filter(Node.node_id == metric.node_id).first()
+        node = db.query(Node).filter(Node.display_name == metric.node_id).first()
         if node is None:
             node = Node(
-                node_id=metric.node_id,
                 display_name=metric.node_id,
+                agent_id=metric.agent_id,
                 os_name=metric.os_name,
                 cpu_cores=metric.cpu_cores,
                 ram_total_mb=metric.ram_total_mb,
@@ -318,6 +320,8 @@ def ingest_metric(metric: MetricIn) -> dict[str, str]:
             node.ram_total_mb = metric.ram_total_mb
             node.ip_address = metric.ip_address
             node.last_seen = normalized_timestamp
+            if metric.agent_id:
+                node.agent_id = metric.agent_id
 
         db.add(
             Metric(
@@ -337,7 +341,8 @@ async def ingest_metric_from_agent(request: Request) -> dict[str, str]:
     request.state.raw_body = raw_body
     metric = MetricIn.model_validate_json(raw_body)
     with SessionLocal() as db:
-        _agent = validate_agent_request(request, db)
+        authenticated_agent = validate_agent_request(request, db)
+    metric.agent_id = authenticated_agent.agent_id
     return ingest_metric(metric)
 
 
@@ -345,11 +350,11 @@ async def ingest_metric_from_agent(request: Request) -> dict[str, str]:
 def ingest_logs(payload: LogsIn) -> dict[str, str | int]:
     now = _utcnow()
     with SessionLocal() as db:
-        node = db.query(Node).filter(Node.node_id == payload.node_id).first()
+        node = db.query(Node).filter(Node.display_name == payload.node_id).first()
         if node is None:
             node = Node(
-                node_id=payload.node_id,
                 display_name=payload.node_id,
+                agent_id=payload.agent_id,
                 os_name=payload.os_name,
                 cpu_cores=payload.cpu_cores,
                 ram_total_mb=payload.ram_total_mb,
@@ -363,6 +368,8 @@ def ingest_logs(payload: LogsIn) -> dict[str, str | int]:
             node.ram_total_mb = payload.ram_total_mb
             node.ip_address = payload.ip_address
             node.last_seen = now
+            if payload.agent_id:
+                node.agent_id = payload.agent_id
 
         inserted_count = 0
         for entry in payload.entries:
@@ -402,14 +409,15 @@ async def ingest_logs_from_agent(request: Request) -> dict[str, str | int]:
     request.state.raw_body = raw_body
     payload = LogsIn.model_validate_json(raw_body)
     with SessionLocal() as db:
-        _agent = validate_agent_request(request, db)
+        authenticated_agent = validate_agent_request(request, db)
+    payload.agent_id = authenticated_agent.agent_id
     return ingest_logs(payload)
 
 
 @app.get("/api/logs")
 def list_logs(node_id: str) -> dict[str, str | list[dict[str, str]]]:
     with SessionLocal() as db:
-        node = db.query(Node).filter(Node.node_id == node_id).first()
+        node = db.query(Node).filter(Node.display_name == node_id).first()
         if node is None:
             raise HTTPException(status_code=404, detail="Node not found")
 
@@ -429,7 +437,7 @@ def list_logs(node_id: str) -> dict[str, str | list[dict[str, str]]]:
             for row in rows
         ]
         return {
-            "node_id": node.node_id,
+            "node_id": node.display_name,
             "display_name": node.display_name,
             "os_name": node.os_name,
             "items": items,
@@ -447,11 +455,11 @@ def list_metrics(node_id: str | None = None) -> dict[str, list[dict[str, str | f
 
         query = (
             db.query(Metric, Node.display_name)
-            .join(Node, Node.node_id == Metric.node_id)
+            .join(Node, Node.display_name == Metric.node_id)
             .filter(Metric.timestamp >= cutoff)
         )
         if node_id:
-            node_exists = db.query(Node.node_id).filter(Node.node_id == node_id).first()
+            node_exists = db.query(Node.display_name).filter(Node.display_name == node_id).first()
             if node_exists is None:
                 raise HTTPException(status_code=404, detail="Node not found")
             query = query.filter(Metric.node_id == node_id)
@@ -484,7 +492,7 @@ def list_metric_history(
         db.query(Metric).filter(Metric.timestamp < now - RETENTION_PERIOD).delete(synchronize_session=False)
         db.commit()
 
-        node = db.query(Node).filter(Node.node_id == node_id).first()
+        node = db.query(Node).filter(Node.display_name == node_id).first()
         if node is None:
             raise HTTPException(status_code=404, detail="Node not found")
 
@@ -510,20 +518,20 @@ def list_nodes() -> dict[str, list[dict[str, str | int | bool | None]]]:
     with SessionLocal() as db:
         rows = (
             db.query(Node, Agent)
-            .outerjoin(Agent, Agent.agent_id == Node.node_id)
+            .outerjoin(Agent, Agent.agent_id == Node.agent_id)
             .order_by(func.lower(Node.display_name))
             .all()
         )
         items = [
             {
-                "node_id": node.node_id,
+                "node_id": node.display_name,
                 "display_name": node.display_name,
                 "os_name": node.os_name,
                 "cpu_cores": node.cpu_cores,
                 "ram_total_mb": node.ram_total_mb,
                 "ip_address": node.ip_address,
                 "last_seen": node.last_seen.isoformat(),
-                "agent_id": agent.agent_id if agent else None,
+                "agent_id": node.agent_id,
                 "agent_enabled": agent.enabled if agent else None,
             }
             for node, agent in rows
@@ -533,16 +541,25 @@ def list_nodes() -> dict[str, list[dict[str, str | int | bool | None]]]:
 
 @app.patch("/api/nodes/{node_id}")
 def rename_node(node_id: str, payload: NodeRenameIn) -> dict[str, str | int]:
+    next_name = payload.display_name.strip()
+    if not next_name:
+        raise HTTPException(status_code=400, detail="Display name cannot be empty")
     with SessionLocal() as db:
-        node = db.query(Node).filter(Node.node_id == node_id).first()
+        node = db.query(Node).filter(Node.display_name == node_id).first()
         if node is None:
             raise HTTPException(status_code=404, detail="Node not found")
+        duplicate = db.query(Node).filter(Node.display_name == next_name).first()
+        if duplicate is not None and duplicate.display_name != node_id:
+            raise HTTPException(status_code=409, detail="Node with this display name already exists")
 
-        node.display_name = payload.display_name
+        db.query(Metric).filter(Metric.node_id == node_id).update({"node_id": next_name}, synchronize_session=False)
+        db.query(LogEntry).filter(LogEntry.node_id == node_id).update({"node_id": next_name}, synchronize_session=False)
+        db.query(Trigger).filter(Trigger.node_id == node_id).update({"node_id": next_name}, synchronize_session=False)
+        node.display_name = next_name
         db.commit()
         db.refresh(node)
         return {
-            "node_id": node.node_id,
+            "node_id": node.display_name,
             "display_name": node.display_name,
             "os_name": node.os_name,
             "cpu_cores": node.cpu_cores,
@@ -555,7 +572,7 @@ def rename_node(node_id: str, payload: NodeRenameIn) -> dict[str, str | int]:
 @app.delete("/api/nodes/{node_id}")
 def delete_node(node_id: str) -> dict[str, str]:
     with SessionLocal() as db:
-        node = db.query(Node).filter(Node.node_id == node_id).first()
+        node = db.query(Node).filter(Node.display_name == node_id).first()
         if node is None:
             raise HTTPException(status_code=404, detail="Node not found")
         db.delete(node)
@@ -614,7 +631,7 @@ def rotate_agent_secret_endpoint(agent_id: str) -> dict[str, str]:
 @app.post("/api/triggers")
 def create_trigger(payload: TriggerCreateIn) -> dict[str, str | float | int | bool | None]:
     with SessionLocal() as db:
-        node = db.query(Node).filter(Node.node_id == payload.node_id).first()
+        node = db.query(Node).filter(Node.display_name == payload.node_id).first()
         if node is None:
             raise HTTPException(status_code=404, detail="Node not found")
 
@@ -651,7 +668,7 @@ def update_trigger(trigger_id: int, payload: TriggerUpdateIn) -> dict[str, str |
         db.commit()
         db.refresh(trigger)
 
-        node = db.query(Node).filter(Node.node_id == trigger.node_id).first()
+        node = db.query(Node).filter(Node.display_name == trigger.node_id).first()
         if node is None:
             raise HTTPException(status_code=404, detail="Node not found")
 
@@ -678,9 +695,9 @@ def delete_trigger(trigger_id: int) -> dict[str, str]:
 @app.get("/api/triggers")
 def list_triggers(node_id: str | None = None) -> dict[str, list[dict[str, str | float | int | bool | None]]]:
     with SessionLocal() as db:
-        query = db.query(Trigger, Node.display_name).join(Node, Node.node_id == Trigger.node_id)
+        query = db.query(Trigger, Node.display_name).join(Node, Node.display_name == Trigger.node_id)
         if node_id:
-            node_exists = db.query(Node.node_id).filter(Node.node_id == node_id).first()
+            node_exists = db.query(Node.display_name).filter(Node.display_name == node_id).first()
             if node_exists is None:
                 raise HTTPException(status_code=404, detail="Node not found")
             query = query.filter(Trigger.node_id == node_id)
@@ -711,7 +728,7 @@ def list_problems() -> dict[str, list[dict[str, str | float | int | bool | None]
     with SessionLocal() as db:
         rows = (
             db.query(Trigger, Node.display_name)
-            .join(Node, Node.node_id == Trigger.node_id)
+            .join(Node, Node.display_name == Trigger.node_id)
             .order_by(Trigger.created_at.desc(), Trigger.id.desc())
             .all()
         )
@@ -1029,8 +1046,14 @@ def dashboard() -> str:
         .credentials-grid input { width: 100%; font-family: monospace; }
         .modal-actions {
             display: flex;
+            gap: 0.5rem;
             justify-content: flex-end;
             margin-top: 0.75rem;
+        }
+        .modal-form-grid {
+            display: grid;
+            gap: 0.75rem;
+            margin-top: 0.5rem;
         }
         [hidden] { display: none !important; }
         @media (max-width: 900px) {
@@ -1321,6 +1344,17 @@ def dashboard() -> str:
             </div>
         </div>
     </div>
+    <div id="action-modal-backdrop" class="modal-backdrop" hidden>
+        <div class="modal">
+            <h3 id="action-modal-title">Confirm action</h3>
+            <p id="action-modal-description" class="meta"></p>
+            <div id="action-modal-fields" class="modal-form-grid"></div>
+            <div class="modal-actions">
+                <button id="action-modal-cancel" type="button" class="secondary">Cancel</button>
+                <button id="action-modal-confirm" type="button">Confirm</button>
+            </div>
+        </div>
+    </div>
 
     <script>
         const state = {
@@ -1336,6 +1370,7 @@ def dashboard() -> str:
             activeMenuKey: '',
             activeMenuData: null,
             activeTab: 'latest',
+            actionModalHandler: null,
         };
 
         async function fetchJson(url, options) {
@@ -1737,6 +1772,38 @@ def dashboard() -> str:
             document.getElementById('credentials-modal-backdrop').hidden = true;
         }
 
+        function showActionModal({ title, description = '', fields = [], confirmLabel = 'Confirm', danger = false, onConfirm }) {
+            document.getElementById('action-modal-title').textContent = title;
+            document.getElementById('action-modal-description').textContent = description;
+            const fieldsContainer = document.getElementById('action-modal-fields');
+            fieldsContainer.innerHTML = '';
+            for (const field of fields) {
+                const label = document.createElement('label');
+                label.innerHTML = `<span class="meta">${field.label}</span><br />`;
+                const input = document.createElement('input');
+                input.type = field.type || 'text';
+                input.id = field.id;
+                input.value = field.value || '';
+                if (field.min != null) input.min = String(field.min);
+                if (field.max != null) input.max = String(field.max);
+                if (field.step != null) input.step = String(field.step);
+                if (field.maxlength != null) input.maxLength = Number(field.maxlength);
+                label.appendChild(input);
+                fieldsContainer.appendChild(label);
+            }
+            const confirmButton = document.getElementById('action-modal-confirm');
+            confirmButton.textContent = confirmLabel;
+            confirmButton.classList.toggle('danger', danger);
+            state.actionModalHandler = onConfirm;
+            document.getElementById('action-modal-backdrop').hidden = false;
+        }
+
+        function hideActionModal() {
+            document.getElementById('action-modal-backdrop').hidden = true;
+            document.getElementById('action-modal-fields').innerHTML = '';
+            state.actionModalHandler = null;
+        }
+
         async function copyCredentialsField(inputId) {
             const input = document.getElementById(inputId);
             const value = input.value || '';
@@ -1766,8 +1833,7 @@ def dashboard() -> str:
                     <button type="button" data-node-action="rename" data-node-id="${nodeId}">Rename</button>
                     ${
                         hasAgent
-                            ? `<button type="button" data-node-action="${isEnabled ? 'disable-agent' : 'enable-agent'}" data-node-id="${nodeId}" data-agent-id="${agentId}">${isEnabled ? 'Disable agent' : 'Enable agent'}</button>
-                               <button type="button" data-node-action="rotate-agent-secret" data-node-id="${nodeId}" data-agent-id="${agentId}">Rotate secret</button>`
+                            ? `<button type="button" data-node-action="${isEnabled ? 'stop-agent' : 'start-agent'}" data-node-id="${nodeId}" data-agent-id="${agentId}">${isEnabled ? 'Stop Agent' : 'Start Agent'}</button>`
                             : ''
                     }
                     <button type="button" class="danger" data-node-action="delete" data-node-id="${nodeId}">Delete</button>
@@ -2056,6 +2122,17 @@ def dashboard() -> str:
         });
         document.getElementById('copy-agent-id').addEventListener('click', async () => copyCredentialsField('credentials-agent-id'));
         document.getElementById('copy-agent-secret').addEventListener('click', async () => copyCredentialsField('credentials-agent-secret'));
+        document.getElementById('action-modal-cancel').addEventListener('click', hideActionModal);
+        document.getElementById('action-modal-backdrop').addEventListener('click', (event) => {
+            if (event.target.id === 'action-modal-backdrop') {
+                hideActionModal();
+            }
+        });
+        document.getElementById('action-modal-confirm').addEventListener('click', async () => {
+            if (typeof state.actionModalHandler === 'function') {
+                await state.actionModalHandler();
+            }
+        });
         document.addEventListener('click', async (event) => {
             const toggleButton = event.target.closest('[data-menu-toggle]');
             if (toggleButton) {
@@ -2076,54 +2153,67 @@ def dashboard() -> str:
                 const agentId = nodeActionButton.dataset.agentId;
                 if (action === 'rename') {
                     const node = state.nodes.find((item) => item.node_id === nodeId);
-                    const nextName = window.prompt('Enter new node name:', node ? node.display_name : '');
-                    if (!nextName) return;
-                    try {
-                        await fetchJson(`/api/nodes/${encodeURIComponent(nodeId)}`, {
-                            method: 'PATCH',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ display_name: nextName.trim() }),
-                        });
-                        setStatus('nodes-status', 'Node renamed.');
-                        await loadNodes();
-                    } catch (error) {
-                        setStatus('nodes-status', error.message, true);
-                    }
+                    showActionModal({
+                        title: 'Rename node',
+                        description: 'Set a new unique display name for this node.',
+                        fields: [{ id: 'rename-node-name', label: 'Display name', value: node ? node.display_name : '', maxlength: 100 }],
+                        confirmLabel: 'Save',
+                        onConfirm: async () => {
+                            const nextName = document.getElementById('rename-node-name').value.trim();
+                            if (!nextName) {
+                                setStatus('nodes-status', 'Display name cannot be empty.', true);
+                                return;
+                            }
+                            try {
+                                await fetchJson(`/api/nodes/${encodeURIComponent(nodeId)}`, {
+                                    method: 'PATCH',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ display_name: nextName }),
+                                });
+                                hideActionModal();
+                                setStatus('nodes-status', 'Node renamed.');
+                                await loadNodes();
+                            } catch (error) {
+                                setStatus('nodes-status', error.message, true);
+                            }
+                        },
+                    });
                 }
-                if (action === 'disable-agent' || action === 'enable-agent') {
-                    try {
-                        await fetchJson(`/api/agents/${encodeURIComponent(agentId)}/${action === 'disable-agent' ? 'disable' : 'enable'}`, { method: 'POST' });
-                        setStatus('nodes-status', `Agent ${action === 'disable-agent' ? 'disabled' : 'enabled'}.`);
-                        await loadAgents();
-                        await loadNodes();
-                    } catch (error) {
-                        setStatus('nodes-status', error.message, true);
-                    }
-                }
-                if (action === 'rotate-agent-secret') {
-                    try {
-                        const data = await fetchJson(`/api/agents/${encodeURIComponent(agentId)}/rotate-secret`, { method: 'POST' });
-                        setStatus('nodes-status', 'Secret rotated. Save new secret now.');
-                        showCredentialsModal({
-                            title: `Rotated secret for ${data.agent_id}`,
-                            agentId: data.agent_id,
-                            secret: data.secret,
-                        });
-                        await loadAgents();
-                        await loadNodes();
-                    } catch (error) {
-                        setStatus('nodes-status', error.message, true);
-                    }
+                if (action === 'stop-agent' || action === 'start-agent') {
+                    showActionModal({
+                        title: action === 'stop-agent' ? 'Stop agent' : 'Start agent',
+                        description: action === 'stop-agent' ? 'Disable this linked agent?' : 'Enable this linked agent?',
+                        confirmLabel: action === 'stop-agent' ? 'Stop Agent' : 'Start Agent',
+                        onConfirm: async () => {
+                            try {
+                                await fetchJson(`/api/agents/${encodeURIComponent(agentId)}/${action === 'stop-agent' ? 'disable' : 'enable'}`, { method: 'POST' });
+                                hideActionModal();
+                                setStatus('nodes-status', `Agent ${action === 'stop-agent' ? 'stopped' : 'started'}.`);
+                                await loadAgents();
+                                await loadNodes();
+                            } catch (error) {
+                                setStatus('nodes-status', error.message, true);
+                            }
+                        },
+                    });
                 }
                 if (action === 'delete') {
-                    if (!window.confirm('Delete node with all related data?')) return;
-                    try {
-                        await fetchJson(`/api/nodes/${encodeURIComponent(nodeId)}`, { method: 'DELETE' });
-                        setStatus('nodes-status', 'Node deleted.');
-                        await refreshAll();
-                    } catch (error) {
-                        setStatus('nodes-status', error.message, true);
-                    }
+                    showActionModal({
+                        title: 'Delete node',
+                        description: 'Delete node with all related metrics, logs and triggers?',
+                        confirmLabel: 'Delete',
+                        danger: true,
+                        onConfirm: async () => {
+                            try {
+                                await fetchJson(`/api/nodes/${encodeURIComponent(nodeId)}`, { method: 'DELETE' });
+                                hideActionModal();
+                                setStatus('nodes-status', 'Node deleted.');
+                                await refreshAll();
+                            } catch (error) {
+                                setStatus('nodes-status', error.message, true);
+                            }
+                        },
+                    });
                 }
                 return;
             }
@@ -2134,38 +2224,59 @@ def dashboard() -> str:
                 const action = triggerActionButton.dataset.triggerAction;
                 const triggerId = triggerActionButton.dataset.triggerId;
                 if (action === 'edit') {
-                    const nextName = window.prompt('Trigger name:', triggerActionButton.dataset.triggerName || '');
-                    if (!nextName) return;
-                    const thresholdRaw = window.prompt('Threshold (0-100):', triggerActionButton.dataset.triggerThreshold || '');
-                    if (!thresholdRaw) return;
-                    const threshold = Number(thresholdRaw);
-                    if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) {
-                        setStatus('triggers-status', 'Threshold must be between 0 and 100.', true);
-                        return;
-                    }
-                    try {
-                        await fetchJson(`/api/triggers/${encodeURIComponent(triggerId)}`, {
-                            method: 'PATCH',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ name: nextName.trim(), threshold }),
-                        });
-                        setStatus('triggers-status', 'Trigger updated.');
-                        await loadTriggers();
-                        await loadProblems();
-                    } catch (error) {
-                        setStatus('triggers-status', error.message, true);
-                    }
+                    showActionModal({
+                        title: 'Edit trigger',
+                        description: 'Update trigger name and threshold.',
+                        fields: [
+                            { id: 'edit-trigger-name', label: 'Name', value: triggerActionButton.dataset.triggerName || '', maxlength: 120 },
+                            { id: 'edit-trigger-threshold', label: 'Threshold (0-100)', type: 'number', value: triggerActionButton.dataset.triggerThreshold || '', min: 0, max: 100, step: 0.1 },
+                        ],
+                        confirmLabel: 'Save',
+                        onConfirm: async () => {
+                            const nextName = document.getElementById('edit-trigger-name').value.trim();
+                            const threshold = Number(document.getElementById('edit-trigger-threshold').value);
+                            if (!nextName) {
+                                setStatus('triggers-status', 'Trigger name cannot be empty.', true);
+                                return;
+                            }
+                            if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) {
+                                setStatus('triggers-status', 'Threshold must be between 0 and 100.', true);
+                                return;
+                            }
+                            try {
+                                await fetchJson(`/api/triggers/${encodeURIComponent(triggerId)}`, {
+                                    method: 'PATCH',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ name: nextName, threshold }),
+                                });
+                                hideActionModal();
+                                setStatus('triggers-status', 'Trigger updated.');
+                                await loadTriggers();
+                                await loadProblems();
+                            } catch (error) {
+                                setStatus('triggers-status', error.message, true);
+                            }
+                        },
+                    });
                 }
                 if (action === 'delete') {
-                    if (!window.confirm('Delete this trigger?')) return;
-                    try {
-                        await fetchJson(`/api/triggers/${encodeURIComponent(triggerId)}`, { method: 'DELETE' });
-                        setStatus('triggers-status', 'Trigger deleted.');
-                        await loadTriggers();
-                        await loadProblems();
-                    } catch (error) {
-                        setStatus('triggers-status', error.message, true);
-                    }
+                    showActionModal({
+                        title: 'Delete trigger',
+                        description: 'Delete this trigger?',
+                        confirmLabel: 'Delete',
+                        danger: true,
+                        onConfirm: async () => {
+                            try {
+                                await fetchJson(`/api/triggers/${encodeURIComponent(triggerId)}`, { method: 'DELETE' });
+                                hideActionModal();
+                                setStatus('triggers-status', 'Trigger deleted.');
+                                await loadTriggers();
+                                await loadProblems();
+                            } catch (error) {
+                                setStatus('triggers-status', error.message, true);
+                            }
+                        },
+                    });
                 }
                 return;
             }
