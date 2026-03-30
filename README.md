@@ -1,152 +1,506 @@
 # Monitoring KB MVP
 
-MVP системы мониторинга состоит из:
+`Monitoring KB MVP` — это сервер мониторинга узлов (node monitoring) с локальным агентом и встроенным веб-дашбордом в одном FastAPI-приложении.
 
-- **FastAPI-сервера**, который принимает метрики CPU/RAM от удалённых узлов;
-- **агента** на `psutil`, который раз в минуту собирает данные и отправляет их на сервер;
-- **агента**, который раз в минуту отправляет метрики и последние системные логи;
-- **веб-дашборда** с левым скрываемым меню и вкладками `Latest data` / `Nodes` / `Logs`;
-- **интеграции с Knowledge Base API** (Hippocrates) и вкладкой `Knowledge Base`;
-- **SQLAlchemy-подключения к Supabase PostgreSQL** и CRUD-примеров для `User`.
+Проект решает сразу несколько задач:
 
-## Что реализовано
+- собирает с удалённых узлов метрики CPU/RAM;
+- принимает и отображает системные логи;
+- хранит данные в PostgreSQL (Supabase) через SQLAlchemy;
+- позволяет управлять агентами (регистрация, отключение, ротация секрета);
+- поддерживает триггеры и список активных проблем;
+- интегрируется с внешним API Knowledge Base (`kb.ai-hippocrates.ru`);
+- даёт UI-вкладку LLM, которая проксирует запросы в локально установленный Ollama (`gemma3:4b`).
 
-- Приём метрик через `POST /api/metrics`.
-- Приём подписанных HMAC-запросов от агентов через `POST /api/agent/metrics` и `POST /api/agent/logs`.
-- Реестр агентов (`agents`) c включением/выключением, отметкой `last_seen` и ротацией секрета.
-- Хранение метрик и узлов в базе данных (Supabase PostgreSQL через SQLAlchemy).
-- Политика retention: метрики старше 1 часа удаляются при запросах/записи.
-- Получение последних значений через `GET /api/metrics`.
-- Получение списка узлов и их параметров через `GET /api/nodes`.
-- Приём логов узла через `POST /api/logs` (до 100 записей за отправку).
-- Получение последних логов узла через `GET /api/logs?node_id=...`.
-- Переименование узла через `PATCH /api/nodes/{node_id}`.
-- Фоновая синхронизация Knowledge Base (`POST /solve/{KB_ID}` каждые 10 минут).
-- Выдача результатов Knowledge Base для UI через `GET /api/knowledge-base`.
-- CRUD для пользователей:
-  - `POST /api/users`
-  - `GET /api/users`
-  - `GET /api/users/{user_id}`
+---
 
-## Конфигурация БД (Supabase)
+## 1) Архитектура проекта в целом
 
-1. Скопируйте `.env.example` в `.env` и заполните значения.
-2. Используются переменные:
-   - `SUPABASE_DB_HOST`
-   - `SUPABASE_DB_PORT`
-   - `SUPABASE_DB_NAME`
-   - `SUPABASE_DB_USER`
-   - `SUPABASE_DB_PASSWORD`
-   - `KB_ID`
-   - `KB_JWT_TOKEN`
-   - (опционально) `KB_API_BASE_URL` и `KB_PRESET_NAME`
-3. `DATABASE_URL` собирается автоматически из этих переменных в `app/config.py`.
+### Компоненты
 
-> Примечание: если переменные не заданы, для локального запуска используется `sqlite:///./monitoring.db`.
+1. **FastAPI-сервер (`main.py`)**
+   - REST API для метрик, логов, агентов, триггеров, проблем, KB, LLM;
+   - встроенный HTML/JS-дашборд на `GET /`;
+   - фоновая синхронизация Knowledge Base каждые 10 минут.
 
-## Запуск сервера
+2. **Агент (`agent.py`)**
+   - собирает метрики с `psutil`;
+   - читает системные логи (`/var/log/syslog`, `/var/log/messages` или `journalctl` на Linux; `wevtutil` на Windows);
+   - отправляет на сервер подписанные HMAC-запросы.
+
+3. **База данных (Supabase PostgreSQL / локально SQLite fallback)**
+   - таблицы: узлы, метрики, логи, агенты, триггеры, пользователи;
+   - SQLAlchemy ORM;
+   - автоматическое создание схемы при старте (`create_all`).
+
+4. **Интеграция с Knowledge Base API (Hippocrates)**
+   - backend ходит в `POST /solve/{KB_ID}`;
+   - кэширует результат;
+   - UI читает кэш через `GET /api/knowledge-base`.
+
+5. **LLM-интеграция через Ollama**
+   - endpoint `POST /api/llm/generate` отправляет промпт в `http://localhost:11434/api/generate`;
+   - модель жёстко задана как `gemma3:4b`.
+
+---
+
+## 2) Структура репозитория
+
+```text
+.
+├── main.py                  # FastAPI приложение + встроенный dashboard HTML/JS
+├── agent.py                 # Агент, сбор метрик/логов и отправка подписанных запросов
+├── app/
+│   ├── api/users.py         # Пример CRUD endpoints пользователей
+│   ├── config.py            # Загрузка env и сборка DATABASE_URL
+│   ├── db/                  # SQLAlchemy engine/session/base
+│   ├── models/              # ORM модели (Node, Metric, LogEntry, Agent, Trigger, User)
+│   ├── schemas/             # Pydantic-схемы для users
+│   └── security/agent_auth.py # HMAC-аутентификация агентов
+├── requirements.txt
+├── .env.example
+└── tests/
+```
+
+---
+
+## 3) Подготовка окружения
+
+## Требования
+
+- Python **3.10+**
+- Linux/macOS/Windows
+- Доступ к PostgreSQL (Supabase) для production-сценария
+- (для раздела LLM) установленный Ollama на сервере
+
+### Установка зависимостей
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
+
+---
+
+## 4) Конфигурация `.env`
+
+Скопируйте пример и заполните переменные:
+
+```bash
+cp .env.example .env
+```
+
+Ключевые переменные:
+
+- `SUPABASE_DB_HOST`
+- `SUPABASE_DB_PORT`
+- `SUPABASE_DB_NAME`
+- `SUPABASE_DB_USER`
+- `SUPABASE_DB_PASSWORD`
+- `KB_ID`
+- `KB_JWT_TOKEN`
+- `KB_API_BASE_URL` (опционально, по умолчанию `https://kb.ai-hippocrates.ru/kbapi`)
+- `KB_PRESET_NAME` (опционально, по умолчанию `Monitoring server`)
+- `SERVER_URL` (для агента)
+- `AGENT_ID`, `AGENT_SECRET` (для агента)
+- `DISPLAY_NAME`/`NODE_ID` (опционально для агента)
+
+Если Supabase-переменные не заданы полностью, сервер автоматически уходит в локальный fallback:
+
+- `sqlite:///./monitoring.db`
+
+---
+
+## 5) Запуск сервера
+
+```bash
+source .venv/bin/activate
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-При старте вызывается `Base.metadata.create_all(...)` для создания таблиц.
-Для production рекомендуется использовать миграции (например, Alembic).
+После запуска:
 
-### Миграции/обновление схемы
+- Dashboard: `http://127.0.0.1:8000/`
+- OpenAPI docs: `http://127.0.0.1:8000/docs`
 
-В проекте сейчас нет Alembic, поэтому для создания таблицы `agents` достаточно перезапустить приложение (сработает `create_all`).  
-Если нужна ручная SQL-миграция, используйте:
+При старте вызывается `Base.metadata.create_all(...)` — таблицы создаются автоматически.
 
-```sql
-CREATE TABLE IF NOT EXISTS agents (
-    agent_id VARCHAR(64) PRIMARY KEY,
-    secret VARCHAR(128) NOT NULL,
-    enabled BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL,
-    last_seen TIMESTAMPTZ NULL
-);
-```
+> Для production лучше добавить Alembic-миграции.
 
-## Запуск агента
+---
 
-1) В UI на вкладке **Nodes** нажмите **Register new node** и скопируйте `AGENT_ID` и `AGENT_SECRET` (показываются один раз).  
-2) Запустите агента:
+## 6) Как запустить агента
+
+### Шаг 1. Зарегистрировать агента
+
+Есть два способа:
+
+1. Через UI: вкладка **Nodes** → **Register new node**
+2. Через API:
 
 ```bash
-python agent.py --server-url http://127.0.0.1:8000 --node-id node-1 --agent-id <AGENT_ID> --agent-secret <AGENT_SECRET>
+curl -X POST http://127.0.0.1:8000/api/agents/register
 ```
 
-или через `.env`:
+Вы получите:
+
+- `agent_id`
+- `secret`
+
+Сохраните их: `secret` показывается как рабочий ключ подписи.
+
+### Шаг 2. Запустить `agent.py`
+
+Вариант через аргументы:
+
+```bash
+python agent.py \
+  --server-url http://127.0.0.1:8000 \
+  --display-name node-1 \
+  --agent-id <AGENT_ID> \
+  --agent-secret <AGENT_SECRET> \
+  --interval 60
+```
+
+Вариант через `.env`:
 
 ```env
 SERVER_URL=http://127.0.0.1:8000
 AGENT_ID=<AGENT_ID>
 AGENT_SECRET=<AGENT_SECRET>
-NODE_ID=node-1
+DISPLAY_NAME=node-1
 ```
 
-По умолчанию агент отправляет данные каждые **60 секунд**.
+И далее:
 
-### Формат подписи
+```bash
+python agent.py
+```
 
-Агент отправляет заголовки:
+Что делает агент в цикле:
+
+1. собирает метрики CPU/RAM;
+2. собирает последние системные логи (до 100 записей);
+3. отправляет метрики в `POST /api/agent/metrics`;
+4. отправляет логи в `POST /api/agent/logs`;
+5. спит `interval` секунд (по умолчанию 60).
+
+---
+
+## 7) Авторизация сервера и агента (HMAC)
+
+### Какие заголовки обязательны
+
+Агент отправляет:
+
 - `X-Agent-ID`
 - `X-Timestamp`
 - `X-Signature`
 
-Подпись считается так:
+### Как вычисляется подпись
 
-`HMAC_SHA256(secret, METHOD + "\n" + PATH + "\n" + TIMESTAMP + "\n" + RAW_BODY)`
+Каноническая строка:
 
-`RAW_BODY` — исходные байты JSON без повторной сериализации на сервере.
-
-Пример подписанного запроса:
-
-```bash
-BODY='{"node_id":"node-1","cpu_percent":10,"ram_percent":20,"os_name":"Ubuntu","cpu_cores":4,"ram_total_mb":8192,"ip_address":"10.0.0.1","timestamp":"2026-03-30T12:00:00+00:00"}'
-TS=$(date +%s)
-SIG=$(python - <<'PY'
-import hashlib, hmac, os
-secret = os.environ["AGENT_SECRET"].encode()
-ts = os.environ["TS"]
-body = os.environ["BODY"].encode()
-msg = f"POST\n/api/agent/metrics\n{ts}\n".encode() + body
-print(hmac.new(secret, msg, hashlib.sha256).hexdigest())
-PY
-)
-curl -X POST http://127.0.0.1:8000/api/agent/metrics \
-  -H "Content-Type: application/json" \
-  -H "X-Agent-ID: $AGENT_ID" \
-  -H "X-Timestamp: $TS" \
-  -H "X-Signature: $SIG" \
-  -d "$BODY"
+```text
+METHOD + "\n" + PATH + "\n" + TIMESTAMP + "\n" + RAW_BODY
 ```
 
-> Примечание по хранению секрета: для HMAC-проверки серверу нужен исходный `secret`, поэтому он хранится в БД. Для production дополнительно ограничьте доступ к БД, включите шифрование на уровне диска/СУБД и мониторинг доступа.
+Далее:
 
-## Быстрая проверка User CRUD
+- `HMAC_SHA256(agent_secret, canonical_payload)`
+- hex-строка становится `X-Signature`.
 
-### Создать пользователя
+### Что проверяет сервер
+
+1. Все заголовки присутствуют;
+2. `X-Timestamp` — это валидный `int`;
+3. Временное окно: не старше/не младше 600 секунд относительно сервера;
+4. Агент существует в таблице `agents`;
+5. Агент не отключён (`enabled=true`);
+6. Подпись совпадает (`hmac.compare_digest`);
+7. При успехе обновляется `last_seen`.
+
+Если проверка не проходит — сервер отвечает `401`/`403`/`400` в зависимости от причины.
+
+### Важно про секрет
+
+- Секрет хранится в БД в исходном виде, потому что нужен для HMAC-проверки входящего запроса.
+- В production обязательно ограничивайте доступ к БД, используйте защищённые секреты и аудит доступа.
+
+---
+
+## 8) Supabase PostgreSQL: как подключено
+
+Проект не использует Supabase SDK, а подключается к Supabase **как к обычному PostgreSQL** через `psycopg2` и SQLAlchemy.
+
+`DATABASE_URL` собирается динамически:
+
+```text
+postgresql+psycopg2://USER:PASSWORD@HOST:PORT/DB
+```
+
+Если один из обязательных `SUPABASE_DB_*` параметров отсутствует — будет fallback на SQLite.
+
+### Практические рекомендации
+
+- Для production лучше использовать отдельного DB-пользователя с минимальными правами;
+- включить TLS-подключение к Supabase (если требуется вашей конфигурацией);
+- добавить регулярные бэкапы/снапшоты;
+- для изменений схемы перейти с `create_all` на Alembic-миграции.
+
+---
+
+## 9) Dashboard: подробно про каждый раздел
+
+В левом меню 8 разделов:
+
+## 9.1 Latest data
+
+Назначение: быстрый просмотр последних 10 точек метрик по выбранному узлу.
+
+- выбираете node;
+- кнопка `Refresh now` тянет данные;
+- показываются CPU %, RAM %, timestamp (UTC), имя узла;
+- API: `GET /api/metrics?node_id=...`.
+
+## 9.2 Nodes
+
+Назначение: инвентаризация узлов и управление агентами.
+
+- список узлов с OS, CPU cores, RAM, IP, last_seen;
+- отображается статус привязанного агента (enabled/disabled);
+- кнопка `Register new node` создаёт новый `agent_id/secret`;
+- доступны действия (через UI-меню): rename node, enable/disable agent, rotate secret, delete node.
+
+Основные API:
+
+- `GET /api/nodes`
+- `PATCH /api/nodes/{node_id}`
+- `DELETE /api/nodes/{node_id}`
+- `GET /api/agents`
+- `POST /api/agents/register`
+- `POST /api/agents/{agent_id}/enable`
+- `POST /api/agents/{agent_id}/disable`
+- `POST /api/agents/{agent_id}/rotate-secret`
+
+## 9.3 Graphs
+
+Назначение: график динамики выбранной метрики за интервал.
+
+- выбор node;
+- выбор метрики: CPU или RAM;
+- выбор интервала (5/15/30/60 минут);
+- рендер SVG-графика на фронте.
+
+API:
+
+- `GET /api/metrics/history?node_id=...&metric_name=cpu_percent|ram_percent&interval_minutes=...`
+
+## 9.4 Triggers
+
+Назначение: правила срабатывания по метрикам.
+
+- создаёте правило: node + метрика + оператор (`>`/`<`) + threshold;
+- видите список правил с текущим статусом активности;
+- можно редактировать имя и порог, удалять.
+
+API:
+
+- `POST /api/triggers`
+- `GET /api/triggers`
+- `PATCH /api/triggers/{trigger_id}`
+- `DELETE /api/triggers/{trigger_id}`
+
+## 9.5 Problems
+
+Назначение: список только активных проблем (где trigger сейчас выполняется).
+
+- агрегирует активные триггеры по всем узлам;
+- показывает condition, latest value, время создания триггера.
+
+API:
+
+- `GET /api/problems`
+
+## 9.6 Logs
+
+Назначение: централизованный просмотр системных логов по узлу.
+
+- агент отправляет до 100 записей за одну отправку;
+- сервер хранит до 2000 логов на узел (старые обрезаются);
+- UI показывает последние 100 записей.
+
+API:
+
+- `POST /api/agent/logs` (для агента, с подписью)
+- `POST /api/logs` (прямой вариант без HMAC, полезно для тестов)
+- `GET /api/logs?node_id=...`
+
+## 9.7 Knowledge Base
+
+Назначение: отображение результатов, полученных из Hippocrates KB.
+
+- backend в фоне обращается к внешнему KB API каждые 10 минут;
+- результат кэшируется в памяти процесса;
+- UI показывает `status`, `last_updated`, таблицу результатов и explanatory set;
+- `Refresh now` на UI делает повторный запрос к локальному `GET /api/knowledge-base` (не прямой вызов внешнего API из браузера).
+
+API:
+
+- `GET /api/knowledge-base`
+
+## 9.8 LLM
+
+Назначение: отправка промпта в локальную LLM через Ollama.
+
+- поле Input/Output;
+- кнопка `Run LLM`;
+- backend вызывает `POST /api/llm/generate`;
+- endpoint проксирует в локальный Ollama с моделью **`gemma3:4b`**.
+
+---
+
+## 10) Про API `kb.ai-hippocrates.ru`
+
+В проекте используется базовый URL:
+
+- `https://kb.ai-hippocrates.ru/kbapi`
+
+Backend формирует запрос:
+
+- `POST https://kb.ai-hippocrates.ru/kbapi/solve/{KB_ID}`
+- заголовки:
+  - `Authorization: <KB_JWT_TOKEN>`
+  - `Content-Type: application/json-patch+json`
+  - `accept: */*`
+- тело:
+
+```json
+{
+  "presetName": "Monitoring server"
+}
+```
+
+`presetName` можно переопределить через `KB_PRESET_NAME`.
+
+Если `KB_ID` или `KB_JWT_TOKEN` не заданы, интеграция помечается как disabled, и `/api/knowledge-base` возвращает соответствующий статус.
+
+---
+
+## 11) Важно: для раздела LLM нужна модель Ollama `gemma3:4b`
+
+На сервере, где работает FastAPI, должен быть доступен локальный Ollama API на `localhost:11434`.
+
+Минимальные шаги:
+
+1. Установить Ollama;
+2. запустить сервис Ollama;
+3. скачать модель:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/api/users \
+ollama pull gemma3:4b
+```
+
+4. Проверить, что модель доступна:
+
+```bash
+ollama list
+```
+
+5. Проверить генерацию напрямую:
+
+```bash
+curl -X POST http://localhost:11434/api/generate \
   -H 'Content-Type: application/json' \
-  -d '{"email": "admin@example.com"}'
+  -d '{"model":"gemma3:4b","prompt":"Hello","stream":false}'
 ```
 
-### Получить всех пользователей
+Если Ollama не запущен или модель не установлена, `POST /api/llm/generate` вернёт `502 LLM service error`.
 
-```bash
-curl http://127.0.0.1:8000/api/users
-```
+---
 
-### Получить пользователя по ID
+## 12) Основные API эндпоинты проекта
 
-```bash
-curl http://127.0.0.1:8000/api/users/1
-```
+### Метрики
+
+- `POST /api/metrics` (без HMAC)
+- `POST /api/agent/metrics` (с HMAC)
+- `GET /api/metrics`
+- `GET /api/metrics/history`
+
+### Логи
+
+- `POST /api/logs`
+- `POST /api/agent/logs`
+- `GET /api/logs`
+
+### Узлы и агенты
+
+- `GET /api/nodes`
+- `PATCH /api/nodes/{node_id}`
+- `DELETE /api/nodes/{node_id}`
+- `GET /api/agents`
+- `POST /api/agents/register`
+- `POST /api/agents/{agent_id}/enable`
+- `POST /api/agents/{agent_id}/disable`
+- `POST /api/agents/{agent_id}/rotate-secret`
+
+### Триггеры и проблемы
+
+- `POST /api/triggers`
+- `PATCH /api/triggers/{trigger_id}`
+- `DELETE /api/triggers/{trigger_id}`
+- `GET /api/triggers`
+- `GET /api/problems`
+
+### Интеграции
+
+- `GET /api/knowledge-base`
+- `POST /api/llm/generate`
+
+### Служебные
+
+- `GET /` — dashboard
+- `GET /docs` — Swagger UI
+
+---
+
+## 13) Быстрая диагностика
+
+### Агент не отправляет данные
+
+Проверьте:
+
+- корректный `SERVER_URL`;
+- правильные `AGENT_ID`/`AGENT_SECRET`;
+- не отключён ли агент (`enabled=false`);
+- синхронность времени на сервере и узле (важно для `X-Timestamp`);
+- доступность сервера по сети.
+
+### Нет данных в Knowledge Base
+
+Проверьте:
+
+- заданы ли `KB_ID` и `KB_JWT_TOKEN`;
+- доступен ли `https://kb.ai-hippocrates.ru` из сети сервера;
+- валиден ли токен авторизации.
+
+### Не работает LLM
+
+Проверьте:
+
+- запущен ли Ollama на том же сервере;
+- что `ollama list` содержит `gemma3:4b`;
+- что `http://localhost:11434/api/generate` отвечает.
+
+---
+
+## 14) Примечания для production
+
+- Вынести UI из строки в `main.py` в отдельные шаблоны/статические файлы;
+- добавить полноценную аутентификацию пользователей dashboard (сейчас сервер открыт, а HMAC применяется к agent-endpoints);
+- внедрить Alembic миграции;
+- добавить retry/backoff и метрики для внешних интеграций (KB, Ollama);
+- централизованно логировать ошибки и аудит действий с агентами.
+
