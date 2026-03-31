@@ -846,7 +846,7 @@ def dashboard() -> str:
             --accent: #2f95e9;
             --accent-soft: rgba(47, 149, 233, 0.18);
             --danger: #cf4557;
-            --shadow: 0 14px 28px rgba(31, 45, 61, 0.08);
+            --shadow: 0 6px 12px rgba(31, 45, 61, 0.06);
             --sidebar-bg: #174a72;
             --sidebar-bg-strong: #0f3b5f;
             --sidebar-text: #d7e7f7;
@@ -874,7 +874,7 @@ def dashboard() -> str:
             border-right: 1px solid rgba(170, 202, 230, 0.25);
             padding: 1rem 0.65rem;
             transition: width 0.25s ease, padding 0.25s ease, border-color 0.25s ease;
-            box-shadow: 8px 0 20px rgba(8, 24, 39, 0.24);
+            box-shadow: 4px 0 10px rgba(8, 24, 39, 0.14);
             z-index: 10;
         }
         .sidebar.collapsed {
@@ -895,9 +895,6 @@ def dashboard() -> str:
             font-weight: bold;
             margin: 0;
             color: #f5fbff;
-        }
-        .brand-subtitle {
-            color: var(--sidebar-muted);
         }
         .sidebar.collapsed .brand-copy {
             display: none;
@@ -939,18 +936,12 @@ def dashboard() -> str:
         .nav-btn:hover {
             border-color: rgba(178, 210, 235, 0.35);
             background: rgba(15, 62, 99, 0.72);
+            transform: none;
         }
         .nav-btn.active {
             background: var(--sidebar-active);
             border-color: rgba(176, 209, 235, 0.35);
             color: #f4fbff;
-        }
-        .nav-icon {
-            display: inline-flex;
-            width: 20px;
-            justify-content: center;
-            opacity: 0.9;
-            font-size: 14px;
         }
         .nav-label {
             white-space: nowrap;
@@ -969,7 +960,7 @@ def dashboard() -> str:
             border-radius: 0.35rem;
             border: 1px solid #c5d8ee;
             background: #ffffff;
-            box-shadow: 0 6px 14px rgba(31, 45, 61, 0.2);
+            box-shadow: 0 3px 8px rgba(31, 45, 61, 0.14);
             cursor: pointer;
         }
         .panel {
@@ -1087,7 +1078,7 @@ def dashboard() -> str:
             border-radius: 0.55rem;
             background: #fff;
             min-width: 146px;
-            box-shadow: 0 14px 30px rgba(31, 45, 61, 0.16);
+            box-shadow: 0 6px 14px rgba(31, 45, 61, 0.1);
         }
         .menu-popover button { width: 100%; text-align: left; }
         #global-menu[hidden] { display: none !important; }
@@ -1147,20 +1138,19 @@ def dashboard() -> str:
             <div class="brand">
                 <div class="brand-copy">
                     <p class="brand-title">Monitoring KB</p>
-                    <p class="brand-subtitle">Simple node overview</p>
                 </div>
                 <button id="sidebar-toggle" class="toggle-btn" type="button" aria-label="Toggle menu">☰</button>
             </div>
             <nav class="nav">
-                <button class="nav-btn active" data-tab="latest" type="button"><span class="nav-icon">▦</span><span class="nav-label">Latest metrics</span></button>
-                <button class="nav-btn" data-tab="nodes" type="button"><span class="nav-icon">🖥</span><span class="nav-label">Nodes</span></button>
-                <button class="nav-btn" data-tab="graphs" type="button"><span class="nav-icon">📈</span><span class="nav-label">Graphs</span></button>
-                <button class="nav-btn" data-tab="triggers" type="button"><span class="nav-icon">⚙</span><span class="nav-label">Triggers</span></button>
-                <button class="nav-btn" data-tab="problems" type="button"><span class="nav-icon">⚠</span><span class="nav-label">Problems</span></button>
-                <button class="nav-btn" data-tab="logs" type="button"><span class="nav-icon">🗒</span><span class="nav-label">Logs</span></button>
-                <button class="nav-btn" data-tab="top" type="button"><span class="nav-icon">🔝</span><span class="nav-label">Top</span></button>
-                <button class="nav-btn" data-tab="knowledge-base" type="button"><span class="nav-icon">📚</span><span class="nav-label">Knowledge Base</span></button>
-                <button class="nav-btn" data-tab="llm" type="button"><span class="nav-icon">🤖</span><span class="nav-label">LLM</span></button>
+                <button class="nav-btn active" data-tab="latest" type="button"><span class="nav-label">Latest metrics</span></button>
+                <button class="nav-btn" data-tab="nodes" type="button"><span class="nav-label">Nodes</span></button>
+                <button class="nav-btn" data-tab="graphs" type="button"><span class="nav-label">Graphs</span></button>
+                <button class="nav-btn" data-tab="triggers" type="button"><span class="nav-label">Triggers</span></button>
+                <button class="nav-btn" data-tab="problems" type="button"><span class="nav-label">Problems</span></button>
+                <button class="nav-btn" data-tab="logs" type="button"><span class="nav-label">Logs</span></button>
+                <button class="nav-btn" data-tab="top" type="button"><span class="nav-label">Top</span></button>
+                <button class="nav-btn" data-tab="knowledge-base" type="button"><span class="nav-label">Knowledge Base</span></button>
+                <button class="nav-btn" data-tab="llm" type="button"><span class="nav-label">LLM</span></button>
             </nav>
         </aside>
         <button id="sidebar-unhide" class="sidebar-unhide-btn" type="button" aria-label="Show menu" hidden>☰</button>
