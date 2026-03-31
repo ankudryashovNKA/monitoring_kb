@@ -9,7 +9,7 @@ import logging
 import operator
 from typing import Deque
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response, status
 import httpx
 
 from app.api.users import router as users_router
@@ -36,6 +36,9 @@ from app.models.metric import Metric
 from app.models.node import Node
 from app.models.log_entry import LogEntry
 from app.models.trigger import Trigger
+from app.models.user import User
+from app.security.user_auth import decode_session_token, hash_password, make_session_token, verify_password
+from sqlalchemy import inspect, text
 
 RETENTION_PERIOD = timedelta(hours=1)
 RECENT_POINTS_LIMIT = 10
@@ -139,6 +142,11 @@ class LLMGenerateIn(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=20000)
 
 
+class LoginIn(BaseModel):
+    login: str = Field(..., min_length=1, max_length=64)
+    password: str = Field(..., min_length=1, max_length=256)
+
+
 app = FastAPI(title="Monitoring KB MVP")
 app.include_router(users_router)
 
@@ -146,10 +154,91 @@ _kb_results_cache: list[dict[str, str | list[dict[str, str]]]] = []
 _kb_last_updated: datetime | None = None
 _kb_last_error: str | None = None
 
+UNPROTECTED_PATH_PREFIXES = (
+    "/api/auth/login",
+    "/api/auth/logout",
+    "/api/agent/metrics",
+    "/api/agent/logs",
+    "/openapi.json",
+    "/docs",
+    "/redoc",
+)
+
+
+@app.middleware("http")
+async def dashboard_auth_middleware(request: Request, call_next):
+    path = request.url.path
+    if path.startswith(UNPROTECTED_PATH_PREFIXES) or path.startswith("/static/"):
+        return await call_next(request)
+
+    if path.startswith("/api"):
+        token = request.cookies.get("dashboard_session")
+        login = decode_session_token(token) if token else None
+        if not login:
+            return Response(
+                content='{"detail":"Authentication required"}',
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                media_type="application/json",
+            )
+    return await call_next(request)
+
 
 def init_db() -> None:
     # For production use Alembic migrations instead of create_all.
     Base.metadata.create_all(bind=engine)
+    _migrate_users_table()
+    _ensure_admin_user()
+
+
+def _migrate_users_table() -> None:
+    inspector = inspect(engine)
+    if "users" not in inspector.get_table_names():
+        return
+
+    existing_columns = {column["name"] for column in inspector.get_columns("users")}
+    statements: list[str] = []
+    if "login" not in existing_columns:
+        statements.append("ALTER TABLE users ADD COLUMN login VARCHAR(64)")
+    if "password_hash" not in existing_columns:
+        statements.append("ALTER TABLE users ADD COLUMN password_hash VARCHAR(512)")
+    if "display_name" not in existing_columns:
+        statements.append("ALTER TABLE users ADD COLUMN display_name VARCHAR(255)")
+
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+
+        connection.execute(
+            text("UPDATE users SET login = email WHERE login IS NULL OR login = ''")
+        )
+        connection.execute(
+            text("UPDATE users SET password_hash = :password_hash WHERE password_hash IS NULL OR password_hash = ''"),
+            {"password_hash": hash_password(settings.admin_password)},
+        )
+
+
+def _ensure_admin_user() -> None:
+    with SessionLocal() as db:
+        admin = db.query(User).filter(User.login == settings.admin_login).first()
+        if admin is None:
+            existing_email = db.query(User).filter(User.email == f"{settings.admin_login}@local").first()
+            if existing_email is not None:
+                existing_email.login = settings.admin_login
+                existing_email.password_hash = hash_password(settings.admin_password)
+                if not existing_email.display_name:
+                    existing_email.display_name = "Administrator"
+            else:
+                db.add(
+                    User(
+                        login=settings.admin_login,
+                        password_hash=hash_password(settings.admin_password),
+                        email=f"{settings.admin_login}@local",
+                        display_name="Administrator",
+                    )
+                )
+        else:
+            admin.password_hash = hash_password(settings.admin_password)
+        db.commit()
 
 
 def _knowledge_base_enabled() -> bool:
@@ -256,6 +345,33 @@ def _serialize_node(node: NodeInfo) -> dict[str, str | int]:
     item = asdict(node)
     item["last_seen"] = node.last_seen.isoformat()
     return item
+
+
+@app.post("/api/auth/login")
+def login(payload: LoginIn, response: Response) -> dict[str, str]:
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.login == payload.login.strip()).first()
+        if user is None or not verify_password(payload.password, user.password_hash):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid login or password")
+
+    token = make_session_token(payload.login.strip())
+    response.set_cookie("dashboard_session", token, httponly=True, samesite="lax", secure=False, max_age=24 * 3600)
+    return {"status": "ok"}
+
+
+@app.post("/api/auth/logout")
+def logout(response: Response) -> dict[str, str]:
+    response.delete_cookie("dashboard_session")
+    return {"status": "ok"}
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request) -> dict[str, str]:
+    token = request.cookies.get("dashboard_session")
+    login = decode_session_token(token) if token else None
+    if not login:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    return {"login": login}
 
 
 def _serialize_agent(agent: Agent) -> dict[str, str | bool | None]:
@@ -1150,7 +1266,9 @@ def dashboard() -> str:
                 <button class="nav-btn" data-tab="logs" type="button"><span class="nav-label">Logs</span></button>
                 <button class="nav-btn" data-tab="top" type="button"><span class="nav-label">Top</span></button>
                 <button class="nav-btn" data-tab="knowledge-base" type="button"><span class="nav-label">Knowledge Base</span></button>
+                <button class="nav-btn" data-tab="users" type="button"><span class="nav-label">Users</span></button>
                 <button class="nav-btn" data-tab="llm" type="button"><span class="nav-label">LLM</span></button>
+                <button id="sign-out" class="nav-btn" type="button"><span class="nav-label">Sign out</span></button>
             </nav>
         </aside>
         <button id="sidebar-unhide" class="sidebar-unhide-btn" type="button" aria-label="Show menu" hidden>☰</button>
@@ -1415,6 +1533,26 @@ def dashboard() -> str:
                 </table>
             </section>
 
+            
+            <section class="panel tab-panel" data-panel="users" hidden>
+                <div class="page-header">
+                    <h2>Users</h2>
+                    <p class="meta">Manage dashboard users. Required fields: Login, Password, Email.</p>
+                </div>
+                <form id="create-user-form" class="toolbar">
+                    <label><span class="meta">Login</span><br /><input id="user-login-input" type="text" maxlength="64" required /></label>
+                    <label><span class="meta">Password</span><br /><input id="user-password-input" type="password" maxlength="256" required /></label>
+                    <label><span class="meta">Email</span><br /><input id="user-email-input" type="email" maxlength="255" required /></label>
+                    <label><span class="meta">Display name</span><br /><input id="user-display-name-input" type="text" maxlength="255" /></label>
+                    <button type="submit">Create user</button>
+                </form>
+                <div id="users-status" class="status"></div>
+                <table>
+                    <thead><tr><th>Login</th><th>Email</th><th>Display name</th><th>Created (UTC+3)</th><th></th></tr></thead>
+                    <tbody id="users-body"></tbody>
+                </table>
+            </section>
+
             <section class="panel tab-panel" data-panel="llm" hidden>
                 <div class="page-header">
                     <h2>LLM</h2>
@@ -1437,6 +1575,20 @@ def dashboard() -> str:
             </section>
         </main>
     </div>
+
+    <div id="login-modal-backdrop" class="modal-backdrop" hidden>
+        <div class="modal">
+            <h3>Sign in</h3>
+            <p class="meta">Enter dashboard credentials.</p>
+            <div class="modal-form-grid">
+                <label><span class="meta">Login</span><br /><input id="auth-login" type="text" maxlength="64" /></label>
+                <label><span class="meta">Password</span><br /><input id="auth-password" type="password" maxlength="256" /></label>
+            </div>
+            <div id="auth-status" class="status"></div>
+            <div class="modal-actions"><button id="auth-sign-in" type="button">Sign in</button></div>
+        </div>
+    </div>
+
     <div id="global-menu" class="menu-popover" hidden></div>
     <div id="credentials-modal-backdrop" class="modal-backdrop" hidden>
         <div class="modal">
@@ -1478,6 +1630,8 @@ def dashboard() -> str:
             triggers: [],
             problems: [],
             knowledgeBase: [],
+            users: [],
+            currentLogin: '',
             latestSelectedNodeId: '',
             graphSelectedNodeId: '',
             triggerSelectedNodeId: '',
@@ -1991,6 +2145,14 @@ def dashboard() -> str:
                     <button type="button" data-trigger-action="edit" data-trigger-id="${triggerId}" data-trigger-name="${triggerName}" data-trigger-threshold="${triggerThreshold}">Edit</button>
                     <button type="button" class="danger" data-trigger-action="delete" data-trigger-id="${triggerId}">Delete</button>
                 `;
+            } else if (type === 'user') {
+                const userId = toggleButton.dataset.userId;
+                const userLogin = toggleButton.dataset.userLogin || '';
+                const userEmail = toggleButton.dataset.userEmail || '';
+                const userDisplayName = toggleButton.dataset.userDisplayName || '';
+                menu.innerHTML = `
+                    <button type="button" data-user-action="edit" data-user-id="${userId}" data-user-login="${userLogin}" data-user-email="${userEmail}" data-user-display-name="${userDisplayName}">Edit</button>
+                `;
             } else {
                 return;
             }
@@ -2113,6 +2275,79 @@ def dashboard() -> str:
                 setStatus('problems-status', error.message, true);
             }
         }
+
+        function renderUsersTable() {
+            const body = document.getElementById('users-body');
+            body.innerHTML = '';
+            if (!state.users.length) {
+                body.innerHTML = '<tr><td colspan="5" class="empty">No users yet.</td></tr>';
+                return;
+            }
+            for (const user of state.users) {
+                const row = document.createElement('tr');
+                const menuKey = `user:${user.id}`;
+                row.innerHTML = `
+                    <td>${user.login}</td>
+                    <td>${user.email}</td>
+                    <td>${user.display_name || '-'}</td>
+                    <td>${formatUtc(user.created_at)}</td>
+                    <td class="menu-cell"><button type="button" class="menu-btn secondary" data-menu-toggle="${menuKey}" data-menu-type="user" data-user-id="${user.id}" data-user-login="${user.login}" data-user-email="${user.email}" data-user-display-name="${user.display_name || ''}">...</button></td>
+                `;
+                body.appendChild(row);
+            }
+        }
+
+        async function loadUsers() {
+            try {
+                const data = await fetchJson('/api/users');
+                state.users = data;
+                renderUsersTable();
+                setStatus('users-status', state.users.length ? '' : 'No users yet.');
+            } catch (error) {
+                state.users = [];
+                renderUsersTable();
+                setStatus('users-status', error.message, true);
+            }
+        }
+
+        async function checkAuth() {
+            try {
+                const data = await fetchJson('/api/auth/me');
+                state.currentLogin = data.login;
+                document.getElementById('login-modal-backdrop').hidden = true;
+                return true;
+            } catch (error) {
+                document.getElementById('login-modal-backdrop').hidden = false;
+                setStatus('auth-status', 'Invalid login or password.', true);
+                return false;
+            }
+        }
+
+        async function signIn() {
+            const login = document.getElementById('auth-login').value.trim();
+            const password = document.getElementById('auth-password').value;
+            if (!login || !password) {
+                setStatus('auth-status', 'Fill login and password.', true);
+                return;
+            }
+            try {
+                await fetchJson('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ login, password }) });
+                setStatus('auth-status', '');
+                document.getElementById('auth-password').value = '';
+                await refreshAll();
+                document.getElementById('login-modal-backdrop').hidden = true;
+            } catch (error) {
+                setStatus('auth-status', error.message, true);
+            }
+        }
+
+        async function signOut() {
+            await fetchJson('/api/auth/logout', { method: 'POST' });
+            state.users = [];
+            renderUsersTable();
+            document.getElementById('login-modal-backdrop').hidden = false;
+        }
+
 
         async function loadKnowledgeBase() {
             try {
@@ -2295,6 +2530,8 @@ def dashboard() -> str:
         });
         document.getElementById('refresh-knowledge-base').addEventListener('click', loadKnowledgeBase);
         document.getElementById('run-llm').addEventListener('click', runLlm);
+        document.getElementById('auth-sign-in').addEventListener('click', signIn);
+        document.getElementById('sign-out').addEventListener('click', signOut);
         document.getElementById('close-credentials-modal').addEventListener('click', hideCredentialsModal);
         document.getElementById('credentials-modal-backdrop').addEventListener('click', (event) => {
             if (event.target.id === 'credentials-modal-backdrop') {
@@ -2399,6 +2636,50 @@ def dashboard() -> str:
                 return;
             }
 
+            const userActionButton = event.target.closest('[data-user-action]');
+            if (userActionButton) {
+                closeAllMenus();
+                const action = userActionButton.dataset.userAction;
+                const userId = userActionButton.dataset.userId;
+                if (action === 'edit') {
+                    showActionModal({
+                        title: 'Edit user',
+                        description: 'Update login, password, email and display name.',
+                        fields: [
+                            { id: 'edit-user-login', label: 'Login', value: userActionButton.dataset.userLogin || '', maxlength: 64 },
+                            { id: 'edit-user-password', label: 'Password', type: 'password', value: '', maxlength: 256 },
+                            { id: 'edit-user-email', label: 'Email', value: userActionButton.dataset.userEmail || '', maxlength: 255 },
+                            { id: 'edit-user-display-name', label: 'Display name', value: userActionButton.dataset.userDisplayName || '', maxlength: 255 },
+                        ],
+                        confirmLabel: 'Save',
+                        onConfirm: async () => {
+                            const login = document.getElementById('edit-user-login').value.trim();
+                            const password = document.getElementById('edit-user-password').value;
+                            const email = document.getElementById('edit-user-email').value.trim();
+                            const display_name = document.getElementById('edit-user-display-name').value.trim();
+                            if (!login || !password || !email) {
+                                setStatus('users-status', 'Login, Password and Email are required.', true);
+                                return;
+                            }
+                            try {
+                                await fetchJson(`/api/users/${encodeURIComponent(userId)}`, {
+                                    method: 'PATCH',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ login, password, email, display_name: display_name || null }),
+                                });
+                                hideActionModal();
+                                setStatus('users-status', 'User updated.');
+                                await loadUsers();
+                            } catch (error) {
+                                setStatus('users-status', error.message, true);
+                            }
+                        },
+                    });
+                }
+                return;
+            }
+
+
             const triggerActionButton = event.target.closest('[data-trigger-action]');
             if (triggerActionButton) {
                 closeAllMenus();
@@ -2468,6 +2749,8 @@ def dashboard() -> str:
         });
 
         async function refreshAll() {
+            const authed = await checkAuth();
+            if (!authed) return;
             await loadNodes();
             await loadAgents();
             await loadLatestMetrics();
@@ -2477,9 +2760,33 @@ def dashboard() -> str:
             await loadLogs();
             await loadTopProcesses();
             await loadKnowledgeBase();
+            await loadUsers();
         }
 
         renderTabs();
+        document.getElementById('create-user-form').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const login = document.getElementById('user-login-input').value.trim();
+            const password = document.getElementById('user-password-input').value;
+            const email = document.getElementById('user-email-input').value.trim();
+            const display_name = document.getElementById('user-display-name-input').value.trim();
+            if (!login || !password || !email) {
+                setStatus('users-status', 'Login, Password and Email are required.', true);
+                return;
+            }
+            try {
+                await fetchJson('/api/users', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ login, password, email, display_name: display_name || null }),
+                });
+                event.target.reset();
+                setStatus('users-status', 'User created.');
+                await loadUsers();
+            } catch (error) {
+                setStatus('users-status', error.message, true);
+            }
+        });
         refreshAll();
         setInterval(refreshAll, 5000);
     </script>
