@@ -108,7 +108,7 @@ def test_nodes_list_and_rename() -> None:
 def test_dashboard_page_available() -> None:
     html = dashboard()
     assert "Monitoring KB MVP" in html
-    assert "Latest data" in html
+    assert "Latest metrics" in html
     assert "Nodes" in html
     assert "Graphs" in html
     assert "Triggers" in html
