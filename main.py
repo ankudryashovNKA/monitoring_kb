@@ -65,6 +65,14 @@ class NodeInfo:
     last_seen: datetime
 
 
+class TopProcessIn(BaseModel):
+    pid: int = Field(..., ge=0)
+    name: str = Field(..., min_length=1, max_length=300)
+    cpu_percent: float = Field(..., ge=0)
+    ram_percent: float = Field(..., ge=0, le=100)
+    ram_mb: int = Field(..., ge=0)
+
+
 class MetricIn(BaseModel):
     node_id: str = Field(..., min_length=1, max_length=100)
     agent_id: str | None = Field(default=None, min_length=1, max_length=64)
@@ -74,6 +82,8 @@ class MetricIn(BaseModel):
     cpu_cores: int = Field(..., ge=1, le=4096)
     ram_total_mb: int = Field(..., ge=1)
     ip_address: str = Field(..., min_length=1, max_length=100)
+    top_cpu_processes: list[TopProcessIn] = Field(default_factory=list, max_length=10)
+    top_ram_processes: list[TopProcessIn] = Field(default_factory=list, max_length=10)
     timestamp: datetime | None = None
 
 
@@ -219,6 +229,7 @@ async def on_shutdown() -> None:
 # Backward-compatible placeholders used by legacy tests.
 _storage: dict[str, Deque[MetricPoint]] = defaultdict(deque)
 _nodes: dict[str, NodeInfo] = {}
+_latest_top_processes: dict[str, dict[str, object]] = {}
 
 init_db()
 
@@ -332,6 +343,13 @@ def ingest_metric(metric: MetricIn) -> dict[str, str]:
             )
         )
         db.commit()
+
+    _latest_top_processes[metric.node_id] = {
+        "node_id": metric.node_id,
+        "top_cpu_processes": [item.model_dump() for item in metric.top_cpu_processes[:10]],
+        "top_ram_processes": [item.model_dump() for item in metric.top_ram_processes[:10]],
+        "timestamp": normalized_timestamp.isoformat(),
+    }
     return {"status": "ok"}
 
 
@@ -477,6 +495,24 @@ def list_metrics(node_id: str | None = None) -> dict[str, list[dict[str, str | f
         ]
         items.reverse()
         return {"items": items}
+
+
+@app.get("/api/top-processes")
+def list_top_processes(node_id: str) -> dict[str, object]:
+    with SessionLocal() as db:
+        node = db.query(Node).filter(Node.display_name == node_id).first()
+        if node is None:
+            raise HTTPException(status_code=404, detail="Node not found")
+
+    payload = _latest_top_processes.get(node_id)
+    if payload is None:
+        return {
+            "node_id": node_id,
+            "top_cpu_processes": [],
+            "top_ram_processes": [],
+            "timestamp": None,
+        }
+    return payload
 
 
 @app.get("/api/metrics/history")
@@ -1080,6 +1116,7 @@ def dashboard() -> str:
                 <button class="nav-btn" data-tab="triggers" type="button"><span class="nav-label">Triggers</span></button>
                 <button class="nav-btn" data-tab="problems" type="button"><span class="nav-label">Problems</span></button>
                 <button class="nav-btn" data-tab="logs" type="button"><span class="nav-label">Logs</span></button>
+                <button class="nav-btn" data-tab="top" type="button"><span class="nav-label">Top</span></button>
                 <button class="nav-btn" data-tab="knowledge-base" type="button"><span class="nav-label">Knowledge Base</span></button>
                 <button class="nav-btn" data-tab="llm" type="button"><span class="nav-label">LLM</span></button>
             </nav>
@@ -1279,6 +1316,51 @@ def dashboard() -> str:
                 </table>
             </section>
 
+            <section class="panel tab-panel" data-panel="top" hidden>
+                <div class="page-header">
+                    <h2>Top</h2>
+                    <p class="meta">Top 10 processes by CPU and RAM on the selected node.</p>
+                </div>
+                <div class="toolbar">
+                    <label>
+                        <span class="meta">Node</span><br />
+                        <select id="top-node-select"></select>
+                    </label>
+                    <button id="refresh-top" type="button">Refresh top</button>
+                </div>
+                <div id="top-status" class="status"></div>
+                <div class="llm-grid">
+                    <div>
+                        <h3>CPU top 10</h3>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>PID</th>
+                                    <th>Process</th>
+                                    <th>CPU %</th>
+                                    <th>RAM</th>
+                                </tr>
+                            </thead>
+                            <tbody id="top-cpu-body"></tbody>
+                        </table>
+                    </div>
+                    <div>
+                        <h3>RAM top 10</h3>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>PID</th>
+                                    <th>Process</th>
+                                    <th>RAM %</th>
+                                    <th>RAM</th>
+                                </tr>
+                            </thead>
+                            <tbody id="top-ram-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
             <section class="panel tab-panel" data-panel="knowledge-base" hidden>
                 <div class="page-header">
                     <h2>Knowledge Base</h2>
@@ -1367,6 +1449,7 @@ def dashboard() -> str:
             graphSelectedNodeId: '',
             triggerSelectedNodeId: '',
             logsSelectedNodeId: '',
+            topSelectedNodeId: '',
             activeMenuKey: '',
             activeMenuData: null,
             activeTab: 'latest',
@@ -1410,10 +1493,12 @@ def dashboard() -> str:
             const graphSelect = document.getElementById('graph-node-select');
             const triggerSelect = document.getElementById('trigger-node-select');
             const logsSelect = document.getElementById('logs-node-select');
+            const topSelect = document.getElementById('top-node-select');
             select.innerHTML = '';
             graphSelect.innerHTML = '';
             triggerSelect.innerHTML = '';
             logsSelect.innerHTML = '';
+            topSelect.innerHTML = '';
             if (!state.nodes.length) {
                 const option = document.createElement('option');
                 option.textContent = 'No nodes yet';
@@ -1422,10 +1507,12 @@ def dashboard() -> str:
                 graphSelect.appendChild(option.cloneNode(true));
                 triggerSelect.appendChild(option.cloneNode(true));
                 logsSelect.appendChild(option.cloneNode(true));
+                topSelect.appendChild(option.cloneNode(true));
                 select.disabled = true;
                 graphSelect.disabled = true;
                 triggerSelect.disabled = true;
                 logsSelect.disabled = true;
+                topSelect.disabled = true;
                 return;
             }
 
@@ -1433,6 +1520,7 @@ def dashboard() -> str:
             graphSelect.disabled = false;
             triggerSelect.disabled = false;
             logsSelect.disabled = false;
+            topSelect.disabled = false;
             if (!state.latestSelectedNodeId || !state.nodes.some((node) => node.node_id === state.latestSelectedNodeId)) {
                 state.latestSelectedNodeId = state.nodes[0].node_id;
             }
@@ -1445,6 +1533,9 @@ def dashboard() -> str:
             if (!state.logsSelectedNodeId || !state.nodes.some((node) => node.node_id === state.logsSelectedNodeId)) {
                 state.logsSelectedNodeId = state.latestSelectedNodeId;
             }
+            if (!state.topSelectedNodeId || !state.nodes.some((node) => node.node_id === state.topSelectedNodeId)) {
+                state.topSelectedNodeId = state.latestSelectedNodeId;
+            }
 
             for (const node of state.nodes) {
                 const option = document.createElement('option');
@@ -1454,11 +1545,13 @@ def dashboard() -> str:
                 graphSelect.appendChild(option.cloneNode(true));
                 triggerSelect.appendChild(option.cloneNode(true));
                 logsSelect.appendChild(option.cloneNode(true));
+                topSelect.appendChild(option.cloneNode(true));
             }
             select.value = state.latestSelectedNodeId;
             graphSelect.value = state.graphSelectedNodeId;
             triggerSelect.value = state.triggerSelectedNodeId;
             logsSelect.value = state.logsSelectedNodeId;
+            topSelect.value = state.topSelectedNodeId;
         }
 
         function renderGraph(items, metricName, intervalMinutes) {
@@ -1747,6 +1840,25 @@ def dashboard() -> str:
             }
         }
 
+        function renderTopTable(items, bodyId, metricKey) {
+            const body = document.getElementById(bodyId);
+            body.innerHTML = '';
+            if (!items.length) {
+                body.innerHTML = '<tr><td colspan="4" class="empty">No process data yet.</td></tr>';
+                return;
+            }
+            for (const item of items) {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${item.pid}</td>
+                    <td>${item.name}</td>
+                    <td>${Number(item[metricKey]).toFixed(2)}</td>
+                    <td>${formatRamMb(item.ram_mb)}</td>
+                `;
+                body.appendChild(row);
+            }
+        }
+
         function setStatus(id, message, isError = false) {
             const element = document.getElementById(id);
             element.textContent = message;
@@ -2011,6 +2123,25 @@ def dashboard() -> str:
             }
         }
 
+        async function loadTopProcesses() {
+            if (!state.topSelectedNodeId) {
+                renderTopTable([], 'top-cpu-body', 'cpu_percent');
+                renderTopTable([], 'top-ram-body', 'ram_percent');
+                setStatus('top-status', 'Waiting for nodes to send data.');
+                return;
+            }
+            try {
+                const data = await fetchJson(`/api/top-processes?node_id=${encodeURIComponent(state.topSelectedNodeId)}`);
+                renderTopTable(data.top_cpu_processes || [], 'top-cpu-body', 'cpu_percent');
+                renderTopTable(data.top_ram_processes || [], 'top-ram-body', 'ram_percent');
+                setStatus('top-status', data.timestamp ? `Last updated (UTC): ${formatUtc(data.timestamp)}` : 'No process data yet.');
+            } catch (error) {
+                renderTopTable([], 'top-cpu-body', 'cpu_percent');
+                renderTopTable([], 'top-ram-body', 'ram_percent');
+                setStatus('top-status', error.message, true);
+            }
+        }
+
         async function runLlm() {
             const prompt = document.getElementById('llm-input').value.trim();
             if (!prompt) {
@@ -2049,13 +2180,16 @@ def dashboard() -> str:
             state.graphSelectedNodeId = event.target.value;
             state.triggerSelectedNodeId = event.target.value;
             state.logsSelectedNodeId = event.target.value;
+            state.topSelectedNodeId = event.target.value;
             document.getElementById('graph-node-select').value = state.graphSelectedNodeId;
             document.getElementById('trigger-node-select').value = state.triggerSelectedNodeId;
             document.getElementById('logs-node-select').value = state.logsSelectedNodeId;
+            document.getElementById('top-node-select').value = state.topSelectedNodeId;
             await loadLatestMetrics();
             await loadGraph();
             await loadTriggers();
             await loadLogs();
+            await loadTopProcesses();
         });
 
         document.getElementById('refresh-latest').addEventListener('click', loadLatestMetrics);
@@ -2111,6 +2245,11 @@ def dashboard() -> str:
         document.getElementById('logs-node-select').addEventListener('change', async (event) => {
             state.logsSelectedNodeId = event.target.value;
             await loadLogs();
+        });
+        document.getElementById('refresh-top').addEventListener('click', loadTopProcesses);
+        document.getElementById('top-node-select').addEventListener('change', async (event) => {
+            state.topSelectedNodeId = event.target.value;
+            await loadTopProcesses();
         });
         document.getElementById('refresh-knowledge-base').addEventListener('click', loadKnowledgeBase);
         document.getElementById('run-llm').addEventListener('click', runLlm);
@@ -2294,6 +2433,7 @@ def dashboard() -> str:
             await loadTriggers();
             await loadProblems();
             await loadLogs();
+            await loadTopProcesses();
             await loadKnowledgeBase();
         }
 

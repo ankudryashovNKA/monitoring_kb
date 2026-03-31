@@ -25,6 +25,7 @@ from main import (  # noqa: E402
     list_logs,
     list_nodes,
     list_problems,
+    list_top_processes,
     list_triggers,
     rename_node,
     MetricIn,
@@ -100,7 +101,7 @@ def test_nodes_list_and_rename() -> None:
     renamed = rename_node("node-rename", NodeRenameIn(display_name="Database node"))
     assert renamed["display_name"] == "Database node"
 
-    metrics = list_metrics(node_id="node-rename")["items"]
+    metrics = list_metrics(node_id="Database node")["items"]
     assert metrics[-1]["display_name"] == "Database node"
 
 
@@ -113,6 +114,7 @@ def test_dashboard_page_available() -> None:
     assert "Triggers" in html
     assert "Problems" in html
     assert "Logs" in html
+    assert "Top" in html
     assert "Knowledge Base" in html
 
 
@@ -145,6 +147,33 @@ def test_metric_history() -> None:
     assert history["metric_name"] == "cpu_percent"
     assert len(history["items"]) == 2
     assert history["items"][-1]["value"] == 22.0
+
+
+def test_top_processes() -> None:
+    ingest_metric(
+        MetricIn(
+            node_id="node-top",
+            cpu_percent=18.0,
+            ram_percent=33.0,
+            os_name="Ubuntu",
+            cpu_cores=4,
+            ram_total_mb=8192,
+            ip_address="10.0.0.14",
+            top_cpu_processes=[
+                {"pid": 101, "name": "python", "cpu_percent": 72.5, "ram_percent": 2.2, "ram_mb": 180},
+                {"pid": 102, "name": "java", "cpu_percent": 34.1, "ram_percent": 6.9, "ram_mb": 560},
+            ],
+            top_ram_processes=[
+                {"pid": 102, "name": "java", "cpu_percent": 34.1, "ram_percent": 6.9, "ram_mb": 560},
+                {"pid": 101, "name": "python", "cpu_percent": 72.5, "ram_percent": 2.2, "ram_mb": 180},
+            ],
+        )
+    )
+
+    top_payload = list_top_processes(node_id="node-top")
+    assert top_payload["node_id"] == "node-top"
+    assert len(top_payload["top_cpu_processes"]) == 2
+    assert top_payload["top_cpu_processes"][0]["name"] == "python"
 
 
 def test_triggers_and_problems() -> None:
