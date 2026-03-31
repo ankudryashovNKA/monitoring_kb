@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 
 DEFAULT_INTERVAL_SECONDS = 60
 MAX_LOG_ENTRIES = 100
+TOP_PROCESS_LIMIT = 10
 
 load_dotenv()
 
@@ -51,8 +52,37 @@ def collect_metrics(display_name: str, agent_id: str) -> dict[str, str | float |
         "cpu_cores": psutil.cpu_count() or 1,
         "ram_total_mb": int(virtual_memory.total / (1024 * 1024)),
         "ip_address": detect_primary_ip(),
+        "top_cpu_processes": collect_top_processes(sort_by="cpu_percent"),
+        "top_ram_processes": collect_top_processes(sort_by="ram_percent"),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def collect_top_processes(sort_by: str) -> list[dict[str, str | float | int]]:
+    if sort_by not in {"cpu_percent", "ram_percent"}:
+        raise ValueError(f"Unsupported top process sort key: {sort_by}")
+
+    total_ram = psutil.virtual_memory().total or 1
+    entries: list[dict[str, str | float | int]] = []
+    for process in psutil.process_iter(["pid", "name", "memory_info"]):
+        try:
+            memory_info = process.info.get("memory_info")
+            rss = int(memory_info.rss) if memory_info is not None else 0
+            ram_percent = (rss / total_ram) * 100
+            entries.append(
+                {
+                    "pid": int(process.info.get("pid") or 0),
+                    "name": str(process.info.get("name") or "unknown"),
+                    "cpu_percent": max(0.0, float(process.cpu_percent(interval=None))),
+                    "ram_percent": max(0.0, min(100.0, float(ram_percent))),
+                    "ram_mb": int(rss / (1024 * 1024)),
+                }
+            )
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+    sorted_entries = sorted(entries, key=lambda item: float(item[sort_by]), reverse=True)
+    return sorted_entries[:TOP_PROCESS_LIMIT]
 
 
 def detect_os_name() -> str:
@@ -230,7 +260,7 @@ def main() -> None:
     )
     parser.add_argument("--agent-id", default=os.getenv("AGENT_ID"), help="Registered agent ID")
     parser.add_argument("--agent-secret", default=os.getenv("AGENT_SECRET"), help="Registered agent secret")
-    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL_SECONDS, help="Send interval in seconds")
+    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL_SECONDS, help="Send interval in seconds (minimum 60)")
     args = parser.parse_args()
 
     if not args.server_url:
@@ -242,6 +272,8 @@ def main() -> None:
 
     metrics_path = "/api/agent/metrics"
     logs_path = "/api/agent/logs"
+    send_interval = max(DEFAULT_INTERVAL_SECONDS, args.interval)
+
     while True:
         metrics_payload = collect_metrics(args.display_name, args.agent_id)
         logs_payload = collect_logs_payload(args.display_name, args.agent_id)
@@ -265,7 +297,7 @@ def main() -> None:
         logs_response.raise_for_status()
         print(f"Sent metrics: {json.dumps(metrics_payload)}")
         print(f"Sent logs entries: {len(logs_payload['entries'])}")
-        time.sleep(args.interval)
+        time.sleep(send_interval)
 
 
 if __name__ == "__main__":
