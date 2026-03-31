@@ -17,6 +17,9 @@ class Settings:
     kb_jwt_token: str | None
     kb_api_base_url: str
     kb_preset_name: str
+    admin_login: str
+    admin_password: str
+    auth_secret: str
 
     @property
     def database_url(self) -> str:
@@ -46,4 +49,7 @@ settings = Settings(
     kb_jwt_token=os.getenv("KB_JWT_TOKEN"),
     kb_api_base_url=os.getenv("KB_API_BASE_URL", "https://kb.ai-hippocrates.ru/kbapi"),
     kb_preset_name=os.getenv("KB_PRESET_NAME", "Monitoring server"),
+    admin_login=os.getenv("ADMIN_LOGIN", "admin"),
+    admin_password=os.getenv("ADMIN_PASSWORD", "admin"),
+    auth_secret=os.getenv("AUTH_SECRET", "change-me-in-production"),
 )
