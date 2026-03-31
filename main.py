@@ -827,6 +827,11 @@ def dashboard() -> str:
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Monitoring KB MVP</title>
+    <link
+        rel="icon"
+        type="image/svg+xml"
+        href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23189de8'/%3E%3Ctext x='50%25' y='52%25' dominant-baseline='middle' text-anchor='middle' font-family='Inter,Arial,sans-serif' font-size='38' font-weight='700' fill='white'%3EM%3C/text%3E%3C/svg%3E"
+    />
     <style>
         :root {
             color-scheme: light;
@@ -838,10 +843,15 @@ def dashboard() -> str:
             --border: #dbe3ef;
             --text: #1f2d3d;
             --muted: #6f7f95;
-            --accent: #0173b2;
-            --accent-soft: rgba(1, 115, 178, 0.1);
+            --accent: #2f95e9;
+            --accent-soft: rgba(47, 149, 233, 0.18);
             --danger: #cf4557;
             --shadow: 0 14px 28px rgba(31, 45, 61, 0.08);
+            --sidebar-bg: #174a72;
+            --sidebar-bg-strong: #0f3b5f;
+            --sidebar-text: #d7e7f7;
+            --sidebar-muted: #9ebdd8;
+            --sidebar-active: #0f3e63;
         }
         * { box-sizing: border-box; }
         body {
@@ -860,16 +870,18 @@ def dashboard() -> str:
             top: 0;
             height: 100vh;
             overflow-y: auto;
-            background: rgba(255, 255, 255, 0.96);
-            border-right: 1px solid var(--border);
-            padding: 1.25rem 1rem;
-            transition: width 0.25s ease, padding 0.25s ease;
-            box-shadow: 6px 0 24px rgba(20, 41, 77, 0.06);
+            background: linear-gradient(180deg, var(--sidebar-bg-strong) 0%, var(--sidebar-bg) 100%);
+            border-right: 1px solid rgba(170, 202, 230, 0.25);
+            padding: 1rem 0.65rem;
+            transition: width 0.25s ease, padding 0.25s ease, border-color 0.25s ease;
+            box-shadow: 8px 0 20px rgba(8, 24, 39, 0.24);
             z-index: 10;
         }
         .sidebar.collapsed {
-            width: 84px;
-            padding-inline: 0.75rem;
+            width: 0;
+            padding: 0;
+            border-right-color: transparent;
+            overflow: hidden;
         }
         .brand {
             display: flex;
@@ -882,12 +894,16 @@ def dashboard() -> str:
             font-size: 1.1rem;
             font-weight: bold;
             margin: 0;
+            color: #f5fbff;
         }
-        .brand-subtitle, .sidebar.collapsed .nav-label, .sidebar.collapsed .brand-copy {
+        .brand-subtitle {
+            color: var(--sidebar-muted);
+        }
+        .sidebar.collapsed .brand-copy {
             display: none;
         }
         .toggle-btn, .nav-btn, button, select, input, textarea {
-            border-radius: 0.45rem;
+            border-radius: 0.35rem;
             border: 1px solid var(--border);
             background: #fff;
             color: var(--text);
@@ -896,39 +912,65 @@ def dashboard() -> str:
             cursor: pointer;
         }
         .toggle-btn {
-            width: 40px;
-            height: 40px;
+            width: 34px;
+            height: 34px;
+            border-color: rgba(194, 219, 242, 0.4);
+            background: rgba(255, 255, 255, 0.08);
+            color: #dceeff;
         }
         .nav {
             display: flex;
             flex-direction: column;
-            gap: 0.75rem;
+            gap: 0.35rem;
         }
         .nav-btn {
             display: flex;
             align-items: center;
-            gap: 0.75rem;
+            gap: 0.55rem;
             width: 100%;
-            padding: 0.7rem 0.85rem;
+            padding: 0.48rem 0.58rem;
             text-align: left;
             transition: background 0.2s ease, border-color 0.2s ease;
+            border: 1px solid transparent;
+            background: transparent;
+            color: var(--sidebar-text);
+            font-weight: 500;
         }
         .nav-btn:hover {
-            border-color: #c2d2e9;
-            background: #f7faff;
+            border-color: rgba(178, 210, 235, 0.35);
+            background: rgba(15, 62, 99, 0.72);
         }
         .nav-btn.active {
-            background: var(--accent-soft);
-            border-color: var(--accent);
-            color: #005489;
+            background: var(--sidebar-active);
+            border-color: rgba(176, 209, 235, 0.35);
+            color: #f4fbff;
         }
-        .sidebar.collapsed .nav-btn {
+        .nav-icon {
+            display: inline-flex;
+            width: 20px;
             justify-content: center;
-            padding-inline: 0;
+            opacity: 0.9;
+            font-size: 14px;
+        }
+        .nav-label {
+            white-space: nowrap;
         }
         .content {
             flex: 1;
             padding: 2rem;
+        }
+        .sidebar-unhide-btn {
+            position: fixed;
+            top: 12px;
+            left: 12px;
+            z-index: 20;
+            width: 34px;
+            height: 34px;
+            border-radius: 0.35rem;
+            border: 1px solid #c5d8ee;
+            background: #ffffff;
+            box-shadow: 0 6px 14px rgba(31, 45, 61, 0.2);
+            cursor: pointer;
         }
         .panel {
             background: var(--panel);
@@ -955,8 +997,8 @@ def dashboard() -> str:
             gap: 0.35rem;
         }
         select, input, textarea {
-            min-height: 38px;
-            padding: 0.5rem 0.65rem;
+            min-height: 32px;
+            padding: 0.3rem 0.5rem;
         }
         textarea {
             width: 100%;
@@ -970,8 +1012,8 @@ def dashboard() -> str:
             gap: 1rem;
         }
         button {
-            min-height: 38px;
-            padding: 0.45rem 0.8rem;
+            min-height: 32px;
+            padding: 0.28rem 0.62rem;
             background: var(--accent-soft);
             border-color: var(--accent);
             font-weight: 600;
@@ -1030,8 +1072,8 @@ def dashboard() -> str:
             width: 64px;
         }
         .menu-btn {
-            min-height: 30px;
-            padding: 0.25rem 0.45rem;
+            min-height: 26px;
+            padding: 0.15rem 0.32rem;
             line-height: 1;
         }
         .menu-popover {
@@ -1105,26 +1147,27 @@ def dashboard() -> str:
             <div class="brand">
                 <div class="brand-copy">
                     <p class="brand-title">Monitoring KB</p>
-                    <p class="brand-subtitle meta">Simple node overview</p>
+                    <p class="brand-subtitle">Simple node overview</p>
                 </div>
                 <button id="sidebar-toggle" class="toggle-btn" type="button" aria-label="Toggle menu">☰</button>
             </div>
             <nav class="nav">
-                <button class="nav-btn active" data-tab="latest" type="button"><span class="nav-label">Latest data</span></button>
-                <button class="nav-btn" data-tab="nodes" type="button"><span class="nav-label">Nodes</span></button>
-                <button class="nav-btn" data-tab="graphs" type="button"><span class="nav-label">Graphs</span></button>
-                <button class="nav-btn" data-tab="triggers" type="button"><span class="nav-label">Triggers</span></button>
-                <button class="nav-btn" data-tab="problems" type="button"><span class="nav-label">Problems</span></button>
-                <button class="nav-btn" data-tab="logs" type="button"><span class="nav-label">Logs</span></button>
-                <button class="nav-btn" data-tab="top" type="button"><span class="nav-label">Top</span></button>
-                <button class="nav-btn" data-tab="knowledge-base" type="button"><span class="nav-label">Knowledge Base</span></button>
-                <button class="nav-btn" data-tab="llm" type="button"><span class="nav-label">LLM</span></button>
+                <button class="nav-btn active" data-tab="latest" type="button"><span class="nav-icon">▦</span><span class="nav-label">Latest metrics</span></button>
+                <button class="nav-btn" data-tab="nodes" type="button"><span class="nav-icon">🖥</span><span class="nav-label">Nodes</span></button>
+                <button class="nav-btn" data-tab="graphs" type="button"><span class="nav-icon">📈</span><span class="nav-label">Graphs</span></button>
+                <button class="nav-btn" data-tab="triggers" type="button"><span class="nav-icon">⚙</span><span class="nav-label">Triggers</span></button>
+                <button class="nav-btn" data-tab="problems" type="button"><span class="nav-icon">⚠</span><span class="nav-label">Problems</span></button>
+                <button class="nav-btn" data-tab="logs" type="button"><span class="nav-icon">🗒</span><span class="nav-label">Logs</span></button>
+                <button class="nav-btn" data-tab="top" type="button"><span class="nav-icon">🔝</span><span class="nav-label">Top</span></button>
+                <button class="nav-btn" data-tab="knowledge-base" type="button"><span class="nav-icon">📚</span><span class="nav-label">Knowledge Base</span></button>
+                <button class="nav-btn" data-tab="llm" type="button"><span class="nav-icon">🤖</span><span class="nav-label">LLM</span></button>
             </nav>
         </aside>
+        <button id="sidebar-unhide" class="sidebar-unhide-btn" type="button" aria-label="Show menu" hidden>☰</button>
         <main class="content">
             <section class="panel tab-panel" data-panel="latest">
                 <div class="page-header">
-                    <h1>Latest data</h1>
+                    <h1>Latest metrics</h1>
                     <p class="meta">Choose a node and inspect the latest 10 CPU/RAM samples received from it.</p>
                 </div>
                 <div class="toolbar">
@@ -1139,7 +1182,7 @@ def dashboard() -> str:
                 <table>
                     <thead>
                         <tr>
-                            <th>Time (UTC)</th>
+                            <th>Time (UTC+3)</th>
                             <th>Node</th>
                             <th>CPU %</th>
                             <th>RAM %</th>
@@ -1166,7 +1209,7 @@ def dashboard() -> str:
                             <th>CPU cores</th>
                             <th>RAM</th>
                             <th>IP</th>
-                            <th>Last seen (UTC)</th>
+                            <th>Last seen (UTC+3)</th>
                             <th>Agent status</th>
                             <th></th>
                         </tr>
@@ -1260,7 +1303,7 @@ def dashboard() -> str:
                             <th>Condition</th>
                             <th>Latest value</th>
                             <th>Status</th>
-                            <th>Created (UTC)</th>
+                            <th>Created (UTC+3)</th>
                             <th></th>
                         </tr>
                     </thead>
@@ -1284,7 +1327,7 @@ def dashboard() -> str:
                             <th>Trigger</th>
                             <th>Condition</th>
                             <th>Latest value</th>
-                            <th>Created (UTC)</th>
+                            <th>Created (UTC+3)</th>
                         </tr>
                     </thead>
                     <tbody id="problems-body"></tbody>
@@ -1307,7 +1350,7 @@ def dashboard() -> str:
                 <table>
                     <thead>
                         <tr>
-                            <th>Time (UTC)</th>
+                            <th>Time (UTC+3)</th>
                             <th>Source</th>
                             <th>Entry</th>
                         </tr>
@@ -1472,7 +1515,7 @@ def dashboard() -> str:
         }
 
         function formatUtc(value) {
-            return new Date(value).toLocaleString('en-GB', { timeZone: 'UTC' });
+            return new Date(value).toLocaleString('en-GB', { timeZone: 'Europe/Moscow' });
         }
 
         function formatRamMb(value) {
@@ -1624,7 +1667,7 @@ def dashboard() -> str:
                 xLabel.setAttribute('font-size', '12');
                 xLabel.setAttribute('text-anchor', 'middle');
                 xLabel.textContent = new Date(tickMs).toLocaleTimeString('en-GB', {
-                    timeZone: 'UTC',
+                    timeZone: 'Europe/Moscow',
                     hour: '2-digit',
                     minute: '2-digit',
                 });
@@ -2095,8 +2138,8 @@ def dashboard() -> str:
                     setStatus(
                         'knowledge-base-status',
                         state.knowledgeBase.length
-                            ? `Last updated (UTC): ${updated}`
-                            : `No results yet. Last updated (UTC): ${updated}`
+                            ? `Last updated (UTC+3): ${updated}`
+                            : `No results yet. Last updated (UTC+3): ${updated}`
                     );
                 }
             } catch (error) {
@@ -2134,7 +2177,7 @@ def dashboard() -> str:
                 const data = await fetchJson(`/api/top-processes?node_id=${encodeURIComponent(state.topSelectedNodeId)}`);
                 renderTopTable(data.top_cpu_processes || [], 'top-cpu-body', 'cpu_percent');
                 renderTopTable(data.top_ram_processes || [], 'top-ram-body', 'ram_percent');
-                setStatus('top-status', data.timestamp ? `Last updated (UTC): ${formatUtc(data.timestamp)}` : 'No process data yet.');
+                setStatus('top-status', data.timestamp ? `Last updated (UTC+3): ${formatUtc(data.timestamp)}` : 'No process data yet.');
             } catch (error) {
                 renderTopTable([], 'top-cpu-body', 'cpu_percent');
                 renderTopTable([], 'top-ram-body', 'ram_percent');
@@ -2164,8 +2207,17 @@ def dashboard() -> str:
             }
         }
 
+        function setSidebarCollapsed(collapsed) {
+            document.getElementById('sidebar').classList.toggle('collapsed', collapsed);
+            document.getElementById('sidebar-unhide').hidden = !collapsed;
+        }
+
         document.getElementById('sidebar-toggle').addEventListener('click', () => {
-            document.getElementById('sidebar').classList.toggle('collapsed');
+            setSidebarCollapsed(true);
+        });
+
+        document.getElementById('sidebar-unhide').addEventListener('click', () => {
+            setSidebarCollapsed(false);
         });
 
         document.querySelectorAll('.nav-btn').forEach((button) => {
