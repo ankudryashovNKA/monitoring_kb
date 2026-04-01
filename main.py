@@ -5,8 +5,10 @@ import contextlib
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import asyncio
+from email.message import EmailMessage
 import logging
 import operator
+import smtplib
 from typing import Deque
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, status
@@ -31,6 +33,7 @@ from app.security.agent_auth import (
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func
+from sqlalchemy.orm import Session
 
 from app.models.metric import Metric
 from app.models.node import Node
@@ -116,11 +119,13 @@ class TriggerCreateIn(BaseModel):
     metric_name: str = Field(..., pattern="^(cpu_percent|ram_percent)$")
     operator: str = Field(..., pattern="^(>|<)$")
     threshold: float = Field(..., ge=0, le=100)
+    alert_user_id: int | None = Field(default=None, ge=1)
 
 
 class TriggerUpdateIn(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
     threshold: float = Field(..., ge=0, le=100)
+    alert_user_id: int | None = Field(default=None, ge=1)
 
 
 class KBExplanatoryItem(BaseModel):
@@ -187,6 +192,7 @@ def init_db() -> None:
     # For production use Alembic migrations instead of create_all.
     Base.metadata.create_all(bind=engine)
     _migrate_users_table()
+    _migrate_triggers_table()
     _ensure_admin_user()
 
 
@@ -252,6 +258,23 @@ def _ensure_admin_user() -> None:
             if admin.email in [f"{settings.admin_login}@local", f"{settings.admin_login}@local.test"]:
                 admin.email = admin_email
         db.commit()
+
+
+def _migrate_triggers_table() -> None:
+    inspector = inspect(engine)
+    if "triggers" not in inspector.get_table_names():
+        return
+
+    existing_columns = {column["name"] for column in inspector.get_columns("triggers")}
+    statements: list[str] = []
+    if "alert_user_id" not in existing_columns:
+        statements.append("ALTER TABLE triggers ADD COLUMN alert_user_id INTEGER")
+    if "alert_sent" not in existing_columns:
+        statements.append("ALTER TABLE triggers ADD COLUMN alert_sent BOOLEAN DEFAULT 0 NOT NULL")
+
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
 
 
 def _knowledge_base_enabled() -> bool:
@@ -422,12 +445,67 @@ def _serialize_trigger(
         "metric_name": trigger.metric_name,
         "operator": trigger.operator,
         "threshold": trigger.threshold,
+        "alert_user_id": trigger.alert_user_id,
+        "alert_to_login": trigger.alert_user.login if trigger.alert_user else None,
+        "alert_to_display_name": trigger.alert_user.display_name if trigger.alert_user else None,
         "is_active": _is_trigger_active(trigger, metric),
         "created_at": trigger.created_at.isoformat(),
     }
     if include_latest:
         payload["latest_value"] = latest_value
     return payload
+
+
+def _send_trigger_alert_email(trigger: Trigger, user: User, metric_value: float) -> bool:
+    if not settings.smtp_host or not settings.smtp_sender:
+        logger.warning("SMTP is not configured, skipping trigger alert email for trigger_id=%s", trigger.id)
+        return False
+
+    subject = f"[Monitoring] Trigger fired: {trigger.name}"
+    recipient_name = user.display_name or user.login
+    body = (
+        f"Hello, {recipient_name}!\n\n"
+        f"Trigger '{trigger.name}' is active on node '{trigger.node_id}'.\n"
+        f"Condition: {trigger.metric_name} {trigger.operator} {trigger.threshold:.2f}%\n"
+        f"Current value: {metric_value:.2f}%\n"
+        f"Triggered at (UTC): {_utcnow().isoformat()}\n"
+    )
+    message = EmailMessage()
+    message["From"] = settings.smtp_sender
+    message["To"] = user.email
+    message["Subject"] = subject
+    message.set_content(body)
+
+    try:
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=15) as smtp:
+            if settings.smtp_use_tls:
+                smtp.starttls()
+            if settings.smtp_username:
+                smtp.login(settings.smtp_username, settings.smtp_password or "")
+            smtp.send_message(message)
+        return True
+    except Exception:
+        logger.exception("Failed to send trigger alert email for trigger_id=%s", trigger.id)
+        return False
+
+
+def _process_trigger_alerts(db: Session, node_id: str, metric: MetricIn) -> None:
+    triggers = db.query(Trigger).filter(Trigger.node_id == node_id).all()
+    for trigger in triggers:
+        metric_value = metric.cpu_percent if trigger.metric_name == "cpu_percent" else metric.ram_percent
+        is_active = metric_value > trigger.threshold if trigger.operator == ">" else metric_value < trigger.threshold
+        if not is_active:
+            trigger.alert_sent = False
+            continue
+        if trigger.alert_sent:
+            continue
+        if trigger.alert_user_id is None:
+            continue
+        user = db.query(User).filter(User.id == trigger.alert_user_id).first()
+        if user is None:
+            continue
+        if _send_trigger_alert_email(trigger, user, metric_value):
+            trigger.alert_sent = True
 
 
 @app.post("/api/metrics")
@@ -471,6 +549,7 @@ def ingest_metric(metric: MetricIn) -> dict[str, str]:
                 timestamp=normalized_timestamp,
             )
         )
+        _process_trigger_alerts(db, metric.node_id, metric)
         db.commit()
 
     _latest_top_processes[metric.node_id] = {
@@ -799,6 +878,10 @@ def create_trigger(payload: TriggerCreateIn) -> dict[str, str | float | int | bo
         node = db.query(Node).filter(Node.display_name == payload.node_id).first()
         if node is None:
             raise HTTPException(status_code=404, detail="Node not found")
+        if payload.alert_user_id is not None:
+            alert_user = db.query(User).filter(User.id == payload.alert_user_id).first()
+            if alert_user is None:
+                raise HTTPException(status_code=404, detail="User for alert not found")
 
         trigger = Trigger(
             node_id=payload.node_id,
@@ -806,6 +889,8 @@ def create_trigger(payload: TriggerCreateIn) -> dict[str, str | float | int | bo
             metric_name=payload.metric_name,
             operator=payload.operator,
             threshold=payload.threshold,
+            alert_user_id=payload.alert_user_id,
+            alert_sent=False,
             created_at=_utcnow(),
         )
         db.add(trigger)
@@ -827,9 +912,15 @@ def update_trigger(trigger_id: int, payload: TriggerUpdateIn) -> dict[str, str |
         trigger = db.query(Trigger).filter(Trigger.id == trigger_id).first()
         if trigger is None:
             raise HTTPException(status_code=404, detail="Trigger not found")
+        if payload.alert_user_id is not None:
+            alert_user = db.query(User).filter(User.id == payload.alert_user_id).first()
+            if alert_user is None:
+                raise HTTPException(status_code=404, detail="User for alert not found")
 
         trigger.name = payload.name
         trigger.threshold = payload.threshold
+        trigger.alert_user_id = payload.alert_user_id
+        trigger.alert_sent = False
         db.commit()
         db.refresh(trigger)
 
@@ -1410,6 +1501,10 @@ def dashboard() -> str:
                         </select>
                     </label>
                     <label>
+                        <span class="meta">Alert to</span><br />
+                        <select id="trigger-alert-user-select"></select>
+                    </label>
+                    <label>
                         <span class="meta">Threshold (%)</span><br />
                         <input id="trigger-threshold-input" type="number" min="0" max="100" step="0.1" value="80" required />
                     </label>
@@ -1423,6 +1518,7 @@ def dashboard() -> str:
                             <th>Name</th>
                             <th>Condition</th>
                             <th>Latest value</th>
+                            <th>Alert to</th>
                             <th>Status</th>
                             <th>Created (UTC+3)</th>
                             <th></th>
@@ -1944,15 +2040,34 @@ def dashboard() -> str:
             return metricName === 'cpu_percent' ? 'CPU %' : 'RAM %';
         }
 
+        function renderAlertUserOptions() {
+            const select = document.getElementById('trigger-alert-user-select');
+            select.innerHTML = '';
+            const emptyOption = document.createElement('option');
+            emptyOption.value = '';
+            emptyOption.textContent = 'Not selected';
+            select.appendChild(emptyOption);
+            for (const user of state.users) {
+                const option = document.createElement('option');
+                option.value = String(user.id);
+                const displayName = user.display_name ? ` (${user.display_name})` : '';
+                option.textContent = `${user.login}${displayName}`;
+                select.appendChild(option);
+            }
+        }
+
         function renderTriggersTable() {
             const body = document.getElementById('triggers-body');
             body.innerHTML = '';
             if (!state.triggers.length) {
-                body.innerHTML = '<tr><td colspan="7" class="empty">No triggers created for the selected node.</td></tr>';
+                body.innerHTML = '<tr><td colspan="8" class="empty">No triggers created for the selected node.</td></tr>';
                 return;
             }
             for (const trigger of state.triggers) {
                 const latestValue = trigger.latest_value == null ? 'No data' : `${Number(trigger.latest_value).toFixed(2)}%`;
+                const alertTo = trigger.alert_to_login
+                    ? `${trigger.alert_to_login}${trigger.alert_to_display_name ? ` (${trigger.alert_to_display_name})` : ''}`
+                    : '—';
                 const menuKey = `trigger:${trigger.id}`;
                 const row = document.createElement('tr');
                 row.innerHTML = `
@@ -1960,6 +2075,7 @@ def dashboard() -> str:
                     <td>${trigger.name}</td>
                     <td>${metricLabel(trigger.metric_name)} ${trigger.operator} ${Number(trigger.threshold).toFixed(2)}%</td>
                     <td>${latestValue}</td>
+                    <td>${alertTo}</td>
                     <td>${trigger.is_active ? 'Active' : 'OK'}</td>
                     <td>${formatUtc(trigger.created_at)}</td>
                     <td class="menu-cell">
@@ -1971,6 +2087,7 @@ def dashboard() -> str:
                             data-trigger-id="${trigger.id}"
                             data-trigger-name="${trigger.name}"
                             data-trigger-threshold="${trigger.threshold}"
+                            data-trigger-alert-user-id="${trigger.alert_user_id || ''}"
                             aria-label="Trigger actions"
                         >...</button>
                     </td>
@@ -2092,15 +2209,30 @@ def dashboard() -> str:
             for (const field of fields) {
                 const label = document.createElement('label');
                 label.innerHTML = `<span class="meta">${field.label}</span><br />`;
-                const input = document.createElement('input');
-                input.type = field.type || 'text';
-                input.id = field.id;
-                input.value = field.value || '';
-                if (field.min != null) input.min = String(field.min);
-                if (field.max != null) input.max = String(field.max);
-                if (field.step != null) input.step = String(field.step);
-                if (field.maxlength != null) input.maxLength = Number(field.maxlength);
-                label.appendChild(input);
+                if (field.type === 'select') {
+                    const select = document.createElement('select');
+                    select.id = field.id;
+                    for (const option of field.options || []) {
+                        const optionElement = document.createElement('option');
+                        optionElement.value = option.value;
+                        optionElement.textContent = option.label;
+                        if ((field.value || '') === option.value) {
+                            optionElement.selected = true;
+                        }
+                        select.appendChild(optionElement);
+                    }
+                    label.appendChild(select);
+                } else {
+                    const input = document.createElement('input');
+                    input.type = field.type || 'text';
+                    input.id = field.id;
+                    input.value = field.value || '';
+                    if (field.min != null) input.min = String(field.min);
+                    if (field.max != null) input.max = String(field.max);
+                    if (field.step != null) input.step = String(field.step);
+                    if (field.maxlength != null) input.maxLength = Number(field.maxlength);
+                    label.appendChild(input);
+                }
                 fieldsContainer.appendChild(label);
             }
             const confirmButton = document.getElementById('action-modal-confirm');
@@ -2315,10 +2447,12 @@ def dashboard() -> str:
                 const data = await fetchJson('/api/users');
                 state.users = data;
                 renderUsersTable();
+                renderAlertUserOptions();
                 setStatus('users-status', state.users.length ? '' : 'No users yet.');
             } catch (error) {
                 state.users = [];
                 renderUsersTable();
+                renderAlertUserOptions();
                 setStatus('users-status', error.message, true);
             }
         }
@@ -2507,6 +2641,8 @@ def dashboard() -> str:
                 return;
             }
             const threshold = Number(document.getElementById('trigger-threshold-input').value);
+            const alertUserRaw = document.getElementById('trigger-alert-user-select').value;
+            const alertUserId = alertUserRaw ? Number(alertUserRaw) : null;
             if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) {
                 setStatus('triggers-status', 'Threshold must be between 0 and 100.', true);
                 return;
@@ -2521,6 +2657,7 @@ def dashboard() -> str:
                         metric_name: document.getElementById('trigger-metric-select').value,
                         operator: document.getElementById('trigger-operator-select').value,
                         threshold,
+                        alert_user_id: alertUserId,
                     }),
                 });
                 setStatus('triggers-status', 'Trigger created.');
@@ -2699,17 +2836,26 @@ def dashboard() -> str:
                 const action = triggerActionButton.dataset.triggerAction;
                 const triggerId = triggerActionButton.dataset.triggerId;
                 if (action === 'edit') {
+                    const alertUserOptions = [{ value: '', label: 'Not selected' }].concat(
+                        state.users.map((user) => ({
+                            value: String(user.id),
+                            label: `${user.login}${user.display_name ? ` (${user.display_name})` : ''}`,
+                        }))
+                    );
                     showActionModal({
                         title: 'Edit trigger',
-                        description: 'Update trigger name and threshold.',
+                        description: 'Update trigger name, threshold and alert recipient.',
                         fields: [
                             { id: 'edit-trigger-name', label: 'Name', value: triggerActionButton.dataset.triggerName || '', maxlength: 120 },
                             { id: 'edit-trigger-threshold', label: 'Threshold (0-100)', type: 'number', value: triggerActionButton.dataset.triggerThreshold || '', min: 0, max: 100, step: 0.1 },
+                            { id: 'edit-trigger-alert-user-id', label: 'Alert to', type: 'select', value: triggerActionButton.dataset.triggerAlertUserId || '', options: alertUserOptions },
                         ],
                         confirmLabel: 'Save',
                         onConfirm: async () => {
                             const nextName = document.getElementById('edit-trigger-name').value.trim();
                             const threshold = Number(document.getElementById('edit-trigger-threshold').value);
+                            const alertUserRaw = document.getElementById('edit-trigger-alert-user-id').value;
+                            const alertUserId = alertUserRaw ? Number(alertUserRaw) : null;
                             if (!nextName) {
                                 setStatus('triggers-status', 'Trigger name cannot be empty.', true);
                                 return;
@@ -2722,7 +2868,7 @@ def dashboard() -> str:
                                 await fetchJson(`/api/triggers/${encodeURIComponent(triggerId)}`, {
                                     method: 'PATCH',
                                     headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({ name: nextName, threshold }),
+                                    body: JSON.stringify({ name: nextName, threshold, alert_user_id: alertUserId }),
                                 });
                                 hideActionModal();
                                 setStatus('triggers-status', 'Trigger updated.');
@@ -2765,6 +2911,7 @@ def dashboard() -> str:
             const authed = await checkAuth();
             if (!authed) return;
             await loadNodes();
+            await loadUsers();
             await loadAgents();
             await loadLatestMetrics();
             await loadGraph();
@@ -2773,7 +2920,6 @@ def dashboard() -> str:
             await loadLogs();
             await loadTopProcesses();
             await loadKnowledgeBase();
-            await loadUsers();
         }
 
         renderTabs();
