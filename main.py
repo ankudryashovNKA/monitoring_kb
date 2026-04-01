@@ -225,13 +225,17 @@ def _migrate_users_table() -> None:
 
 
 def _ensure_admin_user() -> None:
+    admin_email = f"{settings.admin_login}@monitoring-kb.com"
     with SessionLocal() as db:
         admin = db.query(User).filter(User.login == settings.admin_login).first()
         if admin is None:
-            existing_email = db.query(User).filter(User.email == f"{settings.admin_login}@local").first()
+            existing_email = db.query(User).filter(
+                User.email.in_([f"{settings.admin_login}@local", f"{settings.admin_login}@local.test", admin_email])
+            ).first()
             if existing_email is not None:
                 existing_email.login = settings.admin_login
                 existing_email.password_hash = hash_password(settings.admin_password)
+                existing_email.email = admin_email
                 if not existing_email.display_name:
                     existing_email.display_name = "Administrator"
             else:
@@ -239,12 +243,14 @@ def _ensure_admin_user() -> None:
                     User(
                         login=settings.admin_login,
                         password_hash=hash_password(settings.admin_password),
-                        email=f"{settings.admin_login}@local",
+                        email=admin_email,
                         display_name="Administrator",
                     )
                 )
         else:
             admin.password_hash = hash_password(settings.admin_password)
+            if admin.email in [f"{settings.admin_login}@local", f"{settings.admin_login}@local.test"]:
+                admin.email = admin_email
         db.commit()
 
 
