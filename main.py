@@ -132,15 +132,18 @@ class LogsIn(BaseModel):
 class TriggerCreateIn(BaseModel):
     node_id: str = Field(..., min_length=1, max_length=100)
     name: str = Field("Trigger", min_length=1, max_length=120)
-    metric_name: str = Field(..., pattern="^(cpu_percent|ram_percent)$")
+    metric_name: str = Field(
+        ...,
+        pattern="^(cpu_percent|ram_percent|swap_percent|uptime_seconds|disk_read_time_ms|disk_write_time_ms|zombie_processes)$",
+    )
     operator: str = Field(..., pattern="^(>|<)$")
-    threshold: float = Field(..., ge=0, le=100)
+    threshold: float = Field(..., ge=0)
     alert_user_id: int | None = Field(default=None, ge=1)
 
 
 class TriggerUpdateIn(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
-    threshold: float = Field(..., ge=0, le=100)
+    threshold: float = Field(..., ge=0)
     alert_user_id: int | None = Field(default=None, ge=1)
 
 
@@ -465,7 +468,7 @@ def _is_trigger_active(trigger: Trigger, metric: Metric | None) -> bool:
     if metric is None:
         return False
     comparator = operator.gt if trigger.operator == ">" else operator.lt
-    metric_value = metric.cpu_percent if trigger.metric_name == "cpu_percent" else metric.ram_percent
+    metric_value = _extract_metric_value(metric, trigger.metric_name)
     return comparator(metric_value, trigger.threshold)
 
 
@@ -477,7 +480,7 @@ def _serialize_trigger(
 ) -> dict[str, str | float | int | bool | None]:
     latest_value = None
     if metric is not None:
-        latest_value = metric.cpu_percent if trigger.metric_name == "cpu_percent" else metric.ram_percent
+        latest_value = _extract_metric_value(metric, trigger.metric_name)
     payload: dict[str, str | float | int | bool | None] = {
         "id": trigger.id,
         "node_id": trigger.node_id,
@@ -507,8 +510,8 @@ def _send_trigger_alert_email(trigger: Trigger, user: User, metric_value: float)
     body = (
         f"Hello, {recipient_name}!\n\n"
         f"Trigger '{trigger.name}' is active on node '{trigger.node_id}'.\n"
-        f"Condition: {trigger.metric_name} {trigger.operator} {trigger.threshold:.2f}%\n"
-        f"Current value: {metric_value:.2f}%\n"
+        f"Condition: {trigger.metric_name} {trigger.operator} {trigger.threshold:.2f}\n"
+        f"Current value: {metric_value:.2f}\n"
         f"Triggered at (UTC): {_utcnow().isoformat()}\n"
     )
     message = EmailMessage()
@@ -533,7 +536,7 @@ def _send_trigger_alert_email(trigger: Trigger, user: User, metric_value: float)
 def _process_trigger_alerts(db: Session, node_id: str, metric: MetricIn) -> None:
     triggers = db.query(Trigger).filter(Trigger.node_id == node_id).all()
     for trigger in triggers:
-        metric_value = metric.cpu_percent if trigger.metric_name == "cpu_percent" else metric.ram_percent
+        metric_value = _extract_metric_input_value(metric, trigger.metric_name)
         is_active = metric_value > trigger.threshold if trigger.operator == ">" else metric_value < trigger.threshold
         if not is_active:
             trigger.alert_sent = False
@@ -550,6 +553,24 @@ def _process_trigger_alerts(db: Session, node_id: str, metric: MetricIn) -> None
 
 
 def _extract_metric_value(metric: Metric, metric_name: str) -> float:
+    if metric_name == "cpu_percent":
+        return metric.cpu_percent
+    if metric_name == "ram_percent":
+        return metric.ram_percent
+    if metric_name == "swap_percent":
+        return metric.swap_percent
+    if metric_name == "uptime_seconds":
+        return metric.uptime_seconds
+    if metric_name == "disk_read_time_ms":
+        return metric.disk_read_time_ms
+    if metric_name == "disk_write_time_ms":
+        return metric.disk_write_time_ms
+    if metric_name == "zombie_processes":
+        return float(metric.zombie_processes)
+    raise ValueError(f"Unsupported metric name: {metric_name}")
+
+
+def _extract_metric_input_value(metric: MetricIn, metric_name: str) -> float:
     if metric_name == "cpu_percent":
         return metric.cpu_percent
     if metric_name == "ram_percent":
@@ -1470,7 +1491,7 @@ def dashboard() -> str:
             <section class="panel tab-panel" data-panel="latest">
                 <div class="page-header">
                     <h1>Latest metrics</h1>
-                    <p class="meta">Choose a node and inspect the latest 10 CPU/RAM samples received from it.</p>
+                    <p class="meta">Choose a node and inspect the latest 10 samples for all metrics received from it.</p>
                 </div>
                 <div class="toolbar">
                     <label>
@@ -1488,6 +1509,11 @@ def dashboard() -> str:
                             <th>Node</th>
                             <th>CPU %</th>
                             <th>RAM %</th>
+                            <th>Swap %</th>
+                            <th>Uptime (s)</th>
+                            <th>Disk read (ms)</th>
+                            <th>Disk write (ms)</th>
+                            <th>Zombie processes</th>
                         </tr>
                     </thead>
                     <tbody id="metrics-body"></tbody>
@@ -1535,6 +1561,11 @@ def dashboard() -> str:
                         <select id="graph-metric-select">
                             <option value="cpu_percent">CPU %</option>
                             <option value="ram_percent">RAM %</option>
+                            <option value="swap_percent">Swap %</option>
+                            <option value="uptime_seconds">Uptime (s)</option>
+                            <option value="disk_read_time_ms">Disk read time (ms)</option>
+                            <option value="disk_write_time_ms">Disk write time (ms)</option>
+                            <option value="zombie_processes">Zombie processes</option>
                         </select>
                     </label>
                     <label>
@@ -1581,6 +1612,11 @@ def dashboard() -> str:
                         <select id="trigger-metric-select">
                             <option value="cpu_percent">CPU %</option>
                             <option value="ram_percent">RAM %</option>
+                            <option value="swap_percent">Swap %</option>
+                            <option value="uptime_seconds">Uptime (s)</option>
+                            <option value="disk_read_time_ms">Disk read time (ms)</option>
+                            <option value="disk_write_time_ms">Disk write time (ms)</option>
+                            <option value="zombie_processes">Zombie processes</option>
                         </select>
                     </label>
                     <label>
@@ -1595,8 +1631,8 @@ def dashboard() -> str:
                         <select id="trigger-alert-user-select"></select>
                     </label>
                     <label>
-                        <span class="meta">Threshold (%)</span><br />
-                        <input id="trigger-threshold-input" type="number" min="0" max="100" step="0.1" value="80" required />
+                        <span class="meta">Threshold</span><br />
+                        <input id="trigger-threshold-input" type="number" min="0" step="0.1" value="80" required />
                     </label>
                     <button type="submit">Create trigger</button>
                 </form>
@@ -1823,6 +1859,16 @@ def dashboard() -> str:
     </div>
 
     <script>
+        const METRIC_META = {
+            cpu_percent: { label: 'CPU %', unit: '%' },
+            ram_percent: { label: 'RAM %', unit: '%' },
+            swap_percent: { label: 'Swap %', unit: '%' },
+            uptime_seconds: { label: 'Uptime (s)', unit: 's' },
+            disk_read_time_ms: { label: 'Disk read time (ms)', unit: 'ms' },
+            disk_write_time_ms: { label: 'Disk write time (ms)', unit: 'ms' },
+            zombie_processes: { label: 'Zombie processes', unit: '' },
+        };
+
         const state = {
             nodes: [],
             agents: [],
@@ -1863,6 +1909,26 @@ def dashboard() -> str:
 
         function formatRamMb(value) {
             return `${(value / 1024).toFixed(1)} GB (${value} MB)`;
+        }
+
+        function metricLabel(metricName) {
+            return METRIC_META[metricName]?.label || metricName;
+        }
+
+        function metricUnit(metricName) {
+            return METRIC_META[metricName]?.unit || '';
+        }
+
+        function formatMetricValue(metricName, value) {
+            const numeric = Number(value);
+            if (!Number.isFinite(numeric)) {
+                return 'No data';
+            }
+            const unit = metricUnit(metricName);
+            if (metricName === 'zombie_processes') {
+                return `${Math.round(numeric)}${unit}`;
+            }
+            return `${numeric.toFixed(2)}${unit}`;
         }
 
         function renderTabs() {
@@ -2038,8 +2104,8 @@ def dashboard() -> str:
                 return `${x.toFixed(2)},${y.toFixed(2)}`;
             });
             line.setAttribute('points', points.join(' '));
-            const latestValue = sortedItems[sortedItems.length - 1].value.toFixed(2);
-            title.textContent = `${metricName === 'cpu_percent' ? 'CPU' : 'RAM'} trend (${safeInterval} min), latest: ${latestValue}%`;
+            const latestValue = sortedItems[sortedItems.length - 1].value;
+            title.textContent = `${metricLabel(metricName)} trend (${safeInterval} min), latest: ${formatMetricValue(metricName, latestValue)}`;
         }
 
         function renderLatestSummary(items, node) {
@@ -2069,7 +2135,7 @@ def dashboard() -> str:
             const body = document.getElementById('metrics-body');
             body.innerHTML = '';
             if (!items.length) {
-                body.innerHTML = '<tr><td colspan="4" class="empty">No metrics for this node yet.</td></tr>';
+                body.innerHTML = '<tr><td colspan="9" class="empty">No metrics for this node yet.</td></tr>';
                 return;
             }
 
@@ -2080,6 +2146,11 @@ def dashboard() -> str:
                     <td>${item.display_name || 'Unknown node'}</td>
                     <td>${item.cpu_percent.toFixed(2)}</td>
                     <td>${item.ram_percent.toFixed(2)}</td>
+                    <td>${item.swap_percent.toFixed(2)}</td>
+                    <td>${item.uptime_seconds.toFixed(2)}</td>
+                    <td>${item.disk_read_time_ms.toFixed(2)}</td>
+                    <td>${item.disk_write_time_ms.toFixed(2)}</td>
+                    <td>${Number(item.zombie_processes).toFixed(0)}</td>
                 `;
                 body.appendChild(row);
             }
@@ -2126,10 +2197,6 @@ def dashboard() -> str:
             }
         }
 
-        function metricLabel(metricName) {
-            return metricName === 'cpu_percent' ? 'CPU %' : 'RAM %';
-        }
-
         function renderAlertUserOptions() {
             const select = document.getElementById('trigger-alert-user-select');
             select.innerHTML = '';
@@ -2154,7 +2221,7 @@ def dashboard() -> str:
                 return;
             }
             for (const trigger of state.triggers) {
-                const latestValue = trigger.latest_value == null ? 'No data' : `${Number(trigger.latest_value).toFixed(2)}%`;
+                const latestValue = trigger.latest_value == null ? 'No data' : formatMetricValue(trigger.metric_name, trigger.latest_value);
                 const alertTo = trigger.alert_to_login
                     ? `${trigger.alert_to_login}${trigger.alert_to_display_name ? ` (${trigger.alert_to_display_name})` : ''}`
                     : '—';
@@ -2163,7 +2230,7 @@ def dashboard() -> str:
                 row.innerHTML = `
                     <td>${trigger.node_display_name}</td>
                     <td>${trigger.name}</td>
-                    <td>${metricLabel(trigger.metric_name)} ${trigger.operator} ${Number(trigger.threshold).toFixed(2)}%</td>
+                    <td>${metricLabel(trigger.metric_name)} ${trigger.operator} ${formatMetricValue(trigger.metric_name, trigger.threshold)}</td>
                     <td>${latestValue}</td>
                     <td>${alertTo}</td>
                     <td>${trigger.is_active ? 'Active' : 'OK'}</td>
@@ -2194,12 +2261,12 @@ def dashboard() -> str:
                 return;
             }
             for (const trigger of state.problems) {
-                const latestValue = trigger.latest_value == null ? 'No data' : `${Number(trigger.latest_value).toFixed(2)}%`;
+                const latestValue = trigger.latest_value == null ? 'No data' : formatMetricValue(trigger.metric_name, trigger.latest_value);
                 const row = document.createElement('tr');
                 row.innerHTML = `
                     <td>${trigger.node_display_name}</td>
                     <td>${trigger.name}</td>
-                    <td>${metricLabel(trigger.metric_name)} ${trigger.operator} ${Number(trigger.threshold).toFixed(2)}%</td>
+                    <td>${metricLabel(trigger.metric_name)} ${trigger.operator} ${formatMetricValue(trigger.metric_name, trigger.threshold)}</td>
                     <td>${latestValue}</td>
                     <td>${formatUtc(trigger.created_at)}</td>
                 `;
@@ -2733,8 +2800,8 @@ def dashboard() -> str:
             const threshold = Number(document.getElementById('trigger-threshold-input').value);
             const alertUserRaw = document.getElementById('trigger-alert-user-select').value;
             const alertUserId = alertUserRaw ? Number(alertUserRaw) : null;
-            if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) {
-                setStatus('triggers-status', 'Threshold must be between 0 and 100.', true);
+            if (!Number.isFinite(threshold) || threshold < 0) {
+                setStatus('triggers-status', 'Threshold must be a positive number or zero.', true);
                 return;
             }
             try {
