@@ -79,17 +79,33 @@ class TopProcessIn(BaseModel):
     ram_mb: int = Field(..., ge=0)
 
 
+class FilesystemUsageIn(BaseModel):
+    device: str = Field(..., min_length=1, max_length=300)
+    mountpoint: str = Field(..., min_length=1, max_length=300)
+    fstype: str = Field(..., min_length=1, max_length=64)
+    total_gb: float = Field(..., ge=0)
+    used_gb: float = Field(..., ge=0)
+    free_gb: float = Field(..., ge=0)
+    percent: float = Field(..., ge=0, le=100)
+
+
 class MetricIn(BaseModel):
     node_id: str = Field(..., min_length=1, max_length=100)
     agent_id: str | None = Field(default=None, min_length=1, max_length=64)
     cpu_percent: float = Field(..., ge=0, le=100)
     ram_percent: float = Field(..., ge=0, le=100)
+    uptime_seconds: float = Field(default=0, ge=0)
+    swap_percent: float = Field(default=0, ge=0, le=100)
+    disk_read_time_ms: float = Field(default=0, ge=0)
+    disk_write_time_ms: float = Field(default=0, ge=0)
+    zombie_processes: int = Field(default=0, ge=0)
     os_name: str = Field(..., min_length=1, max_length=200)
     cpu_cores: int = Field(..., ge=1, le=4096)
     ram_total_mb: int = Field(..., ge=1)
     ip_address: str = Field(..., min_length=1, max_length=100)
     top_cpu_processes: list[TopProcessIn] = Field(default_factory=list, max_length=10)
     top_ram_processes: list[TopProcessIn] = Field(default_factory=list, max_length=10)
+    filesystems: list[FilesystemUsageIn] = Field(default_factory=list, max_length=100)
     timestamp: datetime | None = None
 
 
@@ -193,6 +209,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _migrate_users_table()
     _migrate_triggers_table()
+    _migrate_metrics_table()
     _ensure_admin_user()
 
 
@@ -258,6 +275,29 @@ def _ensure_admin_user() -> None:
             if admin.email in [f"{settings.admin_login}@local", f"{settings.admin_login}@local.test"]:
                 admin.email = admin_email
         db.commit()
+
+
+def _migrate_metrics_table() -> None:
+    inspector = inspect(engine)
+    if "metrics" not in inspector.get_table_names():
+        return
+
+    existing_columns = {column["name"] for column in inspector.get_columns("metrics")}
+    statements: list[str] = []
+    if "uptime_seconds" not in existing_columns:
+        statements.append("ALTER TABLE metrics ADD COLUMN uptime_seconds FLOAT NOT NULL DEFAULT 0")
+    if "swap_percent" not in existing_columns:
+        statements.append("ALTER TABLE metrics ADD COLUMN swap_percent FLOAT NOT NULL DEFAULT 0")
+    if "disk_read_time_ms" not in existing_columns:
+        statements.append("ALTER TABLE metrics ADD COLUMN disk_read_time_ms FLOAT NOT NULL DEFAULT 0")
+    if "disk_write_time_ms" not in existing_columns:
+        statements.append("ALTER TABLE metrics ADD COLUMN disk_write_time_ms FLOAT NOT NULL DEFAULT 0")
+    if "zombie_processes" not in existing_columns:
+        statements.append("ALTER TABLE metrics ADD COLUMN zombie_processes INTEGER NOT NULL DEFAULT 0")
+
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
 
 
 def _migrate_triggers_table() -> None:
@@ -355,6 +395,7 @@ async def on_shutdown() -> None:
 _storage: dict[str, Deque[MetricPoint]] = defaultdict(deque)
 _nodes: dict[str, NodeInfo] = {}
 _latest_top_processes: dict[str, dict[str, object]] = {}
+_latest_filesystems: dict[str, dict[str, object]] = {}
 
 init_db()
 
@@ -508,6 +549,24 @@ def _process_trigger_alerts(db: Session, node_id: str, metric: MetricIn) -> None
             trigger.alert_sent = True
 
 
+def _extract_metric_value(metric: Metric, metric_name: str) -> float:
+    if metric_name == "cpu_percent":
+        return metric.cpu_percent
+    if metric_name == "ram_percent":
+        return metric.ram_percent
+    if metric_name == "swap_percent":
+        return metric.swap_percent
+    if metric_name == "uptime_seconds":
+        return metric.uptime_seconds
+    if metric_name == "disk_read_time_ms":
+        return metric.disk_read_time_ms
+    if metric_name == "disk_write_time_ms":
+        return metric.disk_write_time_ms
+    if metric_name == "zombie_processes":
+        return float(metric.zombie_processes)
+    raise ValueError(f"Unsupported metric name: {metric_name}")
+
+
 @app.post("/api/metrics")
 def ingest_metric(metric: MetricIn) -> dict[str, str]:
     timestamp = metric.timestamp or _utcnow()
@@ -546,6 +605,11 @@ def ingest_metric(metric: MetricIn) -> dict[str, str]:
                 node_id=metric.node_id,
                 cpu_percent=metric.cpu_percent,
                 ram_percent=metric.ram_percent,
+                uptime_seconds=metric.uptime_seconds,
+                swap_percent=metric.swap_percent,
+                disk_read_time_ms=metric.disk_read_time_ms,
+                disk_write_time_ms=metric.disk_write_time_ms,
+                zombie_processes=metric.zombie_processes,
                 timestamp=normalized_timestamp,
             )
         )
@@ -556,6 +620,11 @@ def ingest_metric(metric: MetricIn) -> dict[str, str]:
         "node_id": metric.node_id,
         "top_cpu_processes": [item.model_dump() for item in metric.top_cpu_processes[:10]],
         "top_ram_processes": [item.model_dump() for item in metric.top_ram_processes[:10]],
+        "timestamp": normalized_timestamp.isoformat(),
+    }
+    _latest_filesystems[metric.node_id] = {
+        "node_id": metric.node_id,
+        "filesystems": [item.model_dump() for item in metric.filesystems[:100]],
         "timestamp": normalized_timestamp.isoformat(),
     }
     return {"status": "ok"}
@@ -696,6 +765,11 @@ def list_metrics(node_id: str | None = None) -> dict[str, list[dict[str, str | f
                 "node_id": metric.node_id,
                 "cpu_percent": metric.cpu_percent,
                 "ram_percent": metric.ram_percent,
+                "uptime_seconds": metric.uptime_seconds,
+                "swap_percent": metric.swap_percent,
+                "disk_read_time_ms": metric.disk_read_time_ms,
+                "disk_write_time_ms": metric.disk_write_time_ms,
+                "zombie_processes": metric.zombie_processes,
                 "timestamp": metric.timestamp.isoformat(),
                 "display_name": display_name,
             }
@@ -723,10 +797,26 @@ def list_top_processes(node_id: str) -> dict[str, object]:
     return payload
 
 
+@app.get("/api/filesystems")
+def list_filesystems(node_id: str) -> dict[str, object]:
+    with SessionLocal() as db:
+        node = db.query(Node).filter(Node.display_name == node_id).first()
+        if node is None:
+            raise HTTPException(status_code=404, detail="Node not found")
+
+    payload = _latest_filesystems.get(node_id)
+    if payload is None:
+        return {"node_id": node_id, "filesystems": [], "timestamp": None}
+    return payload
+
+
 @app.get("/api/metrics/history")
 def list_metric_history(
     node_id: str,
-    metric_name: str = Query("cpu_percent", pattern="^(cpu_percent|ram_percent)$"),
+    metric_name: str = Query(
+        "cpu_percent",
+        pattern="^(cpu_percent|ram_percent|swap_percent|uptime_seconds|disk_read_time_ms|disk_write_time_ms|zombie_processes)$",
+    ),
     interval_minutes: int = Query(15, ge=1, le=60),
 ) -> dict[str, str | list[dict[str, str | float]]]:
     now = _utcnow()
@@ -749,7 +839,7 @@ def list_metric_history(
         items = [
             {
                 "timestamp": metric.timestamp.isoformat(),
-                "value": metric.cpu_percent if metric_name == "cpu_percent" else metric.ram_percent,
+                "value": _extract_metric_value(metric, metric_name),
             }
             for metric in rows
         ]
