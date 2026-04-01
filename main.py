@@ -195,6 +195,7 @@ def _migrate_users_table() -> None:
     if "users" not in inspector.get_table_names():
         return
 
+    dialect_name = engine.dialect.name
     existing_columns = {column["name"] for column in inspector.get_columns("users")}
     statements: list[str] = []
     if "login" not in existing_columns:
@@ -203,6 +204,11 @@ def _migrate_users_table() -> None:
         statements.append("ALTER TABLE users ADD COLUMN password_hash VARCHAR(512)")
     if "display_name" not in existing_columns:
         statements.append("ALTER TABLE users ADD COLUMN display_name VARCHAR(255)")
+    if "created_at" not in existing_columns:
+        if dialect_name == "postgresql":
+            statements.append("ALTER TABLE users ADD COLUMN created_at TIMESTAMP WITH TIME ZONE")
+        else:
+            statements.append("ALTER TABLE users ADD COLUMN created_at DATETIME")
 
     with engine.begin() as connection:
         for statement in statements:
@@ -215,6 +221,7 @@ def _migrate_users_table() -> None:
             text("UPDATE users SET password_hash = :password_hash WHERE password_hash IS NULL OR password_hash = ''"),
             {"password_hash": hash_password(settings.admin_password)},
         )
+        connection.execute(text("UPDATE users SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
 
 
 def _ensure_admin_user() -> None:
