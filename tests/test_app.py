@@ -271,6 +271,18 @@ def test_logs_ingest_and_list() -> None:
     assert len(response["items"]) == 2
 
 
+def test_users_list_returns_valid_admin_email() -> None:
+    client = TestClient(app)
+    login_response = client.post("/api/auth/login", json={"login": "admin", "password": "admin"})
+    assert login_response.status_code == 200
+
+    users_response = client.get("/api/users")
+    assert users_response.status_code == 200
+    users = users_response.json()
+    assert users
+    assert users[0]["email"].endswith("@monitoring-kb.com")
+
+
 def test_agent_auth_success() -> None:
     with SessionLocal() as db:
         agent_id, secret = register_agent(db)
