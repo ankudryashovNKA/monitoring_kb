@@ -17,6 +17,9 @@ class Trigger(Base):
     metric_name: Mapped[str] = mapped_column(String(20), nullable=False)
     operator: Mapped[str] = mapped_column(String(2), nullable=False)
     threshold: Mapped[float] = mapped_column(Float, nullable=False)
+    alert_user_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    alert_sent: Mapped[bool] = mapped_column(nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     node = relationship("Node", back_populates="triggers")
+    alert_user = relationship("User")

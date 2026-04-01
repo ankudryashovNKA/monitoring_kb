@@ -20,6 +20,12 @@ class Settings:
     admin_login: str
     admin_password: str
     auth_secret: str
+    smtp_host: str | None
+    smtp_port: int
+    smtp_username: str | None
+    smtp_password: str | None
+    smtp_sender: str | None
+    smtp_use_tls: bool
 
     @property
     def database_url(self) -> str:
@@ -52,4 +58,10 @@ settings = Settings(
     admin_login=os.getenv("ADMIN_LOGIN", "admin"),
     admin_password=os.getenv("ADMIN_PASSWORD", "admin"),
     auth_secret=os.getenv("AUTH_SECRET", "change-me-in-production"),
+    smtp_host=os.getenv("SMTP_HOST"),
+    smtp_port=int(os.getenv("SMTP_PORT", "587")),
+    smtp_username=os.getenv("SMTP_USERNAME"),
+    smtp_password=os.getenv("SMTP_PASSWORD"),
+    smtp_sender=os.getenv("SMTP_SENDER"),
+    smtp_use_tls=os.getenv("SMTP_USE_TLS", "true").strip().lower() in {"1", "true", "yes", "on"},
 )
