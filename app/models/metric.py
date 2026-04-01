@@ -15,6 +15,11 @@ class Metric(Base):
     node_id: Mapped[str] = mapped_column(String(100), ForeignKey("nodes.display_name", ondelete="CASCADE"), index=True)
     cpu_percent: Mapped[float] = mapped_column(Float, nullable=False)
     ram_percent: Mapped[float] = mapped_column(Float, nullable=False)
+    uptime_seconds: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    swap_percent: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    disk_read_time_ms: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    disk_write_time_ms: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    zombie_processes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
 
     node = relationship("Node", back_populates="metrics")

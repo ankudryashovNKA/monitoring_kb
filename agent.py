@@ -40,18 +40,26 @@ def detect_primary_ip() -> str:
         return "127.0.0.1"
 
 
-def collect_metrics(display_name: str, agent_id: str) -> dict[str, str | float | int]:
+def collect_metrics(display_name: str, agent_id: str) -> dict[str, object]:
     os_name = detect_os_name()
     virtual_memory = psutil.virtual_memory()
+    swap_memory = psutil.swap_memory()
+    disk_io = psutil.disk_io_counters()
     return {
         "node_id": display_name,
         "agent_id": agent_id,
         "cpu_percent": psutil.cpu_percent(interval=1),
         "ram_percent": virtual_memory.percent,
+        "uptime_seconds": max(0.0, time.time() - psutil.boot_time()),
+        "swap_percent": swap_memory.percent,
+        "disk_read_time_ms": float(getattr(disk_io, "read_time", 0.0) if disk_io else 0.0),
+        "disk_write_time_ms": float(getattr(disk_io, "write_time", 0.0) if disk_io else 0.0),
+        "zombie_processes": count_zombie_processes(),
         "os_name": os_name,
         "cpu_cores": psutil.cpu_count() or 1,
         "ram_total_mb": int(virtual_memory.total / (1024 * 1024)),
         "ip_address": detect_primary_ip(),
+        "filesystems": collect_filesystem_usage(),
         "top_cpu_processes": collect_top_processes(sort_by="cpu_percent"),
         "top_ram_processes": collect_top_processes(sort_by="ram_percent"),
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -106,6 +114,47 @@ def detect_os_name() -> str:
         except OSError:
             distro = "Linux"
     return f"{distro} ({platform.release()})"
+
+
+def collect_filesystem_usage() -> list[dict[str, str | float]]:
+    filesystems: list[dict[str, str | float]] = []
+    seen_mounts: set[str] = set()
+    for partition in psutil.disk_partitions(all=True):
+        mountpoint = partition.mountpoint
+        if not mountpoint or mountpoint in seen_mounts:
+            continue
+        seen_mounts.add(mountpoint)
+        try:
+            usage = psutil.disk_usage(mountpoint)
+        except (PermissionError, FileNotFoundError, OSError):
+            continue
+
+        total_gb = usage.total / (1024 ** 3)
+        used_gb = usage.used / (1024 ** 3)
+        free_gb = usage.free / (1024 ** 3)
+        filesystems.append(
+            {
+                "device": partition.device or mountpoint,
+                "mountpoint": mountpoint,
+                "fstype": partition.fstype or "unknown",
+                "total_gb": round(total_gb, 2),
+                "used_gb": round(used_gb, 2),
+                "free_gb": round(free_gb, 2),
+                "percent": float(usage.percent),
+            }
+        )
+    return sorted(filesystems, key=lambda item: str(item["mountpoint"]).lower())
+
+
+def count_zombie_processes() -> int:
+    zombies = 0
+    for process in psutil.process_iter(["status"]):
+        try:
+            if process.info.get("status") == psutil.STATUS_ZOMBIE:
+                zombies += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    return zombies
 
 
 def _linux_log_source() -> tuple[str, str]:
