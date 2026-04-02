@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 DEFAULT_INTERVAL_SECONDS = 60
 MAX_LOG_ENTRIES = 100
 TOP_PROCESS_LIMIT = 10
+LOG_SEVERITY_LEVELS = ("DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY")
 
 load_dotenv()
 
@@ -214,10 +215,48 @@ def _collect_windows_eventlog() -> list[dict[str, str]]:
     if current_event:
         events.append(current_event)
 
-    return [
-        {"source": "windows-eventlog", "message": "\n".join(event_lines)}
-        for event_lines in events[:MAX_LOG_ENTRIES]
-    ]
+    entries: list[dict[str, str]] = []
+    for event_lines in events[:MAX_LOG_ENTRIES]:
+        severity = "INFO"
+        for line in event_lines:
+            if line.lower().startswith("level:"):
+                severity = _normalize_severity(line.split(":", 1)[1].strip())
+                break
+        entries.append({"source": "windows-eventlog", "severity": severity, "message": "\n".join(event_lines)})
+    return entries
+
+
+def _normalize_severity(raw_level: str) -> str:
+    value = (raw_level or "").strip().upper()
+    mapping = {
+        "WARN": "WARNING",
+        "ERR": "ERROR",
+        "FATAL": "CRITICAL",
+        "SEVERE": "CRITICAL",
+        "INFORMATION": "INFO",
+        "INFORMATIONAL": "INFO",
+    }
+    normalized = mapping.get(value, value)
+    return normalized if normalized in LOG_SEVERITY_LEVELS else "INFO"
+
+
+def _extract_linux_severity(message: str) -> str:
+    lowered = message.lower()
+    if " emergency" in lowered or lowered.startswith("emerg"):
+        return "EMERGENCY"
+    if " alert" in lowered or lowered.startswith("alert"):
+        return "ALERT"
+    if " critical" in lowered or " crit" in lowered:
+        return "CRITICAL"
+    if " error" in lowered or " err" in lowered:
+        return "ERROR"
+    if " warning" in lowered or " warn" in lowered:
+        return "WARNING"
+    if " notice" in lowered:
+        return "NOTICE"
+    if " debug" in lowered:
+        return "DEBUG"
+    return "INFO"
 
 
 def collect_logs() -> list[dict[str, str]]:
@@ -235,15 +274,15 @@ def collect_logs() -> list[dict[str, str]]:
             for line in text.splitlines()
             if line.strip()
         ][:MAX_LOG_ENTRIES]
-        return [{"source": source, "message": line} for line in lines]
+        return [{"source": source, "severity": _extract_linux_severity(line), "message": line} for line in lines]
 
     try:
         return [
-            {"source": source, "message": _sanitize_log_text(line)}
+            {"source": source, "severity": _extract_linux_severity(line), "message": _sanitize_log_text(line)}
             for line in _tail_file(path, MAX_LOG_ENTRIES)
         ]
     except OSError as error:
-        return [{"source": source, "message": f"Failed to read {path}: {error}"}]
+        return [{"source": source, "severity": "ERROR", "message": f"Failed to read {path}: {error}"}]
 
 
 def collect_logs_payload(display_name: str, agent_id: str) -> dict[str, str | int | list[dict[str, str]]]:

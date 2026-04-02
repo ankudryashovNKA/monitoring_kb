@@ -14,6 +14,7 @@ class LogEntry(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     node_id: Mapped[str] = mapped_column(String(100), ForeignKey("nodes.display_name", ondelete="CASCADE"), index=True)
     source: Mapped[str] = mapped_column(String(120), nullable=False)
+    severity: Mapped[str] = mapped_column(String(16), index=True, nullable=False, default="INFO")
     message: Mapped[str] = mapped_column(Text, nullable=False)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
 
