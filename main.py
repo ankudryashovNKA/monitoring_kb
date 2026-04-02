@@ -46,8 +46,9 @@ from sqlalchemy import inspect, text
 RETENTION_PERIOD = timedelta(hours=1)
 RECENT_POINTS_LIMIT = 10
 LOG_POINTS_LIMIT = 100
-MAX_STORED_LOGS_PER_NODE = 2000
+MAX_STORED_LOGS_PER_NODE_AND_SEVERITY = 2000
 KB_POLL_INTERVAL_SECONDS = 600
+LOG_SEVERITY_LEVELS = ("DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY")
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,7 @@ class NodeRenameIn(BaseModel):
 
 class LogEntryIn(BaseModel):
     source: str = Field(..., min_length=1, max_length=120)
+    severity: str = Field(default="INFO", pattern="^(DEBUG|INFO|NOTICE|WARNING|ERROR|CRITICAL|ALERT|EMERGENCY)$")
     message: str = Field(..., min_length=1, max_length=8000)
     captured_at: datetime | None = None
 
@@ -213,6 +215,7 @@ def init_db() -> None:
     _migrate_users_table()
     _migrate_triggers_table()
     _migrate_metrics_table()
+    _migrate_log_entries_table()
     _ensure_admin_user()
 
 
@@ -278,6 +281,34 @@ def _ensure_admin_user() -> None:
             if admin.email in [f"{settings.admin_login}@local", f"{settings.admin_login}@local.test"]:
                 admin.email = admin_email
         db.commit()
+
+
+def _migrate_log_entries_table() -> None:
+    inspector = inspect(engine)
+    if "log_entries" not in inspector.get_table_names():
+        return
+
+    dialect_name = engine.dialect.name
+    existing_columns = {column["name"] for column in inspector.get_columns("log_entries")}
+    statements: list[str] = []
+    if "severity" not in existing_columns:
+        statements.append("ALTER TABLE log_entries ADD COLUMN severity VARCHAR(16)")
+
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+        connection.execute(text("UPDATE log_entries SET severity = 'INFO' WHERE severity IS NULL OR severity = ''"))
+
+        index_statements = [
+            "CREATE INDEX IF NOT EXISTS ix_log_entries_severity ON log_entries (severity)",
+            "CREATE INDEX IF NOT EXISTS ix_log_entries_node_severity_captured_at ON log_entries (node_id, severity, captured_at DESC, id DESC)",
+        ]
+        for statement in index_statements:
+            if dialect_name == "postgresql":
+                connection.execute(text(statement))
+            else:
+                with contextlib.suppress(Exception):
+                    connection.execute(text(statement))
 
 
 def _migrate_metrics_table() -> None:
@@ -688,32 +719,37 @@ def ingest_logs(payload: LogsIn) -> dict[str, str | int]:
                 node.agent_id = payload.agent_id
 
         inserted_count = 0
+        touched_severities: set[str] = set()
         for entry in payload.entries:
             captured_at = entry.captured_at or now
             if captured_at.tzinfo is None:
                 captured_at = captured_at.replace(tzinfo=timezone.utc)
+            normalized_severity = entry.severity.upper()
             db.add(
                 LogEntry(
                     node_id=payload.node_id,
                     source=entry.source,
+                    severity=normalized_severity,
                     message=entry.message,
                     captured_at=captured_at.astimezone(timezone.utc),
                 )
             )
+            touched_severities.add(normalized_severity)
             inserted_count += 1
 
-        overflow_ids = [
-            row[0]
-            for row in (
-                db.query(LogEntry.id)
-                .filter(LogEntry.node_id == payload.node_id)
-                .order_by(LogEntry.captured_at.desc(), LogEntry.id.desc())
-                .offset(MAX_STORED_LOGS_PER_NODE)
-                .all()
-            )
-        ]
-        if overflow_ids:
-            db.query(LogEntry).filter(LogEntry.id.in_(overflow_ids)).delete(synchronize_session=False)
+        for severity in touched_severities:
+            overflow_ids = [
+                row[0]
+                for row in (
+                    db.query(LogEntry.id)
+                    .filter(LogEntry.node_id == payload.node_id, LogEntry.severity == severity)
+                    .order_by(LogEntry.captured_at.desc(), LogEntry.id.desc())
+                    .offset(MAX_STORED_LOGS_PER_NODE_AND_SEVERITY)
+                    .all()
+                )
+            ]
+            if overflow_ids:
+                db.query(LogEntry).filter(LogEntry.id.in_(overflow_ids)).delete(synchronize_session=False)
 
         db.commit()
     return {"status": "ok", "inserted": inserted_count}
@@ -731,7 +767,11 @@ async def ingest_logs_from_agent(request: Request) -> dict[str, str | int]:
 
 
 @app.get("/api/logs")
-def list_logs(node_id: str) -> dict[str, str | list[dict[str, str]]]:
+def list_logs(node_id: str, severity: str = Query(default="INFO")) -> dict[str, str | list[dict[str, str]]]:
+    normalized_severity = severity.upper()
+    if normalized_severity not in LOG_SEVERITY_LEVELS:
+        raise HTTPException(status_code=400, detail=f"Unsupported severity: {severity}")
+
     with SessionLocal() as db:
         node = db.query(Node).filter(Node.display_name == node_id).first()
         if node is None:
@@ -739,7 +779,7 @@ def list_logs(node_id: str) -> dict[str, str | list[dict[str, str]]]:
 
         rows = (
             db.query(LogEntry)
-            .filter(LogEntry.node_id == node_id)
+            .filter(LogEntry.node_id == node_id, LogEntry.severity == normalized_severity)
             .order_by(LogEntry.captured_at.desc(), LogEntry.id.desc())
             .limit(LOG_POINTS_LIMIT)
             .all()
@@ -747,6 +787,7 @@ def list_logs(node_id: str) -> dict[str, str | list[dict[str, str]]]:
         items = [
             {
                 "source": row.source,
+                "severity": row.severity,
                 "message": row.message,
                 "captured_at": row.captured_at.isoformat(),
             }
@@ -756,6 +797,7 @@ def list_logs(node_id: str) -> dict[str, str | list[dict[str, str]]]:
             "node_id": node.display_name,
             "display_name": node.display_name,
             "os_name": node.os_name,
+            "severity": normalized_severity,
             "items": items,
         }
 
@@ -1680,12 +1722,25 @@ def dashboard() -> str:
             <section class="panel tab-panel" data-panel="logs" hidden>
                 <div class="page-header">
                     <h2>Logs</h2>
-                    <p class="meta">Latest 100 important system log entries sent by the selected node.</p>
+                    <p class="meta">Latest 100 log entries by selected node and severity.</p>
                 </div>
                 <div class="toolbar">
                     <label>
                         <span class="meta">Node</span><br />
                         <select id="logs-node-select"></select>
+                    </label>
+                    <label>
+                        <span class="meta">Severity</span><br />
+                        <select id="logs-severity-select">
+                            <option value="DEBUG">DEBUG</option>
+                            <option value="INFO" selected>INFO</option>
+                            <option value="NOTICE">NOTICE</option>
+                            <option value="WARNING">WARNING</option>
+                            <option value="ERROR">ERROR</option>
+                            <option value="CRITICAL">CRITICAL</option>
+                            <option value="ALERT">ALERT</option>
+                            <option value="EMERGENCY">EMERGENCY</option>
+                        </select>
                     </label>
                     <button id="refresh-logs" type="button">Refresh logs</button>
                 </div>
@@ -1695,6 +1750,7 @@ def dashboard() -> str:
                         <tr>
                             <th>Time (UTC+3)</th>
                             <th>Source</th>
+                            <th>Severity</th>
                             <th>Entry</th>
                         </tr>
                     </thead>
@@ -1881,6 +1937,7 @@ def dashboard() -> str:
             graphSelectedNodeId: '',
             triggerSelectedNodeId: '',
             logsSelectedNodeId: '',
+            logsSelectedSeverity: 'INFO',
             topSelectedNodeId: '',
             activeMenuKey: '',
             activeMenuData: null,
@@ -2300,7 +2357,7 @@ def dashboard() -> str:
             const body = document.getElementById('logs-body');
             body.innerHTML = '';
             if (!items.length) {
-                body.innerHTML = '<tr><td colspan="3" class="empty">No logs received from this node yet.</td></tr>';
+                body.innerHTML = '<tr><td colspan="4" class="empty">No logs received from this node yet.</td></tr>';
                 return;
             }
             for (const entry of items) {
@@ -2308,6 +2365,7 @@ def dashboard() -> str:
                 row.innerHTML = `
                     <td>${formatUtc(entry.captured_at)}</td>
                     <td>${entry.source}</td>
+                    <td>${entry.severity}</td>
                     <td>${entry.message}</td>
                 `;
                 body.appendChild(row);
@@ -2685,10 +2743,17 @@ def dashboard() -> str:
                 return;
             }
             try {
-                const data = await fetchJson(`/api/logs?node_id=${encodeURIComponent(state.logsSelectedNodeId)}`);
+                const data = await fetchJson(
+                    `/api/logs?node_id=${encodeURIComponent(state.logsSelectedNodeId)}&severity=${encodeURIComponent(state.logsSelectedSeverity)}`
+                );
                 renderLogsTable(data.items || []);
                 const osLabel = data.os_name || 'Unknown OS';
-                setStatus('logs-status', data.items.length ? `Source node OS: ${osLabel}` : `No logs yet. Source node OS: ${osLabel}`);
+                setStatus(
+                    'logs-status',
+                    data.items.length
+                        ? `Source node OS: ${osLabel}. Severity: ${state.logsSelectedSeverity}.`
+                        : `No logs yet for severity ${state.logsSelectedSeverity}. Source node OS: ${osLabel}`
+                );
             } catch (error) {
                 renderLogsTable([]);
                 setStatus('logs-status', error.message, true);
@@ -2828,6 +2893,10 @@ def dashboard() -> str:
         document.getElementById('refresh-logs').addEventListener('click', loadLogs);
         document.getElementById('logs-node-select').addEventListener('change', async (event) => {
             state.logsSelectedNodeId = event.target.value;
+            await loadLogs();
+        });
+        document.getElementById('logs-severity-select').addEventListener('change', async (event) => {
+            state.logsSelectedSeverity = event.target.value;
             await loadLogs();
         });
         document.getElementById('refresh-top').addEventListener('click', loadTopProcesses);

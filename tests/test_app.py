@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from fastapi import HTTPException
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -259,16 +260,43 @@ def test_logs_ingest_and_list() -> None:
             ram_total_mb=4096,
             ip_address="10.0.0.13",
             entries=[
-                LogEntryIn(source="linux-syslog", message="kernel: boot complete"),
-                LogEntryIn(source="linux-syslog", message="sshd: accepted publickey"),
+                LogEntryIn(source="linux-syslog", severity="INFO", message="kernel: boot complete"),
+                LogEntryIn(source="linux-syslog", severity="ERROR", message="sshd: auth failed"),
+                LogEntryIn(source="linux-syslog", severity="INFO", message="sshd: accepted publickey"),
             ],
         )
     )
 
-    response = list_logs(node_id="node-logs")
+    response = list_logs(node_id="node-logs", severity="INFO")
     assert response["node_id"] == "node-logs"
     assert response["os_name"] == "Ubuntu 24.04"
     assert len(response["items"]) == 2
+    assert all(item["severity"] == "INFO" for item in response["items"])
+
+    error_response = list_logs(node_id="node-logs", severity="ERROR")
+    assert len(error_response["items"]) == 1
+    assert error_response["items"][0]["message"] == "sshd: auth failed"
+
+
+def test_logs_invalid_severity() -> None:
+    ingest_metric(
+        MetricIn(
+            node_id="node-logs-invalid",
+            cpu_percent=10.0,
+            ram_percent=20.0,
+            os_name="Ubuntu",
+            cpu_cores=4,
+            ram_total_mb=4096,
+            ip_address="10.0.0.130",
+        )
+    )
+    try:
+        list_logs(node_id="node-logs-invalid", severity="TRACE")
+    except HTTPException as error:
+        assert error.status_code == 400
+        assert "Unsupported severity" in str(error.detail)
+    else:
+        raise AssertionError("Expected unsupported severity error")
 
 
 def test_users_list_returns_valid_admin_email() -> None:
