@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -235,9 +236,9 @@ def test_knowledge_base_normalization_and_endpoint() -> None:
     assert normalized[0]["name"] == "Утечка памяти"
     assert normalized[0]["explanatory_set"][0]["name"] == "Memory_Utilization"
 
-    response = get_knowledge_base()
-    assert "status" in response
-    assert "items" in response
+    payload = asyncio.run(get_knowledge_base(node_id="node-1"))
+    assert "status" in payload
+    assert "items" in payload
 
 
 def test_logs_ingest_and_list() -> None:
