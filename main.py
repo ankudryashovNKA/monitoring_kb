@@ -2928,6 +2928,7 @@ def dashboard() -> str:
             await loadTriggers();
             await loadLogs();
             await loadTopProcesses();
+            await loadKnowledgeBase();
         });
 
         document.getElementById('refresh-latest').addEventListener('click', loadLatestMetrics);
