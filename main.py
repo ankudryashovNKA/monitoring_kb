@@ -4,7 +4,6 @@ from collections import defaultdict, deque
 import contextlib
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
-import asyncio
 from email.message import EmailMessage
 import logging
 import operator
@@ -47,7 +46,6 @@ RETENTION_PERIOD = timedelta(hours=1)
 RECENT_POINTS_LIMIT = 10
 LOG_POINTS_LIMIT = 100
 MAX_STORED_LOGS_PER_NODE_AND_SEVERITY = 2000
-KB_POLL_INTERVAL_SECONDS = 600
 LOG_SEVERITY_LEVELS = ("DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY")
 
 logger = logging.getLogger(__name__)
@@ -176,9 +174,7 @@ class LoginIn(BaseModel):
 app = FastAPI(title="Monitoring KB MVP")
 app.include_router(users_router)
 
-_kb_results_cache: list[dict[str, str | list[dict[str, str]]]] = []
 _kb_last_updated: datetime | None = None
-_kb_last_error: str | None = None
 
 UNPROTECTED_PATH_PREFIXES = (
     "/api/auth/login",
@@ -370,59 +366,9 @@ def _normalize_kb_results(payload: dict) -> list[dict[str, str | list[dict[str, 
     ]
 
 
-async def _fetch_knowledge_base_once() -> None:
-    global _kb_results_cache, _kb_last_updated, _kb_last_error
-    if not _knowledge_base_enabled():
-        _kb_last_error = "Knowledge Base integration disabled: missing KB_ID or KB_JWT_TOKEN."
-        return
-
-    assert settings.kb_id is not None
-    assert settings.kb_jwt_token is not None
-    url = f"{settings.kb_api_base_url.rstrip('/')}/solve/{settings.kb_id}"
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.post(
-            url,
-            headers={
-                "accept": "*/*",
-                "Authorization": settings.kb_jwt_token,
-                "Content-Type": "application/json-patch+json",
-            },
-            json={"presetName": settings.kb_preset_name},
-        )
-        response.raise_for_status()
-        _kb_results_cache = _normalize_kb_results(response.json())
-        _kb_last_updated = _utcnow()
-        _kb_last_error = None
-
-
-async def _knowledge_base_polling_loop() -> None:
-    while True:
-        try:
-            await _fetch_knowledge_base_once()
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Knowledge Base sync failed")
-            global _kb_last_error
-            _kb_last_error = str(exc)
-        await asyncio.sleep(KB_POLL_INTERVAL_SECONDS)
-
-
 @app.on_event("startup")
 async def on_startup() -> None:
     init_db()
-    if _knowledge_base_enabled():
-        app.state.kb_poller_task = asyncio.create_task(_knowledge_base_polling_loop())
-    else:
-        global _kb_last_error
-        _kb_last_error = "Knowledge Base integration disabled: missing KB_ID or KB_JWT_TOKEN."
-
-
-@app.on_event("shutdown")
-async def on_shutdown() -> None:
-    task = getattr(app.state, "kb_poller_task", None)
-    if task is not None:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
 
 
 # Backward-compatible placeholders used by legacy tests.
@@ -1162,16 +1108,137 @@ def list_problems() -> dict[str, list[dict[str, str | float | int | bool | None]
         return {"items": active}
 
 
+KB_AGENT_PRESET_NAME = "agent_preset"
+
+
+def _kb_headers(accept: str = "*/*") -> dict[str, str]:
+    assert settings.kb_jwt_token is not None
+    return {"accept": accept, "Authorization": settings.kb_jwt_token}
+
+
+def _kb_payload_kb_id() -> int | str:
+    assert settings.kb_id is not None
+    with contextlib.suppress(ValueError):
+        return int(settings.kb_id)
+    return settings.kb_id
+
+
+def _active_trigger_names_for_node(db: Session, node_id: str) -> list[str]:
+    triggers = db.query(Trigger).filter(Trigger.node_id == node_id).all()
+    metric = db.query(Metric).filter(Metric.node_id == node_id).order_by(Metric.timestamp.desc()).first()
+    active_names = [trigger.name for trigger in triggers if _is_trigger_active(trigger, metric)]
+    return list(dict.fromkeys(active_names))
+
+
+def _match_kb_nodes(objects_payload: list[dict], trigger_names: list[str]) -> list[int]:
+    names = set(trigger_names)
+    matched: list[int] = []
+    for item in objects_payload:
+        if item.get("name") not in names:
+            continue
+        node_id = item.get("nodeId")
+        if isinstance(node_id, int):
+            matched.append(node_id)
+    return list(dict.fromkeys(matched))
+
+
+async def _get_or_create_agent_preset_id(client: httpx.AsyncClient, kb_id: str) -> int:
+    presets_response = await client.get(
+        f"{settings.kb_api_base_url.rstrip('/')}/api/Test/getPresets/{kb_id}",
+        headers=_kb_headers(),
+    )
+    presets_response.raise_for_status()
+    presets = presets_response.json()
+    preset = next((item for item in presets if item.get("presetName") == KB_AGENT_PRESET_NAME), None)
+    if preset is not None and isinstance(preset.get("id"), int):
+        return preset["id"]
+
+    create_response = await client.post(
+        f"{settings.kb_api_base_url.rstrip('/')}/api/Test/savePresets",
+        headers={**_kb_headers(), "Content-Type": "application/json-patch+json"},
+        json={"presetName": KB_AGENT_PRESET_NAME, "kbId": _kb_payload_kb_id(), "nodesId": []},
+    )
+    create_response.raise_for_status()
+
+    presets_response = await client.get(
+        f"{settings.kb_api_base_url.rstrip('/')}/api/Test/getPresets/{kb_id}",
+        headers=_kb_headers(),
+    )
+    presets_response.raise_for_status()
+    presets = presets_response.json()
+    preset = next((item for item in presets if item.get("presetName") == KB_AGENT_PRESET_NAME), None)
+    if preset is None or not isinstance(preset.get("id"), int):
+        raise HTTPException(status_code=502, detail="Failed to create or resolve agent_preset id in KB service")
+    return preset["id"]
+
+
 @app.get("/api/knowledge-base")
-def get_knowledge_base() -> dict[str, str | list[dict[str, str | list[dict[str, str]]]] | None]:
-    status = "ok" if _kb_last_error is None else "error"
+async def get_knowledge_base(node_id: str = Query(..., min_length=1, max_length=100)) -> dict[str, object]:
+    global _kb_last_updated
     if not _knowledge_base_enabled():
-        status = "disabled"
+        return {
+            "status": "disabled",
+            "node_id": node_id,
+            "last_updated": _kb_last_updated.isoformat() if _kb_last_updated else None,
+            "error": "Knowledge Base integration disabled: missing KB_ID or KB_JWT_TOKEN.",
+            "items": [],
+            "active_triggers": [],
+            "matched_node_ids": [],
+        }
+
+    with SessionLocal() as db:
+        active_triggers = _active_trigger_names_for_node(db, node_id)
+
+    assert settings.kb_id is not None
+    kb_id = settings.kb_id
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            objects_response = await client.get(
+                f"{settings.kb_api_base_url.rstrip('/')}/api/Objects/GetAllObjects/{kb_id}",
+                headers=_kb_headers("text/plain"),
+            )
+            objects_response.raise_for_status()
+            objects_payload = objects_response.json()
+            matched_node_ids = _match_kb_nodes(objects_payload, active_triggers)
+
+            preset_id = await _get_or_create_agent_preset_id(client, kb_id)
+
+            update_response = await client.put(
+                f"{settings.kb_api_base_url.rstrip('/')}/api/Test/update/{preset_id}",
+                headers={**_kb_headers(), "Content-Type": "application/json-patch+json"},
+                json={"presetName": KB_AGENT_PRESET_NAME, "kbId": _kb_payload_kb_id(), "nodesId": matched_node_ids},
+            )
+            update_response.raise_for_status()
+
+            solve_response = await client.post(
+                f"{settings.kb_api_base_url.rstrip('/')}/solve/{kb_id}",
+                headers={**_kb_headers(), "Content-Type": "application/json-patch+json"},
+                json={"presetName": KB_AGENT_PRESET_NAME},
+            )
+            solve_response.raise_for_status()
+            items = _normalize_kb_results(solve_response.json())
+    except httpx.HTTPError as exc:
+        logger.exception("Knowledge Base request failed")
+        return {
+            "status": "error",
+            "node_id": node_id,
+            "last_updated": _kb_last_updated.isoformat() if _kb_last_updated else None,
+            "error": str(exc),
+            "items": [],
+            "active_triggers": active_triggers,
+            "matched_node_ids": [],
+        }
+
+    _kb_last_updated = _utcnow()
     return {
-        "status": status,
-        "last_updated": _kb_last_updated.isoformat() if _kb_last_updated else None,
-        "error": _kb_last_error,
-        "items": _kb_results_cache,
+        "status": "ok",
+        "node_id": node_id,
+        "last_updated": _kb_last_updated.isoformat(),
+        "error": None,
+        "items": items,
+        "active_triggers": active_triggers,
+        "matched_node_ids": matched_node_ids,
     }
 
 
@@ -1806,10 +1873,14 @@ def dashboard() -> str:
             <section class="panel tab-panel" data-panel="knowledge-base" hidden>
                 <div class="page-header">
                     <h2>Knowledge Base</h2>
-                    <p class="meta">Results from Hippocrates KB sync (updated every 10 minutes on the backend).</p>
+                    <p class="meta">Select a node to run KB solve based on active triggers from this node.</p>
                 </div>
                 <div class="toolbar">
-                    <button id="refresh-knowledge-base" type="button">Refresh now</button>
+                    <label>
+                        <span class="meta">Node</span><br />
+                        <select id="kb-node-select"></select>
+                    </label>
+                    <button id="refresh-knowledge-base" type="button">Run KB solve</button>
                 </div>
                 <div id="knowledge-base-status" class="status"></div>
                 <table>
@@ -1939,6 +2010,7 @@ def dashboard() -> str:
             logsSelectedNodeId: '',
             logsSelectedSeverity: 'INFO',
             topSelectedNodeId: '',
+            kbSelectedNodeId: '',
             activeMenuKey: '',
             activeMenuData: null,
             activeTab: 'latest',
@@ -2003,11 +2075,13 @@ def dashboard() -> str:
             const triggerSelect = document.getElementById('trigger-node-select');
             const logsSelect = document.getElementById('logs-node-select');
             const topSelect = document.getElementById('top-node-select');
+            const kbSelect = document.getElementById('kb-node-select');
             select.innerHTML = '';
             graphSelect.innerHTML = '';
             triggerSelect.innerHTML = '';
             logsSelect.innerHTML = '';
             topSelect.innerHTML = '';
+            kbSelect.innerHTML = '';
             if (!state.nodes.length) {
                 const option = document.createElement('option');
                 option.textContent = 'No nodes yet';
@@ -2017,11 +2091,13 @@ def dashboard() -> str:
                 triggerSelect.appendChild(option.cloneNode(true));
                 logsSelect.appendChild(option.cloneNode(true));
                 topSelect.appendChild(option.cloneNode(true));
+                kbSelect.appendChild(option.cloneNode(true));
                 select.disabled = true;
                 graphSelect.disabled = true;
                 triggerSelect.disabled = true;
                 logsSelect.disabled = true;
                 topSelect.disabled = true;
+                kbSelect.disabled = true;
                 return;
             }
 
@@ -2030,6 +2106,7 @@ def dashboard() -> str:
             triggerSelect.disabled = false;
             logsSelect.disabled = false;
             topSelect.disabled = false;
+            kbSelect.disabled = false;
             if (!state.latestSelectedNodeId || !state.nodes.some((node) => node.node_id === state.latestSelectedNodeId)) {
                 state.latestSelectedNodeId = state.nodes[0].node_id;
             }
@@ -2045,6 +2122,9 @@ def dashboard() -> str:
             if (!state.topSelectedNodeId || !state.nodes.some((node) => node.node_id === state.topSelectedNodeId)) {
                 state.topSelectedNodeId = state.latestSelectedNodeId;
             }
+            if (!state.kbSelectedNodeId || !state.nodes.some((node) => node.node_id === state.kbSelectedNodeId)) {
+                state.kbSelectedNodeId = state.latestSelectedNodeId;
+            }
 
             for (const node of state.nodes) {
                 const option = document.createElement('option');
@@ -2055,12 +2135,14 @@ def dashboard() -> str:
                 triggerSelect.appendChild(option.cloneNode(true));
                 logsSelect.appendChild(option.cloneNode(true));
                 topSelect.appendChild(option.cloneNode(true));
+                kbSelect.appendChild(option.cloneNode(true));
             }
             select.value = state.latestSelectedNodeId;
             graphSelect.value = state.graphSelectedNodeId;
             triggerSelect.value = state.triggerSelectedNodeId;
             logsSelect.value = state.logsSelectedNodeId;
             topSelect.value = state.topSelectedNodeId;
+            kbSelect.value = state.kbSelectedNodeId;
         }
 
         function renderGraph(items, metricName, intervalMinutes) {
@@ -2713,7 +2795,13 @@ def dashboard() -> str:
 
         async function loadKnowledgeBase() {
             try {
-                const data = await fetchJson('/api/knowledge-base');
+                if (!state.kbSelectedNodeId) {
+                    state.knowledgeBase = [];
+                    renderKnowledgeBaseTable();
+                    setStatus('knowledge-base-status', 'Choose a node to run Knowledge Base solve.');
+                    return;
+                }
+                const data = await fetchJson(`/api/knowledge-base?node_id=${encodeURIComponent(state.kbSelectedNodeId)}`);
                 state.knowledgeBase = data.items || [];
                 renderKnowledgeBaseTable();
                 if (data.status === 'disabled') {
@@ -2722,11 +2810,13 @@ def dashboard() -> str:
                     setStatus('knowledge-base-status', data.error || 'Failed to load Knowledge Base data.', true);
                 } else {
                     const updated = data.last_updated ? formatUtc(data.last_updated) : 'never';
+                    const activeCount = (data.active_triggers || []).length;
+                    const mappedCount = (data.matched_node_ids || []).length;
                     setStatus(
                         'knowledge-base-status',
                         state.knowledgeBase.length
-                            ? `Last updated (UTC+3): ${updated}`
-                            : `No results yet. Last updated (UTC+3): ${updated}`
+                            ? `Last solve (UTC+3): ${updated}. Active triggers: ${activeCount}, matched KB nodes: ${mappedCount}.`
+                            : `No KB results. Last solve (UTC+3): ${updated}. Active triggers: ${activeCount}, matched KB nodes: ${mappedCount}.`
                     );
                 }
             } catch (error) {
@@ -2827,15 +2917,18 @@ def dashboard() -> str:
             state.triggerSelectedNodeId = event.target.value;
             state.logsSelectedNodeId = event.target.value;
             state.topSelectedNodeId = event.target.value;
+            state.kbSelectedNodeId = event.target.value;
             document.getElementById('graph-node-select').value = state.graphSelectedNodeId;
             document.getElementById('trigger-node-select').value = state.triggerSelectedNodeId;
             document.getElementById('logs-node-select').value = state.logsSelectedNodeId;
             document.getElementById('top-node-select').value = state.topSelectedNodeId;
+            document.getElementById('kb-node-select').value = state.kbSelectedNodeId;
             await loadLatestMetrics();
             await loadGraph();
             await loadTriggers();
             await loadLogs();
             await loadTopProcesses();
+            await loadKnowledgeBase();
         });
 
         document.getElementById('refresh-latest').addEventListener('click', loadLatestMetrics);
@@ -2905,6 +2998,10 @@ def dashboard() -> str:
             await loadTopProcesses();
         });
         document.getElementById('refresh-knowledge-base').addEventListener('click', loadKnowledgeBase);
+        document.getElementById('kb-node-select').addEventListener('change', async (event) => {
+            state.kbSelectedNodeId = event.target.value;
+            await loadKnowledgeBase();
+        });
         document.getElementById('run-llm').addEventListener('click', runLlm);
         document.getElementById('auth-sign-in').addEventListener('click', signIn);
         document.getElementById('sign-out').addEventListener('click', signOut);
@@ -3145,6 +3242,7 @@ def dashboard() -> str:
             await loadProblems();
             await loadLogs();
             await loadTopProcesses();
+            await loadKnowledgeBase();
             await loadKnowledgeBase();
         }
 
