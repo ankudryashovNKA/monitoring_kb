@@ -2998,9 +2998,9 @@ def dashboard() -> str:
             await loadTopProcesses();
         });
         document.getElementById('refresh-knowledge-base').addEventListener('click', loadKnowledgeBase);
-        document.getElementById('kb-node-select').addEventListener('change', async (event) => {
+        document.getElementById('kb-node-select').addEventListener('change', (event) => {
             state.kbSelectedNodeId = event.target.value;
-            await loadKnowledgeBase();
+            setStatus('knowledge-base-status', state.kbSelectedNodeId ? 'Node selected. Click \"Run KB solve\" to fetch Knowledge Base results.' : 'Choose a node to run Knowledge Base solve.');
         });
         document.getElementById('run-llm').addEventListener('click', runLlm);
         document.getElementById('auth-sign-in').addEventListener('click', signIn);
@@ -3242,11 +3242,10 @@ def dashboard() -> str:
             await loadProblems();
             await loadLogs();
             await loadTopProcesses();
-            await loadKnowledgeBase();
-            await loadKnowledgeBase();
         }
 
         renderTabs();
+        setStatus('knowledge-base-status', 'Choose a node and click "Run KB solve" to fetch Knowledge Base results.');
         document.getElementById('create-user-form').addEventListener('submit', async (event) => {
             event.preventDefault();
             const login = document.getElementById('user-login-input').value.trim();
