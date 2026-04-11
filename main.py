@@ -1248,7 +1248,7 @@ async def generate_llm(payload: LLMGenerateIn) -> dict[str, str]:
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
                 "http://localhost:11434/api/generate",
-                json={"model": "gemma3:4b", "prompt": payload.prompt, "stream": False},
+                json={"model": "gemma4:e4b", "prompt": payload.prompt, "stream": False, "options": {"think": False}},
             )
             response.raise_for_status()
             data = response.json()
@@ -1918,7 +1918,7 @@ def dashboard() -> str:
             <section class="panel tab-panel" data-panel="llm" hidden>
                 <div class="page-header">
                     <h2>LLM</h2>
-                    <p class="meta">Input: введите промпт, Output: получите ответ локальной модели gemma3:4b.</p>
+                    <p class="meta">Input: введите промпт, Output: получите ответ локальной модели gemma4:e4b (think=false).</p>
                 </div>
                 <div class="toolbar">
                     <button id="run-llm" type="button">Run LLM</button>

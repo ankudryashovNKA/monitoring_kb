@@ -10,7 +10,7 @@
 - позволяет управлять агентами (регистрация, отключение, ротация секрета);
 - поддерживает триггеры и список активных проблем;
 - интегрируется с внешним API Knowledge Base (`kb.ai-hippocrates.ru`);
-- даёт UI-вкладку LLM, которая проксирует запросы в локально установленный Ollama (`gemma3:4b`).
+- даёт UI-вкладку LLM, которая проксирует запросы в локально установленный Ollama (`gemma4:e4b`).
 
 ---
 
@@ -40,7 +40,7 @@
 
 5. **LLM-интеграция через Ollama**
    - endpoint `POST /api/llm/generate` отправляет промпт в `http://localhost:11434/api/generate`;
-   - модель жёстко задана как `gemma3:4b`.
+   - модель жёстко задана как `gemma4:e4b`.
 
 ---
 
@@ -357,7 +357,7 @@ API:
 - поле Input/Output;
 - кнопка `Run LLM`;
 - backend вызывает `POST /api/llm/generate`;
-- endpoint проксирует в локальный Ollama с моделью **`gemma3:4b`**.
+- endpoint проксирует в локальный Ollama с моделью **`gemma4:e4b`**.
 
 ---
 
@@ -388,7 +388,7 @@ Backend формирует запрос:
 
 ---
 
-## 11) Важно: для раздела LLM нужна модель Ollama `gemma3:4b`
+## 11) Важно: для раздела LLM нужна модель Ollama `gemma4:e4b`
 
 На сервере, где работает FastAPI, должен быть доступен локальный Ollama API на `localhost:11434`.
 
@@ -399,7 +399,7 @@ Backend формирует запрос:
 3. скачать модель:
 
 ```bash
-ollama pull gemma3:4b
+ollama pull gemma4:e4b
 ```
 
 4. Проверить, что модель доступна:
@@ -413,7 +413,7 @@ ollama list
 ```bash
 curl -X POST http://localhost:11434/api/generate \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gemma3:4b","prompt":"Hello","stream":false}'
+  -d '{"model":"gemma4:e4b","prompt":"Hello","stream":false,"options":{"think":false}}'
 ```
 
 Если Ollama не запущен или модель не установлена, `POST /api/llm/generate` вернёт `502 LLM service error`.
@@ -491,7 +491,7 @@ curl -X POST http://localhost:11434/api/generate \
 Проверьте:
 
 - запущен ли Ollama на том же сервере;
-- что `ollama list` содержит `gemma3:4b`;
+- что `ollama list` содержит `gemma4:e4b`;
 - что `http://localhost:11434/api/generate` отвечает.
 
 ---
