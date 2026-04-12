@@ -1294,6 +1294,10 @@ async def analyze_node_with_llm(payload: LLMNodeAnalysisIn) -> dict[str, object]
         node = db.query(Node).filter(Node.display_name == payload.node_id).first()
         if node is None:
             raise HTTPException(status_code=404, detail="Node not found")
+        agent_enabled = False
+        if node.agent_id:
+            agent = db.query(Agent).filter(Agent.agent_id == node.agent_id).first()
+            agent_enabled = bool(agent.enabled) if agent else False
 
         metric = (
             db.query(Metric)
@@ -1330,7 +1334,7 @@ async def analyze_node_with_llm(payload: LLMNodeAnalysisIn) -> dict[str, object]
             "os_name": node.os_name,
             "ip_address": node.ip_address,
             "agent_id": node.agent_id,
-            "agent_enabled": bool(node.agent.enabled) if node.agent else False,
+            "agent_enabled": agent_enabled,
             "last_seen": node.last_seen.isoformat() if node.last_seen else None,
         },
         "latest_metric": {
