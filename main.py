@@ -1247,7 +1247,7 @@ async def get_knowledge_base(node_id: str = Query(..., min_length=1, max_length=
     }
 
 
-def _collect_logs_for_llm(db: Session, node_id: str, per_severity_limit: int = 20) -> list[dict[str, str]]:
+def _collect_logs_for_llm(db: Session, node_id: str, per_severity_limit: int = 5) -> list[dict[str, str]]:
     severities = LOG_SEVERITY_LEVELS[2:]
     items: list[dict[str, str]] = []
     for severity in severities:
@@ -1263,12 +1263,12 @@ def _collect_logs_for_llm(db: Session, node_id: str, per_severity_limit: int = 2
                 {
                     "source": row.source,
                     "severity": row.severity,
-                    "message": row.message,
+                    "message": row.message[:500],
                     "captured_at": row.captured_at.isoformat(),
                 }
             )
     items.sort(key=lambda item: item["captured_at"], reverse=True)
-    return items[:100]
+    return items[:20]
 
 
 def _build_node_analysis_prompt(payload: dict[str, object]) -> str:
@@ -1289,14 +1289,21 @@ def _build_node_analysis_prompt(payload: dict[str, object]) -> str:
 
 
 async def _request_ollama_generate(prompt: str) -> str:
-    timeout = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=30.0)
+    timeout = httpx.Timeout(connect=10.0, read=55.0, write=30.0, pool=30.0)
     chunks: list[str] = []
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream(
             "POST",
             "http://localhost:11434/api/generate",
-            json={"model": "gemma3:4b", "prompt": prompt},
+            json={
+                "model": "gemma3:4b",
+                "prompt": prompt,
+                "think": False,
+                "options": {
+                    "num_predict": 384,
+                },
+            },
         ) as response:
             response.raise_for_status()
             async for line in response.aiter_lines():
