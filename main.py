@@ -1289,7 +1289,9 @@ def _build_node_analysis_prompt(payload: dict[str, object]) -> str:
 
 
 async def _request_ollama_generate(prompt: str) -> str:
-    timeout = httpx.Timeout(connect=10.0, read=55.0, write=30.0, pool=30.0)
+    # LLM ответы (особенно диагностические) могут формироваться дольше минуты,
+    # поэтому увеличиваем read-timeout, чтобы не обрывать поток слишком рано.
+    timeout = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=30.0)
     chunks: list[str] = []
 
     async with httpx.AsyncClient(timeout=timeout) as client:
