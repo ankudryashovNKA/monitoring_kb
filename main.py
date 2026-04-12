@@ -30,7 +30,7 @@ from app.security.agent_auth import (
     rotate_agent_secret,
     validate_agent_request,
 )
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -1289,7 +1289,7 @@ def _build_node_analysis_prompt(payload: dict[str, object]) -> str:
 
 
 @app.post("/api/llm/analyze-node")
-async def analyze_node_with_llm(payload: LLMNodeAnalysisIn) -> dict[str, object]:
+async def analyze_node_with_llm(payload: LLMNodeAnalysisIn) -> StreamingResponse:
     with SessionLocal() as db:
         node = db.query(Node).filter(Node.display_name == payload.node_id).first()
         if node is None:
@@ -1365,34 +1365,66 @@ async def analyze_node_with_llm(payload: LLMNodeAnalysisIn) -> dict[str, object]
     }
 
     prompt = _build_node_analysis_prompt(analysis_payload)
-    try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(
-                "http://localhost:11434/api/generate",
-                json={"model": "gemma3:4b", "prompt": prompt, "stream": False},
-            )
-            response.raise_for_status()
-            data = response.json()
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"LLM service error: {exc}") from exc
+    async def stream_llm_response() -> object:
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                async with client.stream(
+                    "POST",
+                    "http://localhost:11434/api/generate",
+                    json={
+                        "model": "gemma4:e4b",
+                        "prompt": prompt,
+                        "keep_alive": "30m",
+                        "stream": True,
+                    },
+                ) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        chunk = str(data.get("response", ""))
+                        if chunk:
+                            yield chunk
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"LLM service error: {exc}") from exc
 
-    return {"node_id": payload.node_id, "response": str(data.get("response", "")), "context": analysis_payload}
+    return StreamingResponse(stream_llm_response(), media_type="text/plain; charset=utf-8")
 
 
 @app.post("/api/llm/generate")
 async def generate_llm(payload: LLMGenerateIn) -> dict[str, str]:
+    chunks: list[str] = []
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            async with client.stream(
+                "POST",
                 "http://localhost:11434/api/generate",
-                json={"model": "gemma3:4b", "prompt": payload.prompt, "stream": False},
-            )
-            response.raise_for_status()
-            data = response.json()
+                json={
+                    "model": "gemma4:e4b",
+                    "prompt": payload.prompt,
+                    "keep_alive": "30m",
+                    "stream": True,
+                },
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    chunk = str(data.get("response", ""))
+                    if chunk:
+                        chunks.append(chunk)
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"LLM service error: {exc}") from exc
 
-    return {"response": str(data.get("response", ""))}
+    return {"response": "".join(chunks)}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1573,6 +1605,34 @@ def dashboard() -> str:
             min-height: 220px;
             resize: vertical;
             font-family: inherit;
+        }
+        #llm-output {
+            width: 100%;
+            min-height: 280px;
+            max-height: 280px;
+            overflow: auto;
+            border: 1px solid var(--border);
+            border-radius: 0.35rem;
+            background: #ffffff;
+            padding: 0.6rem 0.7rem;
+            line-height: 1.45;
+        }
+        #llm-output pre {
+            overflow: auto;
+            background: #f3f7fd;
+            border: 1px solid #dce7f5;
+            border-radius: 0.35rem;
+            padding: 0.6rem;
+        }
+        #llm-output code {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        }
+        #llm-output p {
+            margin: 0.45rem 0;
+        }
+        #llm-output ul {
+            margin: 0.45rem 0 0.45rem 1.1rem;
+            padding: 0;
         }
         .llm-grid {
             display: grid;
@@ -2064,7 +2124,7 @@ def dashboard() -> str:
                 <div>
                     <label>
                         <span class="meta">Model output</span><br />
-                        <textarea id="llm-output" readonly placeholder="Оценка состояния узла и рекомендации..."></textarea>
+                        <div id="llm-output"></div>
                     </label>
                 </div>
                 <div id="llm-status" class="status"></div>
@@ -2146,6 +2206,7 @@ def dashboard() -> str:
             topSelectedNodeId: '',
             kbSelectedNodeId: '',
             llmSelectedNodeId: '',
+            llmRawOutput: '',
             activeMenuKey: '',
             activeMenuData: null,
             activeTab: 'latest',
@@ -2193,6 +2254,53 @@ def dashboard() -> str:
                 return `${Math.round(numeric)}${unit}`;
             }
             return `${numeric.toFixed(2)}${unit}`;
+        }
+
+        function escapeHtml(value) {
+            return value
+                .replaceAll('&', '&amp;')
+                .replaceAll('<', '&lt;')
+                .replaceAll('>', '&gt;')
+                .replaceAll('"', '&quot;')
+                .replaceAll("'", '&#39;');
+        }
+
+        function markdownToHtml(markdown) {
+            const codeBlocks = [];
+            const withoutCode = markdown.replace(/```([\\s\\S]*?)```/g, (_match, code) => {
+                const token = `__CODE_BLOCK_${codeBlocks.length}__`;
+                codeBlocks.push(`<pre><code>${escapeHtml(code.trim())}</code></pre>`);
+                return token;
+            });
+            let html = escapeHtml(withoutCode);
+            html = html
+                .replace(/^### (.*)$/gm, '<h3>$1</h3>')
+                .replace(/^## (.*)$/gm, '<h2>$1</h2>')
+                .replace(/^# (.*)$/gm, '<h1>$1</h1>')
+                .replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>')
+                .replace(/\\*(.*?)\\*/g, '<em>$1</em>')
+                .replace(/`([^`]+)`/g, '<code>$1</code>')
+                .replace(/^- (.*)$/gm, '<li>$1</li>');
+            html = html.replace(/(<li>.*<\\/li>)/gs, '<ul>$1</ul>');
+            html = html
+                .split(/\\n{2,}/)
+                .map((block) => {
+                    if (block.startsWith('<h') || block.startsWith('<ul>') || block.startsWith('__CODE_BLOCK_')) {
+                        return block;
+                    }
+                    return `<p>${block.replaceAll('\\n', '<br />')}</p>`;
+                })
+                .join('');
+            codeBlocks.forEach((codeBlock, index) => {
+                html = html.replace(`__CODE_BLOCK_${index}__`, codeBlock);
+            });
+            return html;
+        }
+
+        function renderLlmOutput() {
+            document.getElementById('llm-output').innerHTML = state.llmRawOutput
+                ? markdownToHtml(state.llmRawOutput)
+                : '<p class="meta">Оценка состояния узла и рекомендации...</p>';
         }
 
         function renderTabs() {
@@ -3020,21 +3128,41 @@ def dashboard() -> str:
                 return;
             }
             setStatus('llm-status', 'Analyzing node with LLM...');
-            document.getElementById('llm-output').value = '';
+            state.llmRawOutput = '';
+            renderLlmOutput();
             try {
-                const data = await fetchJson('/api/llm/analyze-node', {
+                const response = await fetch('/api/llm/analyze-node', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ node_id: state.llmSelectedNodeId }),
                 });
-                document.getElementById('llm-output').value = data.response || '';
-                const context = data.context || {};
-                const triggerCount = (context.active_triggers || []).length;
-                const logCount = (context.logs_above_info || []).length;
-                const kbCount = (context.knowledge_base?.items || []).length;
-                setStatus('llm-status', `Done. Active triggers: ${triggerCount}, logs above INFO: ${logCount}, KB items: ${kbCount}.`);
+                if (!response.ok) {
+                    let detail = response.statusText || 'Request failed';
+                    try {
+                        const payload = await response.json();
+                        detail = payload.detail || detail;
+                    } catch (_error) {
+                        detail = detail || 'Request failed';
+                    }
+                    throw new Error(detail);
+                }
+                const reader = response.body?.getReader();
+                if (!reader) {
+                    throw new Error('Streaming is not available in this browser.');
+                }
+                const decoder = new TextDecoder();
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    state.llmRawOutput += decoder.decode(value, { stream: true });
+                    renderLlmOutput();
+                }
+                state.llmRawOutput += decoder.decode();
+                renderLlmOutput();
+                setStatus('llm-status', 'Done.');
             } catch (error) {
-                document.getElementById('llm-output').value = '';
+                state.llmRawOutput = '';
+                renderLlmOutput();
                 setStatus('llm-status', error.message, true);
             }
         }
@@ -3401,6 +3529,7 @@ def dashboard() -> str:
         renderTabs();
         setStatus('knowledge-base-status', 'Choose a node and click "Run KB solve" to fetch Knowledge Base results.');
         setStatus('llm-status', 'Choose a node and click "Analyze node" to run LLM diagnostics.');
+        renderLlmOutput();
         document.getElementById('create-user-form').addEventListener('submit', async (event) => {
             event.preventDefault();
             const login = document.getElementById('user-login-input').value.trim();
