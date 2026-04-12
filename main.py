@@ -47,6 +47,7 @@ RECENT_POINTS_LIMIT = 10
 LOG_POINTS_LIMIT = 100
 MAX_STORED_LOGS_PER_NODE_AND_SEVERITY = 2000
 LOG_SEVERITY_LEVELS = ("DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY")
+LLM_GENERATE_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=None, pool=None)
 
 logger = logging.getLogger(__name__)
 
@@ -1245,7 +1246,7 @@ async def get_knowledge_base(node_id: str = Query(..., min_length=1, max_length=
 @app.post("/api/llm/generate")
 async def generate_llm(payload: LLMGenerateIn) -> dict[str, str]:
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=LLM_GENERATE_TIMEOUT) as client:
             response = await client.post(
                 "http://localhost:11434/api/generate",
                 json={"model": "gemma4:e4b", "prompt": payload.prompt, "stream": False, "options": {"think": False}},
