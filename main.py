@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict, deque
 import contextlib
 from dataclasses import asdict, dataclass
@@ -10,6 +11,7 @@ import logging
 import operator
 import smtplib
 from typing import Deque
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, status
 import httpx
@@ -180,6 +182,8 @@ app = FastAPI(title="Monitoring KB MVP")
 app.include_router(users_router)
 
 _kb_last_updated: datetime | None = None
+_llm_tasks: dict[str, dict[str, object]] = {}
+_llm_tasks_lock = asyncio.Lock()
 
 UNPROTECTED_PATH_PREFIXES = (
     "/api/auth/login",
@@ -1319,10 +1323,9 @@ async def _request_ollama_generate(prompt: str) -> str:
     return "".join(chunks)
 
 
-@app.post("/api/llm/analyze-node")
-async def analyze_node_with_llm(payload: LLMNodeAnalysisIn) -> dict[str, object]:
+async def _build_node_analysis_payload(node_id: str) -> dict[str, object]:
     with SessionLocal() as db:
-        node = db.query(Node).filter(Node.display_name == payload.node_id).first()
+        node = db.query(Node).filter(Node.display_name == node_id).first()
         if node is None:
             raise HTTPException(status_code=404, detail="Node not found")
         agent_enabled = False
@@ -1332,13 +1335,13 @@ async def analyze_node_with_llm(payload: LLMNodeAnalysisIn) -> dict[str, object]
 
         metric = (
             db.query(Metric)
-            .filter(Metric.node_id == payload.node_id)
+            .filter(Metric.node_id == node_id)
             .order_by(Metric.timestamp.desc())
             .first()
         )
         active_triggers = (
             db.query(Trigger)
-            .filter(Trigger.node_id == payload.node_id)
+            .filter(Trigger.node_id == node_id)
             .all()
         )
         active_trigger_items = [
@@ -1353,13 +1356,13 @@ async def analyze_node_with_llm(payload: LLMNodeAnalysisIn) -> dict[str, object]
             if _is_trigger_active(trigger, metric)
         ]
 
-        logs = _collect_logs_for_llm(db, payload.node_id)
-        top_payload = _latest_top_processes.get(payload.node_id, {})
+        logs = _collect_logs_for_llm(db, node_id)
+        top_payload = _latest_top_processes.get(node_id, {})
 
-    kb_payload = await get_knowledge_base(payload.node_id)
+    kb_payload = await get_knowledge_base(node_id)
     kb_items = kb_payload.get("items", []) if isinstance(kb_payload, dict) else []
 
-    analysis_payload: dict[str, object] = {
+    return {
         "node": {
             "node_id": node.display_name,
             "os_name": node.os_name,
@@ -1395,13 +1398,87 @@ async def analyze_node_with_llm(payload: LLMNodeAnalysisIn) -> dict[str, object]
         },
     }
 
+
+async def _run_llm_node_analysis(node_id: str) -> tuple[str, dict[str, object]]:
+    analysis_payload = await _build_node_analysis_payload(node_id)
     prompt = _build_node_analysis_prompt(analysis_payload)
     try:
         llm_response = await _request_ollama_generate(prompt)
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"LLM service error: {exc}") from exc
 
+    return llm_response, analysis_payload
+
+
+async def _run_llm_task(task_id: str, node_id: str) -> None:
+    async with _llm_tasks_lock:
+        task = _llm_tasks.get(task_id)
+        if task is None:
+            return
+        task["status"] = "running"
+        task["started_at"] = _utcnow().isoformat()
+        task["updated_at"] = task["started_at"]
+
+    try:
+        llm_response, analysis_payload = await _run_llm_node_analysis(node_id)
+        async with _llm_tasks_lock:
+            task = _llm_tasks.get(task_id)
+            if task is not None:
+                task["status"] = "done"
+                task["response"] = llm_response
+                task["context"] = analysis_payload
+                task["error"] = None
+                task["updated_at"] = _utcnow().isoformat()
+    except HTTPException as exc:
+        async with _llm_tasks_lock:
+            task = _llm_tasks.get(task_id)
+            if task is not None:
+                task["status"] = "error"
+                task["error"] = str(exc.detail)
+                task["updated_at"] = _utcnow().isoformat()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Unexpected LLM task error")
+        async with _llm_tasks_lock:
+            task = _llm_tasks.get(task_id)
+            if task is not None:
+                task["status"] = "error"
+                task["error"] = f"Unexpected server error: {exc}"
+                task["updated_at"] = _utcnow().isoformat()
+
+
+@app.post("/api/llm/analyze-node")
+async def analyze_node_with_llm(payload: LLMNodeAnalysisIn) -> dict[str, object]:
+    llm_response, analysis_payload = await _run_llm_node_analysis(payload.node_id)
     return {"node_id": payload.node_id, "response": llm_response, "context": analysis_payload}
+
+
+@app.post("/api/llm/analyze-node/start")
+async def start_node_analysis_with_llm(payload: LLMNodeAnalysisIn) -> dict[str, str]:
+    task_id = uuid4().hex
+    created_at = _utcnow().isoformat()
+    async with _llm_tasks_lock:
+        _llm_tasks[task_id] = {
+            "task_id": task_id,
+            "node_id": payload.node_id,
+            "status": "pending",
+            "response": None,
+            "context": None,
+            "error": None,
+            "created_at": created_at,
+            "started_at": None,
+            "updated_at": created_at,
+        }
+    asyncio.create_task(_run_llm_task(task_id, payload.node_id))
+    return {"task_id": task_id}
+
+
+@app.get("/api/llm/analyze-node/tasks/{task_id}")
+async def get_node_analysis_task(task_id: str) -> dict[str, object]:
+    async with _llm_tasks_lock:
+        task = _llm_tasks.get(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return dict(task)
 
 
 @app.post("/api/llm/generate")
@@ -2184,6 +2261,10 @@ def dashboard() -> str:
                 throw new Error(message);
             }
             return response.json();
+        }
+
+        function sleep(ms) {
+            return new Promise((resolve) => setTimeout(resolve, ms));
         }
 
         function formatUtc(value) {
@@ -3041,11 +3122,26 @@ def dashboard() -> str:
             setStatus('llm-status', 'Analyzing node with LLM...');
             document.getElementById('llm-output').value = '';
             try {
-                const data = await fetchJson('/api/llm/analyze-node', {
+                const startData = await fetchJson('/api/llm/analyze-node/start', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ node_id: state.llmSelectedNodeId }),
                 });
+                const taskId = startData.task_id;
+                const startedAt = Date.now();
+                let data = null;
+                while (true) {
+                    data = await fetchJson(`/api/llm/analyze-node/tasks/${encodeURIComponent(taskId)}`);
+                    if (data.status === 'done') {
+                        break;
+                    }
+                    if (data.status === 'error') {
+                        throw new Error(data.error || 'LLM analysis task failed.');
+                    }
+                    const elapsedSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+                    setStatus('llm-status', `Analyzing node with LLM... ${elapsedSeconds}s`);
+                    await sleep(2000);
+                }
                 document.getElementById('llm-output').value = data.response || '';
                 const context = data.context || {};
                 const triggerCount = (context.active_triggers || []).length;
