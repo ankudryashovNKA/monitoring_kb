@@ -1288,6 +1288,28 @@ def _build_node_analysis_prompt(payload: dict[str, object]) -> str:
     )
 
 
+async def _request_ollama_generate(prompt: str) -> str:
+    timeout = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=30.0)
+    chunks: list[str] = []
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream(
+            "POST",
+            "http://localhost:11434/api/generate",
+            json={"model": "gemma3:4b", "prompt": prompt},
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line:
+                    continue
+                payload = json.loads(line)
+                chunk = payload.get("response")
+                if isinstance(chunk, str):
+                    chunks.append(chunk)
+
+    return "".join(chunks)
+
+
 @app.post("/api/llm/analyze-node")
 async def analyze_node_with_llm(payload: LLMNodeAnalysisIn) -> dict[str, object]:
     with SessionLocal() as db:
@@ -1366,33 +1388,21 @@ async def analyze_node_with_llm(payload: LLMNodeAnalysisIn) -> dict[str, object]
 
     prompt = _build_node_analysis_prompt(analysis_payload)
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(
-                "http://localhost:11434/api/generate",
-                json={"model": "gemma3:4b", "prompt": prompt, "stream": False},
-            )
-            response.raise_for_status()
-            data = response.json()
+        llm_response = await _request_ollama_generate(prompt)
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"LLM service error: {exc}") from exc
 
-    return {"node_id": payload.node_id, "response": str(data.get("response", "")), "context": analysis_payload}
+    return {"node_id": payload.node_id, "response": llm_response, "context": analysis_payload}
 
 
 @app.post("/api/llm/generate")
 async def generate_llm(payload: LLMGenerateIn) -> dict[str, str]:
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(
-                "http://localhost:11434/api/generate",
-                json={"model": "gemma3:4b", "prompt": payload.prompt, "stream": False},
-            )
-            response.raise_for_status()
-            data = response.json()
+        llm_response = await _request_ollama_generate(payload.prompt)
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"LLM service error: {exc}") from exc
 
-    return {"response": str(data.get("response", ""))}
+    return {"response": llm_response}
 
 
 @app.get("/", response_class=HTMLResponse)
