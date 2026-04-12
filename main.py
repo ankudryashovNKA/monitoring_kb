@@ -5,6 +5,7 @@ import contextlib
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+import json
 import logging
 import operator
 import smtplib
@@ -29,7 +30,7 @@ from app.security.agent_auth import (
     rotate_agent_secret,
     validate_agent_request,
 )
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -47,6 +48,7 @@ RECENT_POINTS_LIMIT = 10
 LOG_POINTS_LIMIT = 100
 MAX_STORED_LOGS_PER_NODE_AND_SEVERITY = 2000
 LOG_SEVERITY_LEVELS = ("DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY")
+LLM_GENERATE_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=None, pool=None)
 
 logger = logging.getLogger(__name__)
 
@@ -1245,7 +1247,7 @@ async def get_knowledge_base(node_id: str = Query(..., min_length=1, max_length=
 @app.post("/api/llm/generate")
 async def generate_llm(payload: LLMGenerateIn) -> dict[str, str]:
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=LLM_GENERATE_TIMEOUT) as client:
             response = await client.post(
                 "http://localhost:11434/api/generate",
                 json={"model": "gemma4:e4b", "prompt": payload.prompt, "stream": False, "options": {"think": False}},
@@ -1256,6 +1258,29 @@ async def generate_llm(payload: LLMGenerateIn) -> dict[str, str]:
         raise HTTPException(status_code=502, detail=f"LLM service error: {exc}") from exc
 
     return {"response": str(data.get("response", ""))}
+
+
+@app.post("/api/llm/generate-stream")
+async def generate_llm_stream(payload: LLMGenerateIn) -> StreamingResponse:
+    async def _stream() -> object:
+        async with httpx.AsyncClient(timeout=LLM_GENERATE_TIMEOUT) as client:
+            async with client.stream(
+                "POST",
+                "http://localhost:11434/api/generate",
+                json={"model": "gemma4:e4b", "prompt": payload.prompt, "stream": True, "options": {"think": False}},
+            ) as response:
+                response.raise_for_status()
+                async for raw_line in response.aiter_lines():
+                    if not raw_line:
+                        continue
+                    chunk_payload = json.loads(raw_line)
+                    chunk = chunk_payload.get("response")
+                    if chunk:
+                        yield str(chunk)
+                    if chunk_payload.get("done"):
+                        break
+
+    return StreamingResponse(_stream(), media_type="text/plain; charset=utf-8")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2878,15 +2903,44 @@ def dashboard() -> str:
             setStatus('llm-status', 'Generating...');
             document.getElementById('llm-output').value = '';
             try {
-                const data = await fetchJson('/api/llm/generate', {
+                const response = await fetch('/api/llm/generate-stream', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ prompt }),
                 });
-                document.getElementById('llm-output').value = data.response || '';
+                if (!response.ok) {
+                    let message = `Request failed with status ${response.status}`;
+                    try {
+                        const payload = await response.json();
+                        if (payload.detail) message = payload.detail;
+                    } catch (error) {
+                        // no-op
+                    }
+                    throw new Error(message);
+                }
+                if (!response.body) {
+                    throw new Error('Empty LLM stream response');
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let generated = '';
+
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) {
+                        break;
+                    }
+                    generated += decoder.decode(value, { stream: true });
+                    document.getElementById('llm-output').value = generated;
+                }
+                generated += decoder.decode();
+                document.getElementById('llm-output').value = generated;
                 setStatus('llm-status', 'Done.');
             } catch (error) {
-                document.getElementById('llm-output').value = '';
+                if (!document.getElementById('llm-output').value) {
+                    document.getElementById('llm-output').value = '';
+                }
                 setStatus('llm-status', error.message, true);
             }
         }
