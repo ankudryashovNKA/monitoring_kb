@@ -5,6 +5,7 @@ import contextlib
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+import json
 import logging
 import operator
 import smtplib
@@ -164,6 +165,10 @@ class KBSolveResponse(BaseModel):
 
 class LLMGenerateIn(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=20000)
+
+
+class LLMNodeAnalysisIn(BaseModel):
+    node_id: str = Field(..., min_length=1, max_length=100)
 
 
 class LoginIn(BaseModel):
@@ -1242,6 +1247,138 @@ async def get_knowledge_base(node_id: str = Query(..., min_length=1, max_length=
     }
 
 
+def _collect_logs_for_llm(db: Session, node_id: str, per_severity_limit: int = 20) -> list[dict[str, str]]:
+    severities = LOG_SEVERITY_LEVELS[2:]
+    items: list[dict[str, str]] = []
+    for severity in severities:
+        rows = (
+            db.query(LogEntry)
+            .filter(LogEntry.node_id == node_id, LogEntry.severity == severity)
+            .order_by(LogEntry.captured_at.desc(), LogEntry.id.desc())
+            .limit(per_severity_limit)
+            .all()
+        )
+        for row in rows:
+            items.append(
+                {
+                    "source": row.source,
+                    "severity": row.severity,
+                    "message": row.message,
+                    "captured_at": row.captured_at.isoformat(),
+                }
+            )
+    items.sort(key=lambda item: item["captured_at"], reverse=True)
+    return items[:100]
+
+
+def _build_node_analysis_prompt(payload: dict[str, object]) -> str:
+    return (
+        "Ты SRE-инженер мониторинга. Проанализируй состояние узла и ответь на русском языке.\n\n"
+        "Структура ответа:\n"
+        "1) Краткий вердикт о состоянии (OK / DEGRADED / CRITICAL).\n"
+        "2) Обнаруженные проблемы (если есть).\n"
+        "3) Приоритетный план действий (по шагам).\n"
+        "4) Что проверить после исправления.\n\n"
+        "Важно:\n"
+        "- Учитывай только данные из входного JSON.\n"
+        "- Не выдумывай факты, явно отмечай нехватку данных.\n"
+        "- Если проблем нет, дай профилактические рекомендации.\n\n"
+        "Данные узла:\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+@app.post("/api/llm/analyze-node")
+async def analyze_node_with_llm(payload: LLMNodeAnalysisIn) -> dict[str, object]:
+    with SessionLocal() as db:
+        node = db.query(Node).filter(Node.display_name == payload.node_id).first()
+        if node is None:
+            raise HTTPException(status_code=404, detail="Node not found")
+        agent_enabled = False
+        if node.agent_id:
+            agent = db.query(Agent).filter(Agent.agent_id == node.agent_id).first()
+            agent_enabled = bool(agent.enabled) if agent else False
+
+        metric = (
+            db.query(Metric)
+            .filter(Metric.node_id == payload.node_id)
+            .order_by(Metric.timestamp.desc())
+            .first()
+        )
+        active_triggers = (
+            db.query(Trigger)
+            .filter(Trigger.node_id == payload.node_id)
+            .all()
+        )
+        active_trigger_items = [
+            {
+                "id": trigger.id,
+                "name": trigger.name,
+                "metric_name": trigger.metric_name,
+                "operator": trigger.operator,
+                "threshold": trigger.threshold,
+            }
+            for trigger in active_triggers
+            if _is_trigger_active(trigger, metric)
+        ]
+
+        logs = _collect_logs_for_llm(db, payload.node_id)
+        top_payload = _latest_top_processes.get(payload.node_id, {})
+
+    kb_payload = await get_knowledge_base(payload.node_id)
+    kb_items = kb_payload.get("items", []) if isinstance(kb_payload, dict) else []
+
+    analysis_payload: dict[str, object] = {
+        "node": {
+            "node_id": node.display_name,
+            "os_name": node.os_name,
+            "ip_address": node.ip_address,
+            "agent_id": node.agent_id,
+            "agent_enabled": agent_enabled,
+            "last_seen": node.last_seen.isoformat() if node.last_seen else None,
+        },
+        "latest_metric": {
+            "timestamp": metric.timestamp.isoformat() if metric else None,
+            "cpu_percent": metric.cpu_percent if metric else None,
+            "ram_percent": metric.ram_percent if metric else None,
+            "swap_percent": metric.swap_percent if metric else None,
+            "uptime_seconds": metric.uptime_seconds if metric else None,
+            "disk_read_time_ms": metric.disk_read_time_ms if metric else None,
+            "disk_write_time_ms": metric.disk_write_time_ms if metric else None,
+            "zombie_processes": metric.zombie_processes if metric else None,
+        },
+        "active_triggers": active_trigger_items,
+        "logs_above_info": logs,
+        "top": {
+            "timestamp": top_payload.get("timestamp"),
+            "top_cpu_processes": top_payload.get("top_cpu_processes", []),
+            "top_ram_processes": top_payload.get("top_ram_processes", []),
+        },
+        "knowledge_base": {
+            "status": kb_payload.get("status") if isinstance(kb_payload, dict) else "error",
+            "error": kb_payload.get("error") if isinstance(kb_payload, dict) else "Unknown KB response",
+            "items": kb_items,
+            "active_triggers": kb_payload.get("active_triggers", []) if isinstance(kb_payload, dict) else [],
+            "matched_node_ids": kb_payload.get("matched_node_ids", []) if isinstance(kb_payload, dict) else [],
+            "last_updated": kb_payload.get("last_updated") if isinstance(kb_payload, dict) else None,
+        },
+    }
+
+    prompt = _build_node_analysis_prompt(analysis_payload)
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                "http://localhost:11434/api/generate",
+                json={"model": "gemma3:4b", "prompt": prompt, "stream": False},
+            )
+            response.raise_for_status()
+            data = response.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"LLM service error: {exc}") from exc
+
+    return {"node_id": payload.node_id, "response": str(data.get("response", "")), "context": analysis_payload}
+
+
 @app.post("/api/llm/generate")
 async def generate_llm(payload: LLMGenerateIn) -> dict[str, str]:
     try:
@@ -1918,19 +2055,16 @@ def dashboard() -> str:
             <section class="panel tab-panel" data-panel="llm" hidden>
                 <div class="page-header">
                     <h2>LLM</h2>
-                    <p class="meta">Input: введите промпт, Output: получите ответ локальной модели gemma3:4b.</p>
+                    <p class="meta">Выберите узел и запустите автоматический анализ: метрики, активные триггеры, логи выше INFO, top и выводы Knowledge Base.</p>
                 </div>
                 <div class="toolbar">
-                    <button id="run-llm" type="button">Run LLM</button>
+                    <label><span class="meta">Node</span><br /><select id="llm-node-select"></select></label>
+                    <button id="run-llm" type="button">Analyze node</button>
                 </div>
-                <div class="llm-grid">
+                <div>
                     <label>
-                        <span class="meta">Input</span><br />
-                        <textarea id="llm-input" placeholder="Введите текст..."></textarea>
-                    </label>
-                    <label>
-                        <span class="meta">Output</span><br />
-                        <textarea id="llm-output" readonly placeholder="Ответ модели..."></textarea>
+                        <span class="meta">Model output</span><br />
+                        <textarea id="llm-output" readonly placeholder="Оценка состояния узла и рекомендации..."></textarea>
                     </label>
                 </div>
                 <div id="llm-status" class="status"></div>
@@ -2011,6 +2145,7 @@ def dashboard() -> str:
             logsSelectedSeverity: 'INFO',
             topSelectedNodeId: '',
             kbSelectedNodeId: '',
+            llmSelectedNodeId: '',
             activeMenuKey: '',
             activeMenuData: null,
             activeTab: 'latest',
@@ -2076,12 +2211,14 @@ def dashboard() -> str:
             const logsSelect = document.getElementById('logs-node-select');
             const topSelect = document.getElementById('top-node-select');
             const kbSelect = document.getElementById('kb-node-select');
+            const llmSelect = document.getElementById('llm-node-select');
             select.innerHTML = '';
             graphSelect.innerHTML = '';
             triggerSelect.innerHTML = '';
             logsSelect.innerHTML = '';
             topSelect.innerHTML = '';
             kbSelect.innerHTML = '';
+            llmSelect.innerHTML = '';
             if (!state.nodes.length) {
                 const option = document.createElement('option');
                 option.textContent = 'No nodes yet';
@@ -2092,12 +2229,14 @@ def dashboard() -> str:
                 logsSelect.appendChild(option.cloneNode(true));
                 topSelect.appendChild(option.cloneNode(true));
                 kbSelect.appendChild(option.cloneNode(true));
+                llmSelect.appendChild(option.cloneNode(true));
                 select.disabled = true;
                 graphSelect.disabled = true;
                 triggerSelect.disabled = true;
                 logsSelect.disabled = true;
                 topSelect.disabled = true;
                 kbSelect.disabled = true;
+                llmSelect.disabled = true;
                 return;
             }
 
@@ -2107,6 +2246,7 @@ def dashboard() -> str:
             logsSelect.disabled = false;
             topSelect.disabled = false;
             kbSelect.disabled = false;
+            llmSelect.disabled = false;
             if (!state.latestSelectedNodeId || !state.nodes.some((node) => node.node_id === state.latestSelectedNodeId)) {
                 state.latestSelectedNodeId = state.nodes[0].node_id;
             }
@@ -2125,6 +2265,9 @@ def dashboard() -> str:
             if (!state.kbSelectedNodeId || !state.nodes.some((node) => node.node_id === state.kbSelectedNodeId)) {
                 state.kbSelectedNodeId = state.latestSelectedNodeId;
             }
+            if (!state.llmSelectedNodeId || !state.nodes.some((node) => node.node_id === state.llmSelectedNodeId)) {
+                state.llmSelectedNodeId = state.latestSelectedNodeId;
+            }
 
             for (const node of state.nodes) {
                 const option = document.createElement('option');
@@ -2136,6 +2279,7 @@ def dashboard() -> str:
                 logsSelect.appendChild(option.cloneNode(true));
                 topSelect.appendChild(option.cloneNode(true));
                 kbSelect.appendChild(option.cloneNode(true));
+                llmSelect.appendChild(option.cloneNode(true));
             }
             select.value = state.latestSelectedNodeId;
             graphSelect.value = state.graphSelectedNodeId;
@@ -2143,6 +2287,7 @@ def dashboard() -> str:
             logsSelect.value = state.logsSelectedNodeId;
             topSelect.value = state.topSelectedNodeId;
             kbSelect.value = state.kbSelectedNodeId;
+            llmSelect.value = state.llmSelectedNodeId;
         }
 
         function renderGraph(items, metricName, intervalMinutes) {
@@ -2870,21 +3015,24 @@ def dashboard() -> str:
         }
 
         async function runLlm() {
-            const prompt = document.getElementById('llm-input').value.trim();
-            if (!prompt) {
-                setStatus('llm-status', 'Введите текст в input.', true);
+            if (!state.llmSelectedNodeId) {
+                setStatus('llm-status', 'Choose a node first.', true);
                 return;
             }
-            setStatus('llm-status', 'Generating...');
+            setStatus('llm-status', 'Analyzing node with LLM...');
             document.getElementById('llm-output').value = '';
             try {
-                const data = await fetchJson('/api/llm/generate', {
+                const data = await fetchJson('/api/llm/analyze-node', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ prompt }),
+                    body: JSON.stringify({ node_id: state.llmSelectedNodeId }),
                 });
                 document.getElementById('llm-output').value = data.response || '';
-                setStatus('llm-status', 'Done.');
+                const context = data.context || {};
+                const triggerCount = (context.active_triggers || []).length;
+                const logCount = (context.logs_above_info || []).length;
+                const kbCount = (context.knowledge_base?.items || []).length;
+                setStatus('llm-status', `Done. Active triggers: ${triggerCount}, logs above INFO: ${logCount}, KB items: ${kbCount}.`);
             } catch (error) {
                 document.getElementById('llm-output').value = '';
                 setStatus('llm-status', error.message, true);
@@ -2918,11 +3066,13 @@ def dashboard() -> str:
             state.logsSelectedNodeId = event.target.value;
             state.topSelectedNodeId = event.target.value;
             state.kbSelectedNodeId = event.target.value;
+            state.llmSelectedNodeId = event.target.value;
             document.getElementById('graph-node-select').value = state.graphSelectedNodeId;
             document.getElementById('trigger-node-select').value = state.triggerSelectedNodeId;
             document.getElementById('logs-node-select').value = state.logsSelectedNodeId;
             document.getElementById('top-node-select').value = state.topSelectedNodeId;
             document.getElementById('kb-node-select').value = state.kbSelectedNodeId;
+            document.getElementById('llm-node-select').value = state.llmSelectedNodeId;
             await loadLatestMetrics();
             await loadGraph();
             await loadTriggers();
@@ -3001,6 +3151,10 @@ def dashboard() -> str:
         document.getElementById('kb-node-select').addEventListener('change', (event) => {
             state.kbSelectedNodeId = event.target.value;
             setStatus('knowledge-base-status', state.kbSelectedNodeId ? 'Node selected. Click \"Run KB solve\" to fetch Knowledge Base results.' : 'Choose a node to run Knowledge Base solve.');
+        });
+        document.getElementById('llm-node-select').addEventListener('change', (event) => {
+            state.llmSelectedNodeId = event.target.value;
+            setStatus('llm-status', state.llmSelectedNodeId ? 'Node selected. Click "Analyze node".' : 'Choose a node for LLM analysis.');
         });
         document.getElementById('run-llm').addEventListener('click', runLlm);
         document.getElementById('auth-sign-in').addEventListener('click', signIn);
@@ -3246,6 +3400,7 @@ def dashboard() -> str:
 
         renderTabs();
         setStatus('knowledge-base-status', 'Choose a node and click "Run KB solve" to fetch Knowledge Base results.');
+        setStatus('llm-status', 'Choose a node and click "Analyze node" to run LLM diagnostics.');
         document.getElementById('create-user-form').addEventListener('submit', async (event) => {
             event.preventDefault();
             const login = document.getElementById('user-login-input').value.trim();
