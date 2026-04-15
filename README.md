@@ -21,7 +21,7 @@
 1. **FastAPI-сервер (`main.py`)**
    - REST API для метрик, логов, агентов, триггеров, проблем, KB, LLM;
    - встроенный HTML/JS-дашборд на `GET /`;
-   - фоновая синхронизация Knowledge Base каждые 10 минут.
+   - on-demand интеграция с Knowledge Base для выбранного узла (по кнопке в UI).
 
 2. **Агент (`agent.py`)**
    - собирает метрики с `psutil`;
@@ -34,13 +34,14 @@
    - автоматическое создание схемы при старте (`create_all`).
 
 4. **Интеграция с Knowledge Base API (Hippocrates)**
-   - backend ходит в `POST /solve/{KB_ID}`;
-   - кэширует результат;
-   - UI читает кэш через `GET /api/knowledge-base`.
+   - backend запускает solve по запросу для выбранного узла (`GET /api/knowledge-base?node_id=...`);
+   - перед solve сопоставляет активные триггеры узла с KB-объектами, обновляет preset `agent_preset`;
+   - возвращает в UI результаты solve + диагностические поля (`active_triggers`, `matched_node_ids`, `last_updated`).
 
 5. **LLM-интеграция через Ollama**
-   - endpoint `POST /api/llm/generate` отправляет промпт в `http://localhost:11434/api/generate`;
-   - модель жёстко задана как `gemma3:4b`.
+   - endpoint `POST /api/llm/analyze-node` собирает контекст узла (метрики, триггеры, логи, KB) и стримит ответ;
+   - endpoint `POST /api/llm/generate` принимает произвольный prompt и возвращает полный ответ;
+   - модель жёстко задана как `gemma4:e4b` (локальный Ollama API на `http://localhost:11434`).
 
 ---
 
@@ -339,25 +340,35 @@ API:
 
 ## 9.7 Knowledge Base
 
-Назначение: отображение результатов, полученных из Hippocrates KB.
+Назначение: получить диагностические рекомендации из Hippocrates KB для **конкретного выбранного узла**.
 
-- backend в фоне обращается к внешнему KB API каждые 10 минут;
-- результат кэшируется в памяти процесса;
-- UI показывает `status`, `last_updated`, таблицу результатов и explanatory set;
-- `Refresh now` на UI делает повторный запрос к локальному `GET /api/knowledge-base` (не прямой вызов внешнего API из браузера).
+Как это работает сейчас:
+
+- UI отправляет `GET /api/knowledge-base?node_id=<display_name>` только по кнопке **Run KB solve**;
+- backend находит активные триггеры этого узла (по последней метрике);
+- backend получает список KB-объектов, сопоставляет их по имени с активными триггерами и собирает `matched_node_ids`;
+- backend проверяет/создаёт preset `agent_preset`, обновляет его `nodesId` и запускает `solve`;
+- UI показывает `status`, `last_updated`, `active_triggers`, `matched_node_ids`, таблицу результатов и `explanatorySet`.
+
+Важно:
+
+- при отсутствии `KB_ID` или `KB_JWT_TOKEN` endpoint возвращает `status=disabled`;
+- при сетевой/HTTP ошибке к внешнему KB API endpoint возвращает `status=error` и текст ошибки;
+- браузер не ходит напрямую во внешний KB API — только в локальный backend.
 
 API:
 
-- `GET /api/knowledge-base`
+- `GET /api/knowledge-base?node_id=...`
 
 ## 9.8 LLM
 
-Назначение: отправка промпта в локальную LLM через Ollama.
+Назначение: запуск LLM-диагностики узла и получение структурированного ответа на русском языке.
 
-- поле Input/Output;
-- кнопка `Run LLM`;
-- backend вызывает `POST /api/llm/generate`;
-- endpoint проксирует в локальный Ollama с моделью **`gemma3:4b`**.
+- в UI выбирается узел и нажимается кнопка **Analyze node**;
+- backend вызывает `POST /api/llm/analyze-node`, формирует payload из узла, последней метрики, активных триггеров, логов и KB-результатов;
+- ответ от Ollama стримится в UI по мере генерации;
+- для ручных/внешних интеграций остаётся endpoint `POST /api/llm/generate` (один prompt → один склеенный ответ);
+- модель по умолчанию: **`gemma4:e4b`**.
 
 ---
 
@@ -367,28 +378,25 @@ API:
 
 - `https://kb.ai-hippocrates.ru/kbapi`
 
-Backend формирует запрос:
+Текущий поток вызовов для `GET /api/knowledge-base?node_id=...`:
 
-- `POST https://kb.ai-hippocrates.ru/kbapi/solve/{KB_ID}`
-- заголовки:
-  - `Authorization: <KB_JWT_TOKEN>`
-  - `Content-Type: application/json-patch+json`
-  - `accept: */*`
-- тело:
+1. `GET /api/Objects/GetAllObjects/{KB_ID}` — получить объекты KB;
+2. `GET /api/Test/getPresets/{KB_ID}` — найти preset `agent_preset`;
+3. при необходимости `POST /api/Test/savePresets` — создать preset;
+4. `PUT /api/Test/update/{preset_id}` — обновить `nodesId` для preset;
+5. `POST /solve/{KB_ID}` с `{"presetName":"agent_preset"}` — получить solve-результат.
 
-```json
-{
-  "presetName": "Monitoring server"
-}
-```
+Типовые заголовки:
 
-`presetName` можно переопределить через `KB_PRESET_NAME`.
+- `Authorization: <KB_JWT_TOKEN>`
+- `accept: */*` (или `text/plain` для некоторых endpoints KB)
+- `Content-Type: application/json-patch+json` для `POST/PUT` с JSON-телом
 
 Если `KB_ID` или `KB_JWT_TOKEN` не заданы, интеграция помечается как disabled, и `/api/knowledge-base` возвращает соответствующий статус.
 
 ---
 
-## 11) Важно: для раздела LLM нужна модель Ollama `gemma3:4b`
+## 11) Важно: для раздела LLM нужна модель Ollama `gemma4:e4b`
 
 На сервере, где работает FastAPI, должен быть доступен локальный Ollama API на `localhost:11434`.
 
@@ -399,7 +407,7 @@ Backend формирует запрос:
 3. скачать модель:
 
 ```bash
-ollama pull gemma3:4b
+ollama pull gemma4:e4b
 ```
 
 4. Проверить, что модель доступна:
@@ -413,10 +421,10 @@ ollama list
 ```bash
 curl -X POST http://localhost:11434/api/generate \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gemma3:4b","prompt":"Hello","stream":false}'
+  -d '{"model":"gemma4:e4b","prompt":"Hello","stream":false}'
 ```
 
-Если Ollama не запущен или модель не установлена, `POST /api/llm/generate` вернёт `502 LLM service error`.
+Если Ollama не запущен или модель не установлена, LLM endpoints (`/api/llm/analyze-node`, `/api/llm/generate`) вернут `502 LLM service error`.
 
 ---
 
@@ -482,16 +490,17 @@ curl -X POST http://localhost:11434/api/generate \
 
 Проверьте:
 
+- задан ли `node_id` в запросе `/api/knowledge-base`;
 - заданы ли `KB_ID` и `KB_JWT_TOKEN`;
-- доступен ли `https://kb.ai-hippocrates.ru` из сети сервера;
-- валиден ли токен авторизации.
+- доступны ли KB endpoints (`GetAllObjects`, `getPresets`, `update`, `solve`) из сети сервера;
+- совпадают ли имена активных trigger'ов с именами объектов в KB (иначе `matched_node_ids` будет пустым).
 
 ### Не работает LLM
 
 Проверьте:
 
 - запущен ли Ollama на том же сервере;
-- что `ollama list` содержит `gemma3:4b`;
+- что `ollama list` содержит `gemma4:e4b`;
 - что `http://localhost:11434/api/generate` отвечает.
 
 ---
