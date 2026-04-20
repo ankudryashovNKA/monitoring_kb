@@ -27,3 +27,5 @@ class Node(Base):
     metrics = relationship("Metric", back_populates="node", cascade="all, delete-orphan")
     triggers = relationship("Trigger", back_populates="node", cascade="all, delete-orphan")
     log_entries = relationship("LogEntry", back_populates="node", cascade="all, delete-orphan")
+    agent_scripts = relationship("AgentScript", back_populates="node", cascade="all, delete-orphan")
+    agent_commands = relationship("AgentCommand", back_populates="node", cascade="all, delete-orphan")

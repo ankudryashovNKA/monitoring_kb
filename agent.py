@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import os
+from pathlib import Path
 import platform
 import socket
 import subprocess
@@ -19,6 +20,7 @@ from dotenv import load_dotenv
 DEFAULT_INTERVAL_SECONDS = 60
 MAX_LOG_ENTRIES = 100
 TOP_PROCESS_LIMIT = 10
+SCRIPTS_DIR = "scripts"
 LOG_SEVERITY_LEVELS = ("DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY")
 
 load_dotenv()
@@ -400,6 +402,49 @@ def post_signed_json(
     return requests.post(url, data=raw_body, headers=headers, timeout=timeout)
 
 
+def get_signed_json(
+    *,
+    server_url: str,
+    endpoint_path: str,
+    timeout: int,
+    agent_id: str,
+    agent_secret: str,
+) -> requests.Response:
+    raw_body = b""
+    headers = build_signed_headers(
+        method="GET",
+        endpoint_path=endpoint_path,
+        payload_bytes=raw_body,
+        agent_id=agent_id,
+        agent_secret=agent_secret,
+    )
+    url = server_url.rstrip("/") + endpoint_path
+    return requests.get(url, headers=headers, timeout=timeout)
+
+
+def discover_local_scripts(base_dir: Path) -> list[dict[str, str]]:
+    scripts_dir = base_dir / SCRIPTS_DIR
+    if not scripts_dir.exists() or not scripts_dir.is_dir():
+        return []
+    items: list[dict[str, str]] = []
+    for path in sorted(scripts_dir.iterdir(), key=lambda item: item.name.lower()):
+        if not path.is_file():
+            continue
+        items.append({"script_id": path.name, "script_path": str(path.resolve())})
+    return items
+
+
+def run_local_script(base_dir: Path, script_id: str) -> tuple[int, str, str]:
+    scripts_dir = (base_dir / SCRIPTS_DIR).resolve()
+    candidate = (scripts_dir / script_id).resolve()
+    if not str(candidate).startswith(str(scripts_dir)):
+        return 1, "", "Script path escapes scripts/ directory"
+    if not candidate.exists() or not candidate.is_file():
+        return 1, "", "Script not found in scripts/ directory"
+    completed = subprocess.run([str(candidate)], capture_output=True, text=True, check=False, cwd=str(base_dir))
+    return completed.returncode, completed.stdout[-200000:], completed.stderr[-200000:]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Monitoring agent")
     parser.add_argument("--server-url", default=os.getenv("SERVER_URL"), help="FastAPI server URL, e.g. http://localhost:8000")
@@ -423,6 +468,9 @@ def main() -> None:
     metrics_path = "/api/agent/metrics"
     logs_path = "/api/agent/logs"
     send_interval = max(DEFAULT_INTERVAL_SECONDS, args.interval)
+    scripts_path = "/api/agent/scripts"
+    command_next_path = "/api/agent/commands/next"
+    base_dir = Path.cwd()
 
     while True:
         metrics_payload = collect_metrics(args.display_name, args.agent_id)
@@ -445,6 +493,51 @@ def main() -> None:
             agent_secret=args.agent_secret,
         )
         logs_response.raise_for_status()
+
+        scripts_payload = {
+            "node_id": args.display_name,
+            "scripts": discover_local_scripts(base_dir),
+        }
+        scripts_response = post_signed_json(
+            server_url=args.server_url,
+            endpoint_path=scripts_path,
+            payload=scripts_payload,
+            timeout=10,
+            agent_id=args.agent_id,
+            agent_secret=args.agent_secret,
+        )
+        scripts_response.raise_for_status()
+
+        command_response = get_signed_json(
+            server_url=args.server_url,
+            endpoint_path=command_next_path,
+            timeout=10,
+            agent_id=args.agent_id,
+            agent_secret=args.agent_secret,
+        )
+        command_response.raise_for_status()
+        command_item = command_response.json().get("item")
+        if command_item:
+            started_at = datetime.now(timezone.utc).isoformat()
+            exit_code, stdout, stderr = run_local_script(base_dir, str(command_item.get("script_id", "")))
+            finished_at = datetime.now(timezone.utc).isoformat()
+            result_payload = {
+                "status": "completed" if exit_code == 0 else "failed",
+                "stdout": stdout,
+                "stderr": stderr,
+                "exit_code": exit_code,
+                "started_at": started_at,
+                "finished_at": finished_at,
+            }
+            result_response = post_signed_json(
+                server_url=args.server_url,
+                endpoint_path=f"/api/agent/commands/{int(command_item['id'])}/result",
+                payload=result_payload,
+                timeout=120,
+                agent_id=args.agent_id,
+                agent_secret=args.agent_secret,
+            )
+            result_response.raise_for_status()
         print(f"Sent metrics: {json.dumps(metrics_payload)}")
         print(f"Sent logs entries: {len(logs_payload['entries'])}")
         time.sleep(send_interval)
