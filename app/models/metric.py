@@ -19,6 +19,9 @@ class Metric(Base):
     swap_percent: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     disk_read_time_ms: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     disk_write_time_ms: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    net_recv_kbps: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    net_sent_kbps: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    process_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     zombie_processes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
 

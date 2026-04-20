@@ -23,6 +23,10 @@ LOG_SEVERITY_LEVELS = ("DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL"
 
 load_dotenv()
 
+_last_disk_io_counters: psutil._common.sdiskio | None = None
+_last_net_io_counters: psutil._common.snetio | None = None
+_last_io_sample_ts: float | None = None
+
 
 def _sanitize_log_text(value: str) -> str:
     """Remove control characters that can break API validation/storage."""
@@ -46,6 +50,7 @@ def collect_metrics(display_name: str, agent_id: str) -> dict[str, object]:
     virtual_memory = psutil.virtual_memory()
     swap_memory = psutil.swap_memory()
     disk_io = psutil.disk_io_counters()
+    io_rates = collect_io_rates(disk_io)
     return {
         "node_id": display_name,
         "agent_id": agent_id,
@@ -53,8 +58,11 @@ def collect_metrics(display_name: str, agent_id: str) -> dict[str, object]:
         "ram_percent": virtual_memory.percent,
         "uptime_seconds": max(0.0, time.time() - psutil.boot_time()),
         "swap_percent": swap_memory.percent,
-        "disk_read_time_ms": float(getattr(disk_io, "read_time", 0.0) if disk_io else 0.0),
-        "disk_write_time_ms": float(getattr(disk_io, "write_time", 0.0) if disk_io else 0.0),
+        "disk_read_time_ms": io_rates["disk_read_time_ms"],
+        "disk_write_time_ms": io_rates["disk_write_time_ms"],
+        "net_recv_kbps": io_rates["net_recv_kbps"],
+        "net_sent_kbps": io_rates["net_sent_kbps"],
+        "process_count": count_processes(),
         "zombie_processes": count_zombie_processes(),
         "os_name": os_name,
         "cpu_cores": psutil.cpu_count() or 1,
@@ -64,6 +72,53 @@ def collect_metrics(display_name: str, agent_id: str) -> dict[str, object]:
         "top_cpu_processes": collect_top_processes(sort_by="cpu_percent"),
         "top_ram_processes": collect_top_processes(sort_by="ram_percent"),
         "timestamp": datetime.now(timezone.utc).isoformat(),
+}
+
+
+def collect_io_rates(disk_io: psutil._common.sdiskio | None) -> dict[str, float]:
+    global _last_disk_io_counters, _last_net_io_counters, _last_io_sample_ts
+
+    now = time.time()
+    net_io = psutil.net_io_counters()
+    defaults = {
+        "disk_read_time_ms": 0.0,
+        "disk_write_time_ms": 0.0,
+        "net_recv_kbps": 0.0,
+        "net_sent_kbps": 0.0,
+    }
+    if _last_io_sample_ts is None or _last_disk_io_counters is None or _last_net_io_counters is None:
+        _last_io_sample_ts = now
+        _last_disk_io_counters = disk_io
+        _last_net_io_counters = net_io
+        return defaults
+
+    elapsed = max(1e-6, now - _last_io_sample_ts)
+
+    read_latency = 0.0
+    write_latency = 0.0
+    if disk_io and _last_disk_io_counters:
+        read_count_delta = max(0, int(getattr(disk_io, "read_count", 0)) - int(getattr(_last_disk_io_counters, "read_count", 0)))
+        write_count_delta = max(0, int(getattr(disk_io, "write_count", 0)) - int(getattr(_last_disk_io_counters, "write_count", 0)))
+        read_time_delta = max(0.0, float(getattr(disk_io, "read_time", 0.0)) - float(getattr(_last_disk_io_counters, "read_time", 0.0)))
+        write_time_delta = max(
+            0.0, float(getattr(disk_io, "write_time", 0.0)) - float(getattr(_last_disk_io_counters, "write_time", 0.0))
+        )
+        if read_count_delta > 0:
+            read_latency = read_time_delta / read_count_delta
+        if write_count_delta > 0:
+            write_latency = write_time_delta / write_count_delta
+
+    recv_kbps = max(0.0, float(net_io.bytes_recv - _last_net_io_counters.bytes_recv) / elapsed / 1024)
+    sent_kbps = max(0.0, float(net_io.bytes_sent - _last_net_io_counters.bytes_sent) / elapsed / 1024)
+
+    _last_io_sample_ts = now
+    _last_disk_io_counters = disk_io
+    _last_net_io_counters = net_io
+    return {
+        "disk_read_time_ms": read_latency,
+        "disk_write_time_ms": write_latency,
+        "net_recv_kbps": recv_kbps,
+        "net_sent_kbps": sent_kbps,
     }
 
 
@@ -156,6 +211,13 @@ def count_zombie_processes() -> int:
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
     return zombies
+
+
+def count_processes() -> int:
+    try:
+        return len(psutil.pids())
+    except Exception:
+        return 0
 
 
 def _linux_log_source() -> tuple[str, str]:
