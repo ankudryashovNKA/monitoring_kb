@@ -401,16 +401,18 @@ def _migrate_triggers_table() -> None:
     if "triggers" not in inspector.get_table_names():
         return
 
+    dialect_name = engine.dialect.name
+    bool_default_false = "FALSE" if dialect_name == "postgresql" else "0"
     existing_columns = {column["name"] for column in inspector.get_columns("triggers")}
     statements: list[str] = []
     if "alert_user_id" not in existing_columns:
         statements.append("ALTER TABLE triggers ADD COLUMN alert_user_id INTEGER")
     if "alert_sent" not in existing_columns:
-        statements.append("ALTER TABLE triggers ADD COLUMN alert_sent BOOLEAN DEFAULT 0 NOT NULL")
+        statements.append(f"ALTER TABLE triggers ADD COLUMN alert_sent BOOLEAN DEFAULT {bool_default_false} NOT NULL")
     if "action_script_id" not in existing_columns:
         statements.append("ALTER TABLE triggers ADD COLUMN action_script_id VARCHAR(200) DEFAULT '' NOT NULL")
     if "remediation_sent" not in existing_columns:
-        statements.append("ALTER TABLE triggers ADD COLUMN remediation_sent BOOLEAN DEFAULT 0 NOT NULL")
+        statements.append(f"ALTER TABLE triggers ADD COLUMN remediation_sent BOOLEAN DEFAULT {bool_default_false} NOT NULL")
 
     with engine.begin() as connection:
         for statement in statements:
