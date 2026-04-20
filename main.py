@@ -58,6 +58,9 @@ METRIC_VALUE_EXTRACTORS = {
     "uptime_seconds": lambda metric: float(metric.uptime_seconds),
     "disk_read_time_ms": lambda metric: float(metric.disk_read_time_ms),
     "disk_write_time_ms": lambda metric: float(metric.disk_write_time_ms),
+    "net_recv_kbps": lambda metric: float(metric.net_recv_kbps),
+    "net_sent_kbps": lambda metric: float(metric.net_sent_kbps),
+    "process_count": lambda metric: float(metric.process_count),
     "zombie_processes": lambda metric: float(metric.zombie_processes),
 }
 
@@ -108,6 +111,9 @@ class MetricIn(BaseModel):
     swap_percent: float = Field(default=0, ge=0, le=100)
     disk_read_time_ms: float = Field(default=0, ge=0)
     disk_write_time_ms: float = Field(default=0, ge=0)
+    net_recv_kbps: float = Field(default=0, ge=0)
+    net_sent_kbps: float = Field(default=0, ge=0)
+    process_count: int = Field(default=0, ge=0)
     zombie_processes: int = Field(default=0, ge=0)
     os_name: str = Field(..., min_length=1, max_length=200)
     cpu_cores: int = Field(..., ge=1, le=4096)
@@ -145,7 +151,7 @@ class TriggerCreateIn(BaseModel):
     name: str = Field("Trigger", min_length=1, max_length=120)
     metric_name: str = Field(
         ...,
-        pattern="^(cpu_percent|ram_percent|swap_percent|uptime_seconds|disk_read_time_ms|disk_write_time_ms|zombie_processes)$",
+        pattern="^(cpu_percent|ram_percent|swap_percent|uptime_seconds|disk_read_time_ms|disk_write_time_ms|net_recv_kbps|net_sent_kbps|process_count|zombie_processes)$",
     )
     operator: str = Field(..., pattern="^(>|<)$")
     threshold: float = Field(..., ge=0)
@@ -347,6 +353,12 @@ def _migrate_metrics_table() -> None:
         statements.append("ALTER TABLE metrics ADD COLUMN disk_read_time_ms FLOAT NOT NULL DEFAULT 0")
     if "disk_write_time_ms" not in existing_columns:
         statements.append("ALTER TABLE metrics ADD COLUMN disk_write_time_ms FLOAT NOT NULL DEFAULT 0")
+    if "net_recv_kbps" not in existing_columns:
+        statements.append("ALTER TABLE metrics ADD COLUMN net_recv_kbps FLOAT NOT NULL DEFAULT 0")
+    if "net_sent_kbps" not in existing_columns:
+        statements.append("ALTER TABLE metrics ADD COLUMN net_sent_kbps FLOAT NOT NULL DEFAULT 0")
+    if "process_count" not in existing_columns:
+        statements.append("ALTER TABLE metrics ADD COLUMN process_count INTEGER NOT NULL DEFAULT 0")
     if "zombie_processes" not in existing_columns:
         statements.append("ALTER TABLE metrics ADD COLUMN zombie_processes INTEGER NOT NULL DEFAULT 0")
 
@@ -624,6 +636,9 @@ def ingest_metric(metric: MetricIn) -> dict[str, str]:
                 swap_percent=metric.swap_percent,
                 disk_read_time_ms=metric.disk_read_time_ms,
                 disk_write_time_ms=metric.disk_write_time_ms,
+                net_recv_kbps=metric.net_recv_kbps,
+                net_sent_kbps=metric.net_sent_kbps,
+                process_count=metric.process_count,
                 zombie_processes=metric.zombie_processes,
                 timestamp=normalized_timestamp,
             )
@@ -795,6 +810,9 @@ def list_metrics(node_id: str | None = None) -> dict[str, list[dict[str, str | f
                 "swap_percent": metric.swap_percent,
                 "disk_read_time_ms": metric.disk_read_time_ms,
                 "disk_write_time_ms": metric.disk_write_time_ms,
+                "net_recv_kbps": metric.net_recv_kbps,
+                "net_sent_kbps": metric.net_sent_kbps,
+                "process_count": metric.process_count,
                 "zombie_processes": metric.zombie_processes,
                 "timestamp": metric.timestamp.isoformat(),
                 "display_name": display_name,
@@ -841,7 +859,7 @@ def list_metric_history(
     node_id: str,
     metric_name: str = Query(
         "cpu_percent",
-        pattern="^(cpu_percent|ram_percent|swap_percent|uptime_seconds|disk_read_time_ms|disk_write_time_ms|zombie_processes)$",
+        pattern="^(cpu_percent|ram_percent|swap_percent|uptime_seconds|disk_read_time_ms|disk_write_time_ms|net_recv_kbps|net_sent_kbps|process_count|zombie_processes)$",
     ),
     interval_minutes: int = Query(15, ge=1, le=60),
 ) -> dict[str, str | list[dict[str, str | float]]]:
@@ -1371,6 +1389,9 @@ async def analyze_node_with_llm(payload: LLMNodeAnalysisIn) -> StreamingResponse
             "uptime_seconds": metric.uptime_seconds if metric else None,
             "disk_read_time_ms": metric.disk_read_time_ms if metric else None,
             "disk_write_time_ms": metric.disk_write_time_ms if metric else None,
+            "net_recv_kbps": metric.net_recv_kbps if metric else None,
+            "net_sent_kbps": metric.net_sent_kbps if metric else None,
+            "process_count": metric.process_count if metric else None,
             "zombie_processes": metric.zombie_processes if metric else None,
         },
         "active_triggers": active_trigger_items,
@@ -1834,6 +1855,21 @@ def dashboard() -> str:
                 </div>
                 <div id="latest-summary" class="grid"></div>
                 <div id="latest-status" class="status"></div>
+                <h3>Filesystems</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Device</th>
+                            <th>Mountpoint</th>
+                            <th>FS type</th>
+                            <th>Total (GB)</th>
+                            <th>Used (GB)</th>
+                            <th>Free (GB)</th>
+                            <th>Used %</th>
+                        </tr>
+                    </thead>
+                    <tbody id="filesystems-body"></tbody>
+                </table>
                 <table>
                     <thead>
                         <tr>
@@ -1843,8 +1879,11 @@ def dashboard() -> str:
                             <th>RAM %</th>
                             <th>Swap %</th>
                             <th>Uptime (s)</th>
-                            <th>Disk read (ms)</th>
-                            <th>Disk write (ms)</th>
+                            <th>Disk read await (ms/op)</th>
+                            <th>Disk write await (ms/op)</th>
+                            <th>Net recv (KB/s)</th>
+                            <th>Net sent (KB/s)</th>
+                            <th>Processes</th>
                             <th>Zombie processes</th>
                         </tr>
                     </thead>
@@ -1895,8 +1934,11 @@ def dashboard() -> str:
                             <option value="ram_percent">RAM %</option>
                             <option value="swap_percent">Swap %</option>
                             <option value="uptime_seconds">Uptime (s)</option>
-                            <option value="disk_read_time_ms">Disk read time (ms)</option>
-                            <option value="disk_write_time_ms">Disk write time (ms)</option>
+                            <option value="disk_read_time_ms">Disk read await (ms/op)</option>
+                            <option value="disk_write_time_ms">Disk write await (ms/op)</option>
+                            <option value="net_recv_kbps">Net recv (KB/s)</option>
+                            <option value="net_sent_kbps">Net sent (KB/s)</option>
+                            <option value="process_count">Processes</option>
                             <option value="zombie_processes">Zombie processes</option>
                         </select>
                     </label>
@@ -1946,8 +1988,11 @@ def dashboard() -> str:
                             <option value="ram_percent">RAM %</option>
                             <option value="swap_percent">Swap %</option>
                             <option value="uptime_seconds">Uptime (s)</option>
-                            <option value="disk_read_time_ms">Disk read time (ms)</option>
-                            <option value="disk_write_time_ms">Disk write time (ms)</option>
+                            <option value="disk_read_time_ms">Disk read await (ms/op)</option>
+                            <option value="disk_write_time_ms">Disk write await (ms/op)</option>
+                            <option value="net_recv_kbps">Net recv (KB/s)</option>
+                            <option value="net_sent_kbps">Net sent (KB/s)</option>
+                            <option value="process_count">Processes</option>
                             <option value="zombie_processes">Zombie processes</option>
                         </select>
                     </label>
@@ -2211,8 +2256,11 @@ def dashboard() -> str:
             ram_percent: { label: 'RAM %', unit: '%' },
             swap_percent: { label: 'Swap %', unit: '%' },
             uptime_seconds: { label: 'Uptime (s)', unit: 's' },
-            disk_read_time_ms: { label: 'Disk read time (ms)', unit: 'ms' },
-            disk_write_time_ms: { label: 'Disk write time (ms)', unit: 'ms' },
+            disk_read_time_ms: { label: 'Disk read await (ms/op)', unit: ' ms/op' },
+            disk_write_time_ms: { label: 'Disk write await (ms/op)', unit: ' ms/op' },
+            net_recv_kbps: { label: 'Net recv (KB/s)', unit: ' KB/s' },
+            net_sent_kbps: { label: 'Net sent (KB/s)', unit: ' KB/s' },
+            process_count: { label: 'Processes', unit: '' },
             zombie_processes: { label: 'Zombie processes', unit: '' },
         };
 
@@ -2276,7 +2324,7 @@ def dashboard() -> str:
                 return 'No data';
             }
             const unit = metricUnit(metricName);
-            if (metricName === 'zombie_processes') {
+            if (metricName === 'zombie_processes' || metricName === 'process_count') {
                 return `${Math.round(numeric)}${unit}`;
             }
             return `${numeric.toFixed(2)}${unit}`;
@@ -2553,7 +2601,7 @@ def dashboard() -> str:
             const body = document.getElementById('metrics-body');
             body.innerHTML = '';
             if (!items.length) {
-                body.innerHTML = '<tr><td colspan="9" class="empty">No metrics for this node yet.</td></tr>';
+                body.innerHTML = '<tr><td colspan="12" class="empty">No metrics for this node yet.</td></tr>';
                 return;
             }
 
@@ -2568,7 +2616,32 @@ def dashboard() -> str:
                     <td>${item.uptime_seconds.toFixed(2)}</td>
                     <td>${item.disk_read_time_ms.toFixed(2)}</td>
                     <td>${item.disk_write_time_ms.toFixed(2)}</td>
+                    <td>${item.net_recv_kbps.toFixed(2)}</td>
+                    <td>${item.net_sent_kbps.toFixed(2)}</td>
+                    <td>${Number(item.process_count).toFixed(0)}</td>
                     <td>${Number(item.zombie_processes).toFixed(0)}</td>
+                `;
+                body.appendChild(row);
+            }
+        }
+
+        function renderFilesystemsTable(filesystems) {
+            const body = document.getElementById('filesystems-body');
+            body.innerHTML = '';
+            if (!filesystems.length) {
+                body.innerHTML = '<tr><td colspan="7" class="empty">No filesystem data yet.</td></tr>';
+                return;
+            }
+            for (const item of filesystems) {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${item.device}</td>
+                    <td>${item.mountpoint}</td>
+                    <td>${item.fstype}</td>
+                    <td>${Number(item.total_gb).toFixed(2)}</td>
+                    <td>${Number(item.used_gb).toFixed(2)}</td>
+                    <td>${Number(item.free_gb).toFixed(2)}</td>
+                    <td>${Number(item.percent).toFixed(2)}</td>
                 `;
                 body.appendChild(row);
             }
@@ -2928,18 +3001,24 @@ def dashboard() -> str:
             if (!node) {
                 renderLatestSummary([], null);
                 renderLatestTable([]);
+                renderFilesystemsTable([]);
                 setStatus('latest-status', 'Waiting for nodes to send data.');
                 return;
             }
 
             try {
-                const data = await fetchJson(`/api/metrics?node_id=${encodeURIComponent(node.node_id)}`);
+                const [data, fsData] = await Promise.all([
+                    fetchJson(`/api/metrics?node_id=${encodeURIComponent(node.node_id)}`),
+                    fetchJson(`/api/filesystems?node_id=${encodeURIComponent(node.node_id)}`),
+                ]);
                 renderLatestSummary(data.items, node);
                 renderLatestTable(data.items);
+                renderFilesystemsTable(fsData.filesystems || []);
                 setStatus('latest-status', data.items.length ? '' : 'No recent metrics for the selected node.');
             } catch (error) {
                 renderLatestSummary([], node);
                 renderLatestTable([]);
+                renderFilesystemsTable([]);
                 setStatus('latest-status', error.message, true);
             }
         }
