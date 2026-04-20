@@ -414,3 +414,41 @@ def test_agent_auth_expired_timestamp() -> None:
     response = client.post("/api/agent/metrics", data=raw, headers=headers)
     assert response.status_code == 401
     assert response.json()["detail"] == "Authentication timestamp is outside allowed window"
+
+
+def test_login_sets_secure_cookie_for_https_proxy() -> None:
+    client = TestClient(app)
+    response = client.post(
+        "/api/auth/login",
+        json={"login": "admin", "password": "admin"},
+        headers={"X-Forwarded-Proto": "https"},
+    )
+    assert response.status_code == 200
+    set_cookie = response.headers.get("set-cookie", "")
+    assert "Secure" in set_cookie
+
+
+def test_rename_node_updates_cached_top_processes_key() -> None:
+    ingest_metric(
+        MetricIn(
+            node_id="node-cache",
+            cpu_percent=18.0,
+            ram_percent=33.0,
+            os_name="Ubuntu",
+            cpu_cores=4,
+            ram_total_mb=8192,
+            ip_address="10.0.0.14",
+            top_cpu_processes=[
+                {"pid": 101, "name": "python", "cpu_percent": 72.5, "ram_percent": 2.2, "ram_mb": 180},
+            ],
+            top_ram_processes=[
+                {"pid": 101, "name": "python", "cpu_percent": 72.5, "ram_percent": 2.2, "ram_mb": 180},
+            ],
+        )
+    )
+
+    rename_node("node-cache", NodeRenameIn(display_name="node-cache-renamed"))
+
+    payload = list_top_processes(node_id="node-cache-renamed")
+    assert payload["node_id"] == "node-cache-renamed"
+    assert payload["top_cpu_processes"]
