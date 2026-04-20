@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
@@ -42,6 +43,8 @@ from app.models.metric import Metric  # noqa: E402
 from app.models.node import Node  # noqa: E402
 from app.models.log_entry import LogEntry  # noqa: E402
 from app.models.trigger import Trigger  # noqa: E402
+from app.models.agent_script import AgentScript  # noqa: E402
+from app.models.agent_command import AgentCommand  # noqa: E402
 from app.security.agent_auth import register_agent  # noqa: E402
 
 
@@ -50,14 +53,23 @@ def setup_function() -> None:
         db.query(Metric).delete()
         db.query(LogEntry).delete()
         db.query(Trigger).delete()
+        db.query(AgentCommand).delete()
+        db.query(AgentScript).delete()
         db.query(Node).delete()
         db.query(Agent).delete()
         db.commit()
 
 
-def _signed_headers(agent_id: str, secret: str, path: str, raw_body: bytes, timestamp: int | None = None) -> dict[str, str]:
+def _signed_headers(
+    agent_id: str,
+    secret: str,
+    path: str,
+    raw_body: bytes,
+    timestamp: int | None = None,
+    method: str = "POST",
+) -> dict[str, str]:
     ts = str(timestamp if timestamp is not None else int(time.time()))
-    payload = f"POST\n{path}\n{ts}\n".encode("utf-8") + raw_body
+    payload = f"{method}\n{path}\n{ts}\n".encode("utf-8") + raw_body
     signature = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
     return {"X-Agent-ID": agent_id, "X-Timestamp": ts, "X-Signature": signature, "Content-Type": "application/json"}
 
@@ -179,9 +191,12 @@ def test_top_processes() -> None:
 
 
 def test_triggers_and_problems() -> None:
+    with SessionLocal() as db:
+        agent_id, _secret = register_agent(db)
     ingest_metric(
         MetricIn(
             node_id="node-alert",
+            agent_id=agent_id,
             cpu_percent=91.0,
             ram_percent=40.0,
             os_name="Ubuntu",
@@ -190,6 +205,17 @@ def test_triggers_and_problems() -> None:
             ip_address="10.0.0.12",
         )
     )
+    with SessionLocal() as db:
+        db.add(
+            AgentScript(
+                agent_id=agent_id,
+                node_id="node-alert",
+                script_id="restart.sh",
+                script_path="/tmp/restart.sh",
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        db.commit()
 
     created = create_trigger(
         TriggerCreateIn(
@@ -197,6 +223,7 @@ def test_triggers_and_problems() -> None:
             metric_name="cpu_percent",
             operator=">",
             threshold=85.0,
+            action_script_id="restart.sh",
         )
     )
     assert created["is_active"] is True
@@ -207,10 +234,79 @@ def test_triggers_and_problems() -> None:
     assert triggers[0]["operator"] == ">"
     assert triggers[0]["threshold"] == 85.0
     assert triggers[0]["is_active"] is True
+    assert triggers[0]["action_script_id"] == "restart.sh"
 
     problems = list_problems()["items"]
     assert len(problems) == 1
     assert problems[0]["node_id"] == "node-alert"
+
+
+def test_agent_scripts_and_commands_flow() -> None:
+    with SessionLocal() as db:
+        agent_id, secret = register_agent(db)
+    client = TestClient(app)
+    ingest_metric(
+        MetricIn(
+            node_id="node-remediate",
+            agent_id=agent_id,
+            cpu_percent=95.0,
+            ram_percent=20.0,
+            os_name="Ubuntu",
+            cpu_cores=4,
+            ram_total_mb=4096,
+            ip_address="10.0.0.66",
+        )
+    )
+    scripts_payload = {"node_id": "node-remediate", "scripts": [{"script_id": "fix.sh", "script_path": "/opt/agent/scripts/fix.sh"}]}
+    scripts_raw = json.dumps(scripts_payload, separators=(",", ":")).encode("utf-8")
+    scripts_headers = _signed_headers(agent_id, secret, "/api/agent/scripts", scripts_raw)
+    scripts_response = client.post("/api/agent/scripts", data=scripts_raw, headers=scripts_headers)
+    assert scripts_response.status_code == 200
+
+    created = create_trigger(
+        TriggerCreateIn(
+            node_id="node-remediate",
+            metric_name="cpu_percent",
+            operator=">",
+            threshold=80.0,
+            action_script_id="fix.sh",
+        )
+    )
+    assert created["action_script_id"] == "fix.sh"
+
+    ingest_metric(
+        MetricIn(
+            node_id="node-remediate",
+            agent_id=agent_id,
+            cpu_percent=97.0,
+            ram_percent=20.0,
+            os_name="Ubuntu",
+            cpu_cores=4,
+            ram_total_mb=4096,
+            ip_address="10.0.0.66",
+        )
+    )
+    next_headers = _signed_headers(agent_id, secret, "/api/agent/commands/next", b"", method="GET")
+    next_response = client.get("/api/agent/commands/next", headers=next_headers)
+    assert next_response.status_code == 200
+    item = next_response.json()["item"]
+    assert item["script_id"] == "fix.sh"
+
+    result_payload = {
+        "status": "completed",
+        "stdout": "ok",
+        "stderr": "",
+        "exit_code": 0,
+        "started_at": "2026-04-20T10:00:00+00:00",
+        "finished_at": "2026-04-20T10:00:01+00:00",
+    }
+    result_raw = json.dumps(result_payload, separators=(",", ":")).encode("utf-8")
+    result_headers = _signed_headers(agent_id, secret, f"/api/agent/commands/{item['id']}/result", result_raw)
+    result_response = client.post(f"/api/agent/commands/{item['id']}/result", data=result_raw, headers=result_headers)
+    assert result_response.status_code == 200
+
+    next_response_again = client.get("/api/agent/commands/next", headers=next_headers)
+    assert next_response_again.json()["item"] is None
 
 
 def test_knowledge_base_normalization_and_endpoint() -> None:

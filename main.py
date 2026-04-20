@@ -23,6 +23,8 @@ import app.models.metric  # noqa: F401
 import app.models.node  # noqa: F401
 import app.models.log_entry  # noqa: F401
 import app.models.trigger  # noqa: F401
+import app.models.agent_script  # noqa: F401
+import app.models.agent_command  # noqa: F401
 import app.models.user  # noqa: F401
 import app.models.agent  # noqa: F401
 from app.security.agent_auth import (
@@ -39,6 +41,8 @@ from app.models.metric import Metric
 from app.models.node import Node
 from app.models.log_entry import LogEntry
 from app.models.trigger import Trigger
+from app.models.agent_script import AgentScript
+from app.models.agent_command import AgentCommand
 from app.models.user import User
 from app.security.user_auth import decode_session_token, hash_password, make_session_token, verify_password
 from sqlalchemy import inspect, text
@@ -146,6 +150,25 @@ class LogsIn(BaseModel):
     entries: list[LogEntryIn] = Field(default_factory=list, max_length=LOG_POINTS_LIMIT)
 
 
+class AgentScriptEntryIn(BaseModel):
+    script_id: str = Field(..., min_length=1, max_length=200)
+    script_path: str = Field(..., min_length=1, max_length=500)
+
+
+class AgentScriptsIn(BaseModel):
+    node_id: str = Field(..., min_length=1, max_length=100)
+    scripts: list[AgentScriptEntryIn] = Field(default_factory=list, max_length=500)
+
+
+class AgentCommandResultIn(BaseModel):
+    status: str = Field(..., pattern="^(running|completed|failed)$")
+    stdout: str | None = Field(default=None, max_length=200000)
+    stderr: str | None = Field(default=None, max_length=200000)
+    exit_code: int | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
 class TriggerCreateIn(BaseModel):
     node_id: str = Field(..., min_length=1, max_length=100)
     name: str = Field("Trigger", min_length=1, max_length=120)
@@ -156,12 +179,14 @@ class TriggerCreateIn(BaseModel):
     operator: str = Field(..., pattern="^(>|<)$")
     threshold: float = Field(..., ge=0)
     alert_user_id: int | None = Field(default=None, ge=1)
+    action_script_id: str = Field(..., min_length=1, max_length=200)
 
 
 class TriggerUpdateIn(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
     threshold: float = Field(..., ge=0)
     alert_user_id: int | None = Field(default=None, ge=1)
+    action_script_id: str = Field(..., min_length=1, max_length=200)
 
 
 class KBExplanatoryItem(BaseModel):
@@ -202,6 +227,8 @@ UNPROTECTED_PATH_PREFIXES = (
     "/api/auth/logout",
     "/api/agent/metrics",
     "/api/agent/logs",
+    "/api/agent/scripts",
+    "/api/agent/commands/",
     "/openapi.json",
     "/docs",
     "/redoc",
@@ -240,6 +267,8 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _migrate_users_table()
     _migrate_triggers_table()
+    _migrate_agent_scripts_table()
+    _migrate_agent_commands_table()
     _migrate_metrics_table()
     _migrate_log_entries_table()
     _ensure_admin_user()
@@ -372,16 +401,53 @@ def _migrate_triggers_table() -> None:
     if "triggers" not in inspector.get_table_names():
         return
 
+    dialect_name = engine.dialect.name
+    bool_default_false = "FALSE" if dialect_name == "postgresql" else "0"
     existing_columns = {column["name"] for column in inspector.get_columns("triggers")}
     statements: list[str] = []
     if "alert_user_id" not in existing_columns:
         statements.append("ALTER TABLE triggers ADD COLUMN alert_user_id INTEGER")
     if "alert_sent" not in existing_columns:
-        statements.append("ALTER TABLE triggers ADD COLUMN alert_sent BOOLEAN DEFAULT 0 NOT NULL")
+        statements.append(f"ALTER TABLE triggers ADD COLUMN alert_sent BOOLEAN DEFAULT {bool_default_false} NOT NULL")
+    if "action_script_id" not in existing_columns:
+        statements.append("ALTER TABLE triggers ADD COLUMN action_script_id VARCHAR(200) DEFAULT '' NOT NULL")
+    if "remediation_sent" not in existing_columns:
+        statements.append(f"ALTER TABLE triggers ADD COLUMN remediation_sent BOOLEAN DEFAULT {bool_default_false} NOT NULL")
 
     with engine.begin() as connection:
         for statement in statements:
             connection.execute(text(statement))
+
+
+def _migrate_agent_scripts_table() -> None:
+    inspector = inspect(engine)
+    if "agent_scripts" not in inspector.get_table_names():
+        return
+    dialect_name = engine.dialect.name
+    with engine.begin() as connection:
+        statement = "CREATE UNIQUE INDEX IF NOT EXISTS ix_agent_scripts_node_script ON agent_scripts (node_id, script_id)"
+        if dialect_name == "postgresql":
+            connection.execute(text(statement))
+        else:
+            with contextlib.suppress(Exception):
+                connection.execute(text(statement))
+
+
+def _migrate_agent_commands_table() -> None:
+    inspector = inspect(engine)
+    if "agent_commands" not in inspector.get_table_names():
+        return
+    dialect_name = engine.dialect.name
+    with engine.begin() as connection:
+        for statement in (
+            "CREATE INDEX IF NOT EXISTS ix_agent_commands_agent_status_created ON agent_commands (agent_id, status, created_at)",
+            "CREATE INDEX IF NOT EXISTS ix_agent_commands_trigger_status ON agent_commands (trigger_id, status)",
+        ):
+            if dialect_name == "postgresql":
+                connection.execute(text(statement))
+            else:
+                with contextlib.suppress(Exception):
+                    connection.execute(text(statement))
 
 
 def _knowledge_base_enabled() -> bool:
@@ -518,6 +584,7 @@ def _serialize_trigger(
         "operator": trigger.operator,
         "threshold": trigger.threshold,
         "alert_user_id": trigger.alert_user_id,
+        "action_script_id": trigger.action_script_id,
         "alert_to_login": trigger.alert_user.login if trigger.alert_user else None,
         "alert_to_display_name": trigger.alert_user.display_name if trigger.alert_user else None,
         "is_active": _is_trigger_active(trigger, metric),
@@ -526,6 +593,20 @@ def _serialize_trigger(
     if include_latest:
         payload["latest_value"] = latest_value
     return payload
+
+
+def _serialize_agent_script(script: AgentScript) -> dict[str, str]:
+    return {"script_id": script.script_id, "script_path": script.script_path}
+
+
+def _validate_trigger_script(db: Session, *, node_id: str, action_script_id: str) -> None:
+    script = (
+        db.query(AgentScript)
+        .filter(AgentScript.node_id == node_id, AgentScript.script_id == action_script_id)
+        .first()
+    )
+    if script is None:
+        raise HTTPException(status_code=400, detail="Selected action_script_id is not available for this node")
 
 
 def _send_trigger_alert_email(trigger: Trigger, user: User, metric_value: float) -> bool:
@@ -568,16 +649,51 @@ def _process_trigger_alerts(db: Session, node_id: str, metric: MetricIn) -> None
         is_active = metric_value > trigger.threshold if trigger.operator == ">" else metric_value < trigger.threshold
         if not is_active:
             trigger.alert_sent = False
+            trigger.remediation_sent = False
             continue
-        if trigger.alert_sent:
+        if not trigger.alert_sent and trigger.alert_user_id is not None:
+            user = db.query(User).filter(User.id == trigger.alert_user_id).first()
+            if user is not None and _send_trigger_alert_email(trigger, user, metric_value):
+                trigger.alert_sent = True
+
+        if trigger.remediation_sent or not trigger.action_script_id:
             continue
-        if trigger.alert_user_id is None:
+        node = db.query(Node).filter(Node.display_name == trigger.node_id).first()
+        if node is None or not node.agent_id:
             continue
-        user = db.query(User).filter(User.id == trigger.alert_user_id).first()
-        if user is None:
+        script = (
+            db.query(AgentScript)
+            .filter(
+                AgentScript.node_id == trigger.node_id,
+                AgentScript.agent_id == node.agent_id,
+                AgentScript.script_id == trigger.action_script_id,
+            )
+            .first()
+        )
+        if script is None:
             continue
-        if _send_trigger_alert_email(trigger, user, metric_value):
-            trigger.alert_sent = True
+        existing = (
+            db.query(AgentCommand.id)
+            .filter(
+                AgentCommand.trigger_id == trigger.id,
+                AgentCommand.status.in_(("pending", "running")),
+            )
+            .first()
+        )
+        if existing is not None:
+            trigger.remediation_sent = True
+            continue
+        db.add(
+            AgentCommand(
+                agent_id=node.agent_id,
+                node_id=trigger.node_id,
+                trigger_id=trigger.id,
+                script_id=trigger.action_script_id,
+                status="pending",
+                created_at=_utcnow(),
+            )
+        )
+        trigger.remediation_sent = True
 
 
 def _extract_metric_value(metric: Metric, metric_name: str) -> float:
@@ -671,6 +787,13 @@ async def ingest_metric_from_agent(request: Request) -> dict[str, str]:
     return ingest_metric(metric)
 
 
+def _authenticate_agent_without_body(request: Request) -> str:
+    request.state.raw_body = b""
+    with SessionLocal() as db:
+        authenticated_agent = validate_agent_request(request, db)
+    return authenticated_agent.agent_id
+
+
 @app.post("/api/logs")
 def ingest_logs(payload: LogsIn) -> dict[str, str | int]:
     now = _utcnow()
@@ -742,6 +865,80 @@ async def ingest_logs_from_agent(request: Request) -> dict[str, str | int]:
         authenticated_agent = validate_agent_request(request, db)
     payload.agent_id = authenticated_agent.agent_id
     return ingest_logs(payload)
+
+
+@app.post("/api/agent/scripts")
+async def upsert_agent_scripts(request: Request) -> dict[str, str | int]:
+    raw_body = await request.body()
+    request.state.raw_body = raw_body
+    payload = AgentScriptsIn.model_validate_json(raw_body)
+    with SessionLocal() as db:
+        authenticated_agent = validate_agent_request(request, db)
+        node = db.query(Node).filter(Node.display_name == payload.node_id).first()
+        if node is None:
+            raise HTTPException(status_code=404, detail="Node not found")
+        if node.agent_id != authenticated_agent.agent_id:
+            raise HTTPException(status_code=403, detail="Node does not belong to authenticated agent")
+        db.query(AgentScript).filter(AgentScript.node_id == payload.node_id).delete(synchronize_session=False)
+        now = _utcnow()
+        for script in payload.scripts:
+            db.add(
+                AgentScript(
+                    agent_id=authenticated_agent.agent_id,
+                    node_id=payload.node_id,
+                    script_id=script.script_id,
+                    script_path=script.script_path,
+                    updated_at=now,
+                )
+            )
+        db.commit()
+    return {"status": "ok", "count": len(payload.scripts)}
+
+
+@app.get("/api/agent/commands/next")
+def get_next_agent_command(request: Request) -> dict[str, object]:
+    agent_id = _authenticate_agent_without_body(request)
+    with SessionLocal() as db:
+        command = (
+            db.query(AgentCommand)
+            .filter(AgentCommand.agent_id == agent_id, AgentCommand.status == "pending")
+            .order_by(AgentCommand.created_at.asc(), AgentCommand.id.asc())
+            .first()
+        )
+        if command is None:
+            return {"item": None}
+        return {
+            "item": {
+                "id": command.id,
+                "node_id": command.node_id,
+                "trigger_id": command.trigger_id,
+                "script_id": command.script_id,
+                "status": command.status,
+                "created_at": command.created_at.isoformat(),
+            }
+        }
+
+
+@app.post("/api/agent/commands/{command_id}/result")
+async def update_agent_command_result(command_id: int, request: Request) -> dict[str, str | int]:
+    raw_body = await request.body()
+    request.state.raw_body = raw_body
+    payload = AgentCommandResultIn.model_validate_json(raw_body)
+    with SessionLocal() as db:
+        authenticated_agent = validate_agent_request(request, db)
+        command = db.query(AgentCommand).filter(AgentCommand.id == command_id).first()
+        if command is None:
+            raise HTTPException(status_code=404, detail="Command not found")
+        if command.agent_id != authenticated_agent.agent_id:
+            raise HTTPException(status_code=403, detail="Command does not belong to authenticated agent")
+        command.status = payload.status
+        command.stdout = payload.stdout
+        command.stderr = payload.stderr
+        command.exit_code = payload.exit_code
+        command.started_at = payload.started_at.astimezone(timezone.utc) if payload.started_at else command.started_at
+        command.finished_at = payload.finished_at.astimezone(timezone.utc) if payload.finished_at else command.finished_at
+        db.commit()
+    return {"status": "ok", "id": command_id}
 
 
 @app.get("/api/logs")
@@ -917,6 +1114,21 @@ def list_nodes() -> dict[str, list[dict[str, str | int | bool | None]]]:
         return {"items": items}
 
 
+@app.get("/api/nodes/{node_id}/scripts")
+def list_node_scripts(node_id: str) -> dict[str, object]:
+    with SessionLocal() as db:
+        node = db.query(Node).filter(Node.display_name == node_id).first()
+        if node is None:
+            raise HTTPException(status_code=404, detail="Node not found")
+        scripts = (
+            db.query(AgentScript)
+            .filter(AgentScript.node_id == node_id)
+            .order_by(func.lower(AgentScript.script_id))
+            .all()
+        )
+        return {"node_id": node_id, "items": [_serialize_agent_script(item) for item in scripts]}
+
+
 @app.patch("/api/nodes/{node_id}")
 def rename_node(node_id: str, payload: NodeRenameIn) -> dict[str, str | int]:
     next_name = payload.display_name.strip()
@@ -933,6 +1145,8 @@ def rename_node(node_id: str, payload: NodeRenameIn) -> dict[str, str | int]:
         db.query(Metric).filter(Metric.node_id == node_id).update({"node_id": next_name}, synchronize_session=False)
         db.query(LogEntry).filter(LogEntry.node_id == node_id).update({"node_id": next_name}, synchronize_session=False)
         db.query(Trigger).filter(Trigger.node_id == node_id).update({"node_id": next_name}, synchronize_session=False)
+        db.query(AgentScript).filter(AgentScript.node_id == node_id).update({"node_id": next_name}, synchronize_session=False)
+        db.query(AgentCommand).filter(AgentCommand.node_id == node_id).update({"node_id": next_name}, synchronize_session=False)
         node.display_name = next_name
         db.commit()
         db.refresh(node)
@@ -1030,6 +1244,7 @@ def create_trigger(payload: TriggerCreateIn) -> dict[str, str | float | int | bo
             alert_user = db.query(User).filter(User.id == payload.alert_user_id).first()
             if alert_user is None:
                 raise HTTPException(status_code=404, detail="User for alert not found")
+        _validate_trigger_script(db, node_id=payload.node_id, action_script_id=payload.action_script_id)
 
         trigger = Trigger(
             node_id=payload.node_id,
@@ -1038,7 +1253,9 @@ def create_trigger(payload: TriggerCreateIn) -> dict[str, str | float | int | bo
             operator=payload.operator,
             threshold=payload.threshold,
             alert_user_id=payload.alert_user_id,
+            action_script_id=payload.action_script_id,
             alert_sent=False,
+            remediation_sent=False,
             created_at=_utcnow(),
         )
         db.add(trigger)
@@ -1064,11 +1281,14 @@ def update_trigger(trigger_id: int, payload: TriggerUpdateIn) -> dict[str, str |
             alert_user = db.query(User).filter(User.id == payload.alert_user_id).first()
             if alert_user is None:
                 raise HTTPException(status_code=404, detail="User for alert not found")
+        _validate_trigger_script(db, node_id=trigger.node_id, action_script_id=payload.action_script_id)
 
         trigger.name = payload.name
         trigger.threshold = payload.threshold
         trigger.alert_user_id = payload.alert_user_id
+        trigger.action_script_id = payload.action_script_id
         trigger.alert_sent = False
+        trigger.remediation_sent = False
         db.commit()
         db.refresh(trigger)
 
@@ -2008,6 +2228,10 @@ def dashboard() -> str:
                         <select id="trigger-alert-user-select"></select>
                     </label>
                     <label>
+                        <span class="meta">Action script</span><br />
+                        <select id="trigger-action-script-select" required></select>
+                    </label>
+                    <label>
                         <span class="meta">Threshold</span><br />
                         <input id="trigger-threshold-input" type="number" min="0" step="0.1" value="80" required />
                     </label>
@@ -2020,6 +2244,7 @@ def dashboard() -> str:
                             <th>Node</th>
                             <th>Name</th>
                             <th>Condition</th>
+                            <th>Action script</th>
                             <th>Latest value</th>
                             <th>Alert to</th>
                             <th>Status</th>
@@ -2271,6 +2496,7 @@ def dashboard() -> str:
             problems: [],
             knowledgeBase: [],
             users: [],
+            nodeScripts: {},
             currentLogin: '',
             latestSelectedNodeId: '',
             graphSelectedNodeId: '',
@@ -2704,11 +2930,32 @@ def dashboard() -> str:
             }
         }
 
+        function renderTriggerActionScriptOptions() {
+            const select = document.getElementById('trigger-action-script-select');
+            select.innerHTML = '';
+            const scripts = state.nodeScripts[state.triggerSelectedNodeId] || [];
+            if (!scripts.length) {
+                const option = document.createElement('option');
+                option.value = '';
+                option.textContent = 'No scripts available';
+                select.appendChild(option);
+                select.disabled = true;
+                return;
+            }
+            select.disabled = false;
+            for (const script of scripts) {
+                const option = document.createElement('option');
+                option.value = script.script_id;
+                option.textContent = `${script.script_id} (${script.script_path})`;
+                select.appendChild(option);
+            }
+        }
+
         function renderTriggersTable() {
             const body = document.getElementById('triggers-body');
             body.innerHTML = '';
             if (!state.triggers.length) {
-                body.innerHTML = '<tr><td colspan="8" class="empty">No triggers created for the selected node.</td></tr>';
+                body.innerHTML = '<tr><td colspan="9" class="empty">No triggers created for the selected node.</td></tr>';
                 return;
             }
             for (const trigger of state.triggers) {
@@ -2722,6 +2969,7 @@ def dashboard() -> str:
                     <td>${trigger.node_display_name}</td>
                     <td>${trigger.name}</td>
                     <td>${metricLabel(trigger.metric_name)} ${trigger.operator} ${formatMetricValue(trigger.metric_name, trigger.threshold)}</td>
+                    <td>${trigger.action_script_id || '—'}</td>
                     <td>${latestValue}</td>
                     <td>${alertTo}</td>
                     <td>${trigger.is_active ? 'Active' : 'OK'}</td>
@@ -2736,6 +2984,7 @@ def dashboard() -> str:
                             data-trigger-name="${trigger.name}"
                             data-trigger-threshold="${trigger.threshold}"
                             data-trigger-alert-user-id="${trigger.alert_user_id || ''}"
+                            data-trigger-action-script-id="${trigger.action_script_id || ''}"
                             aria-label="Trigger actions"
                         >...</button>
                     </td>
@@ -2935,8 +3184,10 @@ def dashboard() -> str:
                 const triggerId = toggleButton.dataset.triggerId;
                 const triggerName = toggleButton.dataset.triggerName || '';
                 const triggerThreshold = toggleButton.dataset.triggerThreshold || '';
+                const triggerAlertUserId = toggleButton.dataset.triggerAlertUserId || '';
+                const triggerActionScriptId = toggleButton.dataset.triggerActionScriptId || '';
                 menu.innerHTML = `
-                    <button type="button" data-trigger-action="edit" data-trigger-id="${triggerId}" data-trigger-name="${triggerName}" data-trigger-threshold="${triggerThreshold}">Edit</button>
+                    <button type="button" data-trigger-action="edit" data-trigger-id="${triggerId}" data-trigger-name="${triggerName}" data-trigger-threshold="${triggerThreshold}" data-trigger-alert-user-id="${triggerAlertUserId}" data-trigger-action-script-id="${triggerActionScriptId}">Edit</button>
                     <button type="button" class="danger" data-trigger-action="delete" data-trigger-id="${triggerId}">Delete</button>
                 `;
             } else if (type === 'user') {
@@ -3059,6 +3310,22 @@ def dashboard() -> str:
             } catch (error) {
                 state.triggers = [];
                 renderTriggersTable();
+                setStatus('triggers-status', error.message, true);
+            }
+        }
+
+        async function loadTriggerScripts() {
+            if (!state.triggerSelectedNodeId) {
+                renderTriggerActionScriptOptions();
+                return;
+            }
+            try {
+                const data = await fetchJson(`/api/nodes/${encodeURIComponent(state.triggerSelectedNodeId)}/scripts`);
+                state.nodeScripts[state.triggerSelectedNodeId] = data.items || [];
+                renderTriggerActionScriptOptions();
+            } catch (error) {
+                state.nodeScripts[state.triggerSelectedNodeId] = [];
+                renderTriggerActionScriptOptions();
                 setStatus('triggers-status', error.message, true);
             }
         }
@@ -3308,6 +3575,7 @@ def dashboard() -> str:
             document.getElementById('llm-node-select').value = state.llmSelectedNodeId;
             await loadLatestMetrics();
             await loadGraph();
+            await loadTriggerScripts();
             await loadTriggers();
             await loadLogs();
             await loadTopProcesses();
@@ -3325,6 +3593,7 @@ def dashboard() -> str:
         document.getElementById('graph-interval-select').addEventListener('change', loadGraph);
         document.getElementById('trigger-node-select').addEventListener('change', async (event) => {
             state.triggerSelectedNodeId = event.target.value;
+            await loadTriggerScripts();
             await loadTriggers();
         });
         document.getElementById('create-trigger-form').addEventListener('submit', async (event) => {
@@ -3340,9 +3609,14 @@ def dashboard() -> str:
             }
             const threshold = Number(document.getElementById('trigger-threshold-input').value);
             const alertUserRaw = document.getElementById('trigger-alert-user-select').value;
+            const actionScriptId = document.getElementById('trigger-action-script-select').value;
             const alertUserId = alertUserRaw ? Number(alertUserRaw) : null;
             if (!Number.isFinite(threshold) || threshold < 0) {
                 setStatus('triggers-status', 'Threshold must be a positive number or zero.', true);
+                return;
+            }
+            if (!actionScriptId) {
+                setStatus('triggers-status', 'Select action script.', true);
                 return;
             }
             try {
@@ -3356,6 +3630,7 @@ def dashboard() -> str:
                         operator: document.getElementById('trigger-operator-select').value,
                         threshold,
                         alert_user_id: alertUserId,
+                        action_script_id: actionScriptId,
                     }),
                 });
                 setStatus('triggers-status', 'Trigger created.');
@@ -3546,6 +3821,11 @@ def dashboard() -> str:
                 const action = triggerActionButton.dataset.triggerAction;
                 const triggerId = triggerActionButton.dataset.triggerId;
                 if (action === 'edit') {
+                    const scripts = state.nodeScripts[state.triggerSelectedNodeId] || [];
+                    const scriptOptions = scripts.map((script) => ({
+                        value: script.script_id,
+                        label: `${script.script_id} (${script.script_path})`,
+                    }));
                     const alertUserOptions = [{ value: '', label: 'Not selected' }].concat(
                         state.users.map((user) => ({
                             value: String(user.id),
@@ -3559,12 +3839,14 @@ def dashboard() -> str:
                             { id: 'edit-trigger-name', label: 'Name', value: triggerActionButton.dataset.triggerName || '', maxlength: 120 },
                             { id: 'edit-trigger-threshold', label: 'Threshold (0-100)', type: 'number', value: triggerActionButton.dataset.triggerThreshold || '', min: 0, max: 100, step: 0.1 },
                             { id: 'edit-trigger-alert-user-id', label: 'Alert to', type: 'select', value: triggerActionButton.dataset.triggerAlertUserId || '', options: alertUserOptions },
+                            { id: 'edit-trigger-action-script-id', label: 'Action script', type: 'select', value: triggerActionButton.dataset.triggerActionScriptId || '', options: scriptOptions },
                         ],
                         confirmLabel: 'Save',
                         onConfirm: async () => {
                             const nextName = document.getElementById('edit-trigger-name').value.trim();
                             const threshold = Number(document.getElementById('edit-trigger-threshold').value);
                             const alertUserRaw = document.getElementById('edit-trigger-alert-user-id').value;
+                            const actionScriptId = document.getElementById('edit-trigger-action-script-id').value;
                             const alertUserId = alertUserRaw ? Number(alertUserRaw) : null;
                             if (!nextName) {
                                 setStatus('triggers-status', 'Trigger name cannot be empty.', true);
@@ -3574,11 +3856,15 @@ def dashboard() -> str:
                                 setStatus('triggers-status', 'Threshold must be between 0 and 100.', true);
                                 return;
                             }
+                            if (!actionScriptId) {
+                                setStatus('triggers-status', 'Select action script.', true);
+                                return;
+                            }
                             try {
                                 await fetchJson(`/api/triggers/${encodeURIComponent(triggerId)}`, {
                                     method: 'PATCH',
                                     headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({ name: nextName, threshold, alert_user_id: alertUserId }),
+                                    body: JSON.stringify({ name: nextName, threshold, alert_user_id: alertUserId, action_script_id: actionScriptId }),
                                 });
                                 hideActionModal();
                                 setStatus('triggers-status', 'Trigger updated.');
@@ -3625,6 +3911,7 @@ def dashboard() -> str:
             await loadAgents();
             await loadLatestMetrics();
             await loadGraph();
+            await loadTriggerScripts();
             await loadTriggers();
             await loadProblems();
             await loadLogs();
