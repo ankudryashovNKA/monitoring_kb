@@ -51,6 +51,16 @@ LOG_SEVERITY_LEVELS = ("DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL"
 
 logger = logging.getLogger(__name__)
 
+METRIC_VALUE_EXTRACTORS = {
+    "cpu_percent": lambda metric: float(metric.cpu_percent),
+    "ram_percent": lambda metric: float(metric.ram_percent),
+    "swap_percent": lambda metric: float(metric.swap_percent),
+    "uptime_seconds": lambda metric: float(metric.uptime_seconds),
+    "disk_read_time_ms": lambda metric: float(metric.disk_read_time_ms),
+    "disk_write_time_ms": lambda metric: float(metric.disk_write_time_ms),
+    "zombie_processes": lambda metric: float(metric.zombie_processes),
+}
+
 
 @dataclass
 class MetricPoint:
@@ -210,6 +220,15 @@ async def dashboard_auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    return response
+
+
 def init_db() -> None:
     # For production use Alembic migrations instead of create_all.
     Base.metadata.create_all(bind=engine)
@@ -278,7 +297,8 @@ def _ensure_admin_user() -> None:
                     )
                 )
         else:
-            admin.password_hash = hash_password(settings.admin_password)
+            if not admin.password_hash:
+                admin.password_hash = hash_password(settings.admin_password)
             if admin.email in [f"{settings.admin_login}@local", f"{settings.admin_login}@local.test"]:
                 admin.email = admin_email
         db.commit()
@@ -409,15 +429,29 @@ def _serialize_node(node: NodeInfo) -> dict[str, str | int]:
     return item
 
 
+def _is_secure_request(request: Request) -> bool:
+    if request.url.scheme == "https":
+        return True
+    forwarded_proto = request.headers.get("x-forwarded-proto", "")
+    return forwarded_proto.lower() == "https"
+
+
 @app.post("/api/auth/login")
-def login(payload: LoginIn, response: Response) -> dict[str, str]:
+def login(payload: LoginIn, request: Request, response: Response) -> dict[str, str]:
     with SessionLocal() as db:
         user = db.query(User).filter(User.login == payload.login.strip()).first()
         if user is None or not verify_password(payload.password, user.password_hash):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid login or password")
 
     token = make_session_token(payload.login.strip())
-    response.set_cookie("dashboard_session", token, httponly=True, samesite="lax", secure=False, max_age=24 * 3600)
+    response.set_cookie(
+        "dashboard_session",
+        token,
+        httponly=True,
+        samesite="lax",
+        secure=_is_secure_request(request),
+        max_age=24 * 3600,
+    )
     return {"status": "ok"}
 
 
@@ -535,39 +569,17 @@ def _process_trigger_alerts(db: Session, node_id: str, metric: MetricIn) -> None
 
 
 def _extract_metric_value(metric: Metric, metric_name: str) -> float:
-    if metric_name == "cpu_percent":
-        return metric.cpu_percent
-    if metric_name == "ram_percent":
-        return metric.ram_percent
-    if metric_name == "swap_percent":
-        return metric.swap_percent
-    if metric_name == "uptime_seconds":
-        return metric.uptime_seconds
-    if metric_name == "disk_read_time_ms":
-        return metric.disk_read_time_ms
-    if metric_name == "disk_write_time_ms":
-        return metric.disk_write_time_ms
-    if metric_name == "zombie_processes":
-        return float(metric.zombie_processes)
-    raise ValueError(f"Unsupported metric name: {metric_name}")
+    extractor = METRIC_VALUE_EXTRACTORS.get(metric_name)
+    if extractor is None:
+        raise ValueError(f"Unsupported metric name: {metric_name}")
+    return extractor(metric)
 
 
 def _extract_metric_input_value(metric: MetricIn, metric_name: str) -> float:
-    if metric_name == "cpu_percent":
-        return metric.cpu_percent
-    if metric_name == "ram_percent":
-        return metric.ram_percent
-    if metric_name == "swap_percent":
-        return metric.swap_percent
-    if metric_name == "uptime_seconds":
-        return metric.uptime_seconds
-    if metric_name == "disk_read_time_ms":
-        return metric.disk_read_time_ms
-    if metric_name == "disk_write_time_ms":
-        return metric.disk_write_time_ms
-    if metric_name == "zombie_processes":
-        return float(metric.zombie_processes)
-    raise ValueError(f"Unsupported metric name: {metric_name}")
+    extractor = METRIC_VALUE_EXTRACTORS.get(metric_name)
+    if extractor is None:
+        raise ValueError(f"Unsupported metric name: {metric_name}")
+    return extractor(metric)
 
 
 @app.post("/api/metrics")
@@ -906,6 +918,17 @@ def rename_node(node_id: str, payload: NodeRenameIn) -> dict[str, str | int]:
         node.display_name = next_name
         db.commit()
         db.refresh(node)
+
+        top_payload = _latest_top_processes.pop(node_id, None)
+        if top_payload is not None:
+            top_payload["node_id"] = next_name
+            _latest_top_processes[next_name] = top_payload
+
+        filesystems_payload = _latest_filesystems.pop(node_id, None)
+        if filesystems_payload is not None:
+            filesystems_payload["node_id"] = next_name
+            _latest_filesystems[next_name] = filesystems_payload
+
         return {
             "node_id": node.display_name,
             "display_name": node.display_name,
@@ -925,6 +948,9 @@ def delete_node(node_id: str) -> dict[str, str]:
             raise HTTPException(status_code=404, detail="Node not found")
         db.delete(node)
         db.commit()
+
+    _latest_top_processes.pop(node_id, None)
+    _latest_filesystems.pop(node_id, None)
     return {"status": "ok"}
 
 
