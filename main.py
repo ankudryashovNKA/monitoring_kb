@@ -1702,7 +1702,7 @@ def dashboard() -> str:
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Monitoring KB MVP</title>
+    <title>Monitoring KB</title>
     <link
         rel="icon"
         type="image/svg+xml"
@@ -2149,7 +2149,7 @@ def dashboard() -> str:
         <aside id="sidebar" class="sidebar">
             <div class="brand">
                 <div class="brand-copy">
-                    <p class="brand-title">Monitoring KB MVP</p>
+                    <p class="brand-title">Monitoring KB</p>
                 </div>
             </div>
             <nav class="nav">
