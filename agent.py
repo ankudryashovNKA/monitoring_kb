@@ -10,6 +10,7 @@ from pathlib import Path
 import platform
 import socket
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -441,7 +442,30 @@ def run_local_script(base_dir: Path, script_id: str) -> tuple[int, str, str]:
         return 1, "", "Script path escapes scripts/ directory"
     if not candidate.exists() or not candidate.is_file():
         return 1, "", "Script not found in scripts/ directory"
-    completed = subprocess.run([str(candidate)], capture_output=True, text=True, check=False, cwd=str(base_dir))
+    extension = candidate.suffix.lower()
+    is_windows = platform.system() == "Windows"
+
+    if is_windows:
+        if extension == ".ps1":
+            command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(candidate)]
+        elif extension in {".bat", ".cmd"}:
+            command = ["cmd", "/c", str(candidate)]
+        elif extension == ".py":
+            command = [sys.executable, str(candidate)]
+        else:
+            return 1, "", f"Unsupported script extension on Windows: {extension or '(none)'}"
+    else:
+        if extension == ".sh":
+            command = ["bash", str(candidate)]
+        elif extension == ".py":
+            command = [sys.executable, str(candidate)]
+        else:
+            return 1, "", f"Unsupported script extension on Linux: {extension or '(none)'}"
+
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, check=False, cwd=str(base_dir))
+    except OSError as error:
+        return 1, "", str(error)
     return completed.returncode, completed.stdout[-200000:], completed.stderr[-200000:]
 
 
