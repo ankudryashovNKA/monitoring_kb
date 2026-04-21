@@ -1702,7 +1702,7 @@ def dashboard() -> str:
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Monitoring KB</title>
+    <title>Monitoring KB MVP</title>
     <link
         rel="icon"
         type="image/svg+xml"
@@ -1765,13 +1765,6 @@ def dashboard() -> str:
             z-index: 10;
         }
 
-        .sidebar.collapsed {
-            width: 0;
-            padding: 0;
-            border-right-color: transparent;
-            overflow: hidden;
-        }
-
         .brand {
             display: flex;
             align-items: flex-start;
@@ -1801,7 +1794,6 @@ def dashboard() -> str:
             font-family: "IBM Plex Mono", Menlo, monospace;
         }
 
-        .toggle-btn,
         .nav-btn,
         button,
         select,
@@ -1812,23 +1804,8 @@ def dashboard() -> str:
             font-family: inherit;
         }
 
-        .toggle-btn,
         .nav-btn,
         button { cursor: pointer; }
-
-        .toggle-btn,
-        .sidebar-unhide-btn {
-            width: 32px;
-            height: 32px;
-            border: 1px solid #6f6f6f;
-            background: #262626;
-            color: #f4f4f4;
-            font-size: 16px;
-            line-height: 1;
-        }
-
-        .toggle-btn:hover,
-        .sidebar-unhide-btn:hover { background: #393939; }
 
         .nav {
             display: flex;
@@ -1863,13 +1840,6 @@ def dashboard() -> str:
         .content {
             padding: 32px;
             background: var(--cds-background);
-        }
-
-        .sidebar-unhide-btn {
-            position: fixed;
-            top: 16px;
-            left: 16px;
-            z-index: 20;
         }
 
         .panel {
@@ -1955,7 +1925,6 @@ def dashboard() -> str:
         input:focus,
         textarea:focus,
         button:focus,
-        .toggle-btn:focus,
         .nav-btn:focus {
             outline: 2px solid var(--cds-focus);
             outline-offset: 2px;
@@ -2180,9 +2149,8 @@ def dashboard() -> str:
         <aside id="sidebar" class="sidebar">
             <div class="brand">
                 <div class="brand-copy">
-                    <p class="brand-title">Monitoring KB</p>
+                    <p class="brand-title">Monitoring KB MVP</p>
                 </div>
-                <button id="sidebar-toggle" class="toggle-btn" type="button" aria-label="Toggle menu">☰</button>
             </div>
             <nav class="nav">
                 <button class="nav-btn active" data-tab="latest" type="button"><span class="nav-label">Latest metrics</span></button>
@@ -2198,7 +2166,6 @@ def dashboard() -> str:
                 <button id="sign-out" class="nav-btn" type="button"><span class="nav-label">Sign out</span></button>
             </nav>
         </aside>
-        <button id="sidebar-unhide" class="sidebar-unhide-btn" type="button" aria-label="Show menu" hidden>☰</button>
         <main class="content">
             <section class="panel tab-panel" data-panel="latest">
                 <div class="page-header">
@@ -3677,19 +3644,6 @@ def dashboard() -> str:
                 setStatus('llm-status', error.message, true);
             }
         }
-
-        function setSidebarCollapsed(collapsed) {
-            document.getElementById('sidebar').classList.toggle('collapsed', collapsed);
-            document.getElementById('sidebar-unhide').hidden = !collapsed;
-        }
-
-        document.getElementById('sidebar-toggle').addEventListener('click', () => {
-            setSidebarCollapsed(true);
-        });
-
-        document.getElementById('sidebar-unhide').addEventListener('click', () => {
-            setSidebarCollapsed(false);
-        });
 
         document.querySelectorAll('.nav-btn').forEach((button) => {
             button.addEventListener('click', () => {
