@@ -217,7 +217,7 @@ class LoginIn(BaseModel):
     password: str = Field(..., min_length=1, max_length=256)
 
 
-app = FastAPI(title="Monitoring KB MVP")
+app = FastAPI(title="Monitoring KB")
 app.include_router(users_router)
 
 _kb_last_updated: datetime | None = None
@@ -1702,7 +1702,7 @@ def dashboard() -> str:
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Monitoring KB MVP</title>
+    <title>Monitoring KB</title>
     <link
         rel="icon"
         type="image/svg+xml"
@@ -2180,7 +2180,6 @@ def dashboard() -> str:
         <aside id="sidebar" class="sidebar">
             <div class="brand">
                 <div class="brand-copy">
-                    <p class="brand-kicker">Server control plane</p>
                     <p class="brand-title">Monitoring KB</p>
                 </div>
                 <button id="sidebar-toggle" class="toggle-btn" type="button" aria-label="Toggle menu">☰</button>
