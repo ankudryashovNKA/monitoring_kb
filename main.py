@@ -1923,12 +1923,16 @@ def dashboard() -> str:
 
         select:focus,
         input:focus,
-        textarea:focus,
-        button:focus,
-        .nav-btn:focus {
-            outline: 2px solid var(--cds-focus);
-            outline-offset: 2px;
+        textarea:focus {
+            outline: none;
             border-bottom-color: var(--cds-focus);
+        }
+
+        button:focus,
+        .nav-btn:focus,
+        .menu-btn:focus {
+            outline: none;
+            box-shadow: none;
         }
 
         textarea {
