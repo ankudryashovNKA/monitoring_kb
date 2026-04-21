@@ -1710,47 +1710,46 @@ def dashboard() -> str:
     />
     <style>
         :root {
-            color-scheme: light;
-            --bg: #f4f7fb;
-            --bg-gradient-start: #f8fbff;
-            --bg-gradient-end: #eef3fa;
-            --panel: #ffffff;
-            --panel-alt: #f8fbff;
-            --border: #dbe3ef;
-            --text: #1f2d3d;
-            --muted: #6f7f95;
-            --accent: #2f95e9;
-            --accent-soft: rgba(47, 149, 233, 0.18);
+            color-scheme: dark;
+            --bg: #171717;
+            --bg-elevated: #1d1d1d;
+            --bg-deep: #0f0f0f;
+            --surface: rgba(41, 41, 41, 0.84);
+            --surface-2: #1f1f1f;
+            --border: #2e2e2e;
+            --border-strong: #393939;
+            --text: #fafafa;
+            --muted: #898989;
+            --muted-2: #b4b4b4;
+            --accent: #3ecf8e;
+            --accent-link: #00c573;
             --danger: #cf4557;
-            --shadow: 0 6px 12px rgba(31, 45, 61, 0.06);
-            --sidebar-bg: #174a72;
-            --sidebar-bg-strong: #0f3b5f;
-            --sidebar-text: #d7e7f7;
-            --sidebar-muted: #9ebdd8;
-            --sidebar-active: #0f3e63;
+            --radius-sm: 6px;
+            --radius-md: 10px;
+            --radius-lg: 16px;
+            --radius-pill: 9999px;
         }
         * { box-sizing: border-box; }
         body {
             margin: 0;
-            font-family: Inter, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            background: linear-gradient(180deg, var(--bg-gradient-start) 0%, var(--bg-gradient-end) 100%);
+            font-family: "Inter", "Circular", "Helvetica Neue", Helvetica, Arial, sans-serif;
+            background: radial-gradient(circle at top right, #202020 0%, var(--bg) 45%, var(--bg-deep) 100%);
             color: var(--text);
         }
         .layout {
-            display: flex;
+            display: grid;
+            grid-template-columns: 260px 1fr;
             min-height: 100vh;
         }
         .sidebar {
-            width: 260px;
             position: sticky;
             top: 0;
             height: 100vh;
             overflow-y: auto;
-            background: linear-gradient(180deg, var(--sidebar-bg-strong) 0%, var(--sidebar-bg) 100%);
-            border-right: 1px solid rgba(170, 202, 230, 0.25);
-            padding: 1rem 0.65rem;
+            background: linear-gradient(180deg, #161616 0%, #111111 100%);
+            border-right: 1px solid var(--border);
+            padding: 1.25rem 0.85rem;
             transition: width 0.25s ease, padding 0.25s ease, border-color 0.25s ease;
-            box-shadow: 4px 0 10px rgba(8, 24, 39, 0.14);
             z-index: 10;
         }
         .sidebar.collapsed {
@@ -1763,67 +1762,68 @@ def dashboard() -> str:
             display: flex;
             align-items: center;
             justify-content: space-between;
-            gap: 0.5rem;
-            margin-bottom: 1.5rem;
+            gap: 0.65rem;
+            padding: 0.35rem 0.4rem 1rem;
+            margin-bottom: 1rem;
+            border-bottom: 1px solid #242424;
         }
         .brand-title {
-            font-size: 1.1rem;
-            font-weight: bold;
             margin: 0;
-            color: #f5fbff;
+            font-size: 1rem;
+            font-weight: 500;
+            color: var(--text);
+            letter-spacing: 0.01em;
         }
-        .sidebar.collapsed .brand-copy {
-            display: none;
+        .brand-kicker {
+            margin: 0 0 0.3rem;
+            color: var(--accent);
+            font-family: "Source Code Pro", "Menlo", monospace;
+            text-transform: uppercase;
+            letter-spacing: 1.2px;
+            font-size: 0.68rem;
         }
         .toggle-btn, .nav-btn, button, select, input, textarea {
-            border-radius: 0.35rem;
+            border-radius: var(--radius-sm);
             border: 1px solid var(--border);
-            background: #fff;
+            background: var(--bg-deep);
             color: var(--text);
         }
-        .toggle-btn, .nav-btn, button {
-            cursor: pointer;
-        }
+        .toggle-btn, .nav-btn, button { cursor: pointer; }
         .toggle-btn {
             width: 34px;
             height: 34px;
-            border-color: rgba(194, 219, 242, 0.4);
-            background: rgba(255, 255, 255, 0.08);
-            color: #dceeff;
+            background: #151515;
+            border-color: var(--border-strong);
         }
         .nav {
             display: flex;
             flex-direction: column;
-            gap: 0.35rem;
+            gap: 0.42rem;
         }
         .nav-btn {
             display: flex;
             align-items: center;
-            gap: 0.55rem;
             width: 100%;
-            padding: 0.48rem 0.58rem;
+            padding: 0.55rem 0.65rem;
             text-align: left;
-            transition: background 0.2s ease, border-color 0.2s ease;
-            border: 1px solid transparent;
+            transition: border-color 0.2s ease, background 0.2s ease;
             background: transparent;
-            color: var(--sidebar-text);
+            border-color: transparent;
+            color: var(--muted-2);
+            font-size: 0.88rem;
             font-weight: 500;
         }
         .nav-btn:hover {
-            border-color: rgba(178, 210, 235, 0.35);
-            background: rgba(15, 62, 99, 0.72);
-            transform: none;
+            border-color: var(--border);
+            background: #181818;
+            color: var(--text);
         }
         .nav-btn.active {
-            background: var(--sidebar-active);
-            border-color: rgba(176, 209, 235, 0.35);
-            color: #f4fbff;
-        }
-        .nav-label {
-            white-space: nowrap;
+            border-color: rgba(62, 207, 142, 0.3);
+            background: rgba(62, 207, 142, 0.08);
+            color: var(--text);
         }
         .content {
-            flex: 1;
             padding: 2rem;
         }
         .sidebar-unhide-btn {
@@ -1833,23 +1833,24 @@ def dashboard() -> str:
             z-index: 20;
             width: 34px;
             height: 34px;
-            border-radius: 0.35rem;
-            border: 1px solid #c5d8ee;
-            background: #ffffff;
-            box-shadow: 0 3px 8px rgba(31, 45, 61, 0.14);
+            border-radius: var(--radius-sm);
+            border: 1px solid var(--border-strong);
+            background: var(--bg-deep);
+            color: var(--text);
             cursor: pointer;
         }
         .panel {
-            background: var(--panel);
+            background: var(--surface);
             border: 1px solid var(--border);
-            border-radius: 0.9rem;
+            border-radius: var(--radius-lg);
             padding: 1.5rem;
-            box-shadow: var(--shadow);
+            backdrop-filter: blur(8px);
         }
-        .page-header {
-            margin-bottom: 1.25rem;
-        }
+        .page-header { margin-bottom: 1.25rem; }
         h1, h2, h3, p { margin-top: 0; }
+        h1 { font-size: 2rem; line-height: 1.05; font-weight: 400; }
+        h2 { font-size: 1.55rem; line-height: 1.2; font-weight: 400; }
+        h3 { font-size: 1.1rem; line-height: 1.35; font-weight: 400; }
         .meta { color: var(--muted); }
         .toolbar {
             display: flex;
@@ -1864,8 +1865,10 @@ def dashboard() -> str:
             gap: 0.35rem;
         }
         select, input, textarea {
-            min-height: 32px;
-            padding: 0.3rem 0.5rem;
+            min-height: 34px;
+            padding: 0.34rem 0.55rem;
+            background: var(--surface-2);
+            border-color: var(--border-strong);
         }
         textarea {
             width: 100%;
@@ -1878,28 +1881,21 @@ def dashboard() -> str:
             min-height: 280px;
             max-height: 280px;
             overflow: auto;
-            border: 1px solid var(--border);
-            border-radius: 0.35rem;
-            background: #ffffff;
-            padding: 0.6rem 0.7rem;
+            border: 1px solid var(--border-strong);
+            border-radius: var(--radius-sm);
+            background: #151515;
+            padding: 0.7rem;
             line-height: 1.45;
         }
         #llm-output pre {
             overflow: auto;
-            background: #f3f7fd;
-            border: 1px solid #dce7f5;
-            border-radius: 0.35rem;
+            background: #111111;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
             padding: 0.6rem;
         }
         #llm-output code {
             font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-        }
-        #llm-output p {
-            margin: 0.45rem 0;
-        }
-        #llm-output ul {
-            margin: 0.45rem 0 0.45rem 1.1rem;
-            padding: 0;
         }
         .llm-grid {
             display: grid;
@@ -1907,45 +1903,48 @@ def dashboard() -> str:
             gap: 1rem;
         }
         button {
-            min-height: 32px;
-            padding: 0.28rem 0.62rem;
-            background: var(--accent-soft);
-            border-color: var(--accent);
-            font-weight: 600;
-            transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
+            min-height: 34px;
+            padding: 0.35rem 0.85rem;
+            border-radius: var(--radius-pill);
+            border-color: var(--border-strong);
+            background: #111111;
+            color: var(--text);
+            font-weight: 500;
+            transition: border-color 0.2s ease, background 0.2s ease;
         }
         button:hover {
-            background: rgba(1, 115, 178, 0.16);
-            border-color: #016198;
-            transform: translateY(-1px);
+            border-color: rgba(62, 207, 142, 0.3);
+            background: rgba(62, 207, 142, 0.08);
         }
         button.danger {
-            border-color: var(--danger);
-            background: rgba(207, 69, 87, 0.1);
+            border-color: rgba(207, 69, 87, 0.5);
+            background: rgba(207, 69, 87, 0.12);
         }
         button.secondary {
-            background: transparent;
-            border-color: var(--border);
+            border-radius: var(--radius-sm);
+            background: #1a1a1a;
         }
         table {
             width: 100%;
             border-collapse: collapse;
             margin-top: 1rem;
-            background: #fff;
-            border-radius: 0.8rem;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            overflow: hidden;
         }
         th, td {
-            padding: 0.85rem;
-            border-bottom: 1px solid var(--border);
+            padding: 0.78rem;
+            border-bottom: 1px solid #262626;
             text-align: left;
             vertical-align: top;
+            font-size: 0.92rem;
         }
         th {
-            background: #f2f7fc;
+            background: #141414;
+            color: var(--muted-2);
+            font-weight: 500;
         }
-        tr:hover td {
-            background: #fbfdff;
-        }
+        tr:hover td { background: #1a1a1a; }
         tr:last-child td { border-bottom: none; }
         .grid {
             display: grid;
@@ -1954,23 +1953,25 @@ def dashboard() -> str:
             margin-bottom: 1rem;
         }
         .stat {
-            background: var(--panel-alt);
+            background: #161616;
             border: 1px solid var(--border);
-            border-radius: 0.8rem;
+            border-radius: var(--radius-md);
             padding: 1rem;
         }
-        .stat-label { color: var(--muted); font-size: 0.9rem; }
-        .stat-value { font-size: 1.5rem; font-weight: bold; margin-top: 0.35rem; }
-        .menu-cell {
-            position: relative;
-            text-align: right;
-            width: 64px;
+        .stat-label {
+            color: var(--muted);
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 1.1px;
+            font-family: "Source Code Pro", "Menlo", monospace;
         }
-        .menu-btn {
-            min-height: 26px;
-            padding: 0.15rem 0.32rem;
-            line-height: 1;
+        .stat-value {
+            font-size: 1.4rem;
+            font-weight: 400;
+            margin-top: 0.35rem;
         }
+        .menu-cell { position: relative; text-align: right; width: 64px; }
+        .menu-btn { min-height: 26px; padding: 0.15rem 0.45rem; line-height: 1; border-radius: var(--radius-sm); }
         .menu-popover {
             position: fixed;
             z-index: 9999;
@@ -1978,23 +1979,19 @@ def dashboard() -> str:
             flex-direction: column;
             gap: 0.35rem;
             padding: 0.5rem;
-            border: 1px solid var(--border);
-            border-radius: 0.55rem;
-            background: #fff;
+            border: 1px solid var(--border-strong);
+            border-radius: var(--radius-sm);
+            background: #131313;
             min-width: 146px;
-            box-shadow: 0 6px 14px rgba(31, 45, 61, 0.1);
         }
-        .menu-popover button { width: 100%; text-align: left; }
+        .menu-popover button { width: 100%; text-align: left; border-radius: var(--radius-sm); }
         #global-menu[hidden] { display: none !important; }
-        .empty, .status {
-            color: var(--muted);
-            padding: 1rem 0;
-        }
-        .error { color: var(--danger); }
+        .empty, .status { color: var(--muted); padding: 1rem 0; }
+        .error { color: #ff8393; }
         .modal-backdrop {
             position: fixed;
             inset: 0;
-            background: rgba(18, 33, 53, 0.45);
+            background: rgba(0, 0, 0, 0.6);
             display: flex;
             align-items: center;
             justify-content: center;
@@ -2003,13 +2000,11 @@ def dashboard() -> str:
         }
         .modal {
             width: min(560px, 100%);
-            background: #fff;
-            border: 1px solid var(--border);
-            border-radius: 0.8rem;
+            background: #151515;
+            border: 1px solid var(--border-strong);
+            border-radius: 12px;
             padding: 1rem;
-            box-shadow: var(--shadow);
         }
-        .modal h3 { margin-bottom: 0.75rem; }
         .credentials-grid {
             display: grid;
             grid-template-columns: 1fr auto;
@@ -2023,15 +2018,12 @@ def dashboard() -> str:
             justify-content: flex-end;
             margin-top: 0.75rem;
         }
-        .modal-form-grid {
-            display: grid;
-            gap: 0.75rem;
-            margin-top: 0.5rem;
-        }
+        .modal-form-grid { display: grid; gap: 0.75rem; margin-top: 0.5rem; }
         [hidden] { display: none !important; }
         @media (max-width: 900px) {
+            .layout { grid-template-columns: 1fr; }
             .content { padding: 1rem; }
-            .sidebar { position: fixed; }
+            .sidebar { position: fixed; width: 260px; }
             .llm-grid { grid-template-columns: 1fr; }
         }
     </style>
@@ -2041,6 +2033,7 @@ def dashboard() -> str:
         <aside id="sidebar" class="sidebar">
             <div class="brand">
                 <div class="brand-copy">
+                    <p class="brand-kicker">Server control plane</p>
                     <p class="brand-title">Monitoring KB</p>
                 </div>
                 <button id="sidebar-toggle" class="toggle-btn" type="button" aria-label="Toggle menu">☰</button>
