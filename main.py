@@ -8,6 +8,7 @@ from email.message import EmailMessage
 import json
 import logging
 import operator
+import re
 import smtplib
 from typing import Deque
 
@@ -1514,13 +1515,22 @@ async def get_knowledge_base(node_id: str = Query(..., min_length=1, max_length=
     }
 
 
+def _sanitize_log_for_llm(message: str) -> str:
+    sanitized = message.replace("\\n", " ").replace("\\r", " ").replace("\\t", " ")
+    sanitized = sanitized.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    sanitized = re.sub(r"[\x00-\x1f\x7f]", " ", sanitized)
+    sanitized = re.sub(r"\s+", " ", sanitized)
+    return sanitized.strip()
+
+
 def _collect_logs_for_llm(db: Session, node_id: str, per_severity_limit: int = 20) -> list[dict[str, str]]:
     severities = LOG_SEVERITY_LEVELS[2:]
+    cutoff = _utcnow() - timedelta(hours=1)
     items: list[dict[str, str]] = []
     for severity in severities:
         rows = (
             db.query(LogEntry)
-            .filter(LogEntry.node_id == node_id, LogEntry.severity == severity)
+            .filter(LogEntry.node_id == node_id, LogEntry.severity == severity, LogEntry.captured_at >= cutoff)
             .order_by(LogEntry.captured_at.desc(), LogEntry.id.desc())
             .limit(per_severity_limit)
             .all()
@@ -1530,7 +1540,7 @@ def _collect_logs_for_llm(db: Session, node_id: str, per_severity_limit: int = 2
                 {
                     "source": row.source,
                     "severity": row.severity,
-                    "message": row.message,
+                    "message": _sanitize_log_for_llm(row.message),
                     "captured_at": row.captured_at.isoformat(),
                 }
             )
