@@ -8,6 +8,7 @@ from email.message import EmailMessage
 import json
 import logging
 import operator
+import os
 import re
 import smtplib
 from typing import Deque
@@ -56,8 +57,8 @@ MAX_STORED_LOGS_PER_NODE_AND_SEVERITY = 2000
 LOG_SEVERITY_LEVELS = ("DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY")
 
 logger = logging.getLogger(__name__)
-OLLAMA_MODEL = "gemma4:e4b"
-OLLAMA_HOST = "http://localhost:11434"
+OLLAMA_MODEL = "gpt-oss:120b-cloud"
+OLLAMA_HOST = "https://ollama.com"
 
 METRIC_VALUE_EXTRACTORS = {
     "cpu_percent": lambda metric: float(metric.cpu_percent),
@@ -1566,7 +1567,9 @@ def _build_node_analysis_prompt(payload: dict[str, object]) -> str:
 
 
 def _stream_ollama_generate(prompt: str) -> object:
-    client = ollama.Client(host=OLLAMA_HOST)
+    api_key = os.getenv("OLLAMA_API_KEY")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+    client = ollama.Client(host=OLLAMA_HOST, headers=headers)
     return client.generate(
         model=OLLAMA_MODEL,
         prompt=prompt,

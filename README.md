@@ -42,7 +42,7 @@
 5. **LLM-интеграция через Ollama**
    - endpoint `POST /api/llm/analyze-node` собирает контекст узла (метрики, триггеры, логи, KB) и стримит ответ;
    - endpoint `POST /api/llm/generate` принимает произвольный prompt и возвращает полный ответ;
-   - модель жёстко задана как `gemma4:e4b`, вызов идёт через `import ollama` (локальный host `http://localhost:11434`).
+   - модель жёстко задана как `gpt-oss:120b-cloud`, вызов идёт через `import ollama` (cloud host `https://ollama.com`) с `OLLAMA_API_KEY`.
 
 ---
 
@@ -73,7 +73,7 @@
 - Python **3.10+**
 - Linux/macOS/Windows
 - Доступ к PostgreSQL (Supabase) для production-сценария
-- (для раздела LLM) установленный Ollama на сервере
+- (для раздела LLM) переменная окружения `OLLAMA_API_KEY` для cloud Ollama
 
 ### Установка зависимостей
 
@@ -384,7 +384,7 @@ API:
 - backend вызывает `POST /api/llm/analyze-node`, формирует payload из узла, последней метрики, активных триггеров, логов и KB-результатов, затем стримит ответ через Python SDK `ollama`;
 - ответ от Ollama стримится в UI по мере генерации;
 - для ручных/внешних интеграций остаётся endpoint `POST /api/llm/generate` (один prompt → один склеенный ответ);
-- модель по умолчанию: **`gemma4:e4b`**.
+- модель по умолчанию: **`gpt-oss:120b-cloud`**.
 
 ---
 
@@ -412,35 +412,17 @@ API:
 
 ---
 
-## 11) Важно: для раздела LLM нужна модель Ollama `gemma4:e4b`
+## 11) Важно: для раздела LLM используется cloud Ollama модель `gpt-oss:120b-cloud`
 
-На сервере, где работает FastAPI, должен быть доступен локальный Ollama API на `localhost:11434`.
+На сервере, где работает FastAPI, должен быть доступ в интернет к `https://ollama.com` и задан `OLLAMA_API_KEY`.
 
-Минимальные шаги:
-
-1. Установить Ollama;
-2. запустить сервис Ollama;
-3. скачать модель:
+Минимальная проверка:
 
 ```bash
-ollama pull gemma4:e4b
+OLLAMA_API_KEY=... python -c "import os, ollama; print(next(iter(ollama.Client(host='https://ollama.com', headers={'Authorization': 'Bearer ' + os.environ['OLLAMA_API_KEY']}).generate(model='gpt-oss:120b-cloud', prompt='hello', stream=True)))['response'])"
 ```
 
-4. Проверить, что модель доступна:
-
-```bash
-ollama list
-```
-
-5. Проверить генерацию напрямую:
-
-```bash
-curl -X POST http://localhost:11434/api/generate \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"gemma4:e4b","prompt":"Hello","stream":false}'
-```
-
-Если Ollama не запущен или модель не установлена, LLM endpoints (`/api/llm/analyze-node`, `/api/llm/generate`) вернут `502 LLM service error`.
+Если API ключ не задан или недоступен cloud endpoint, LLM endpoints (`/api/llm/analyze-node`, `/api/llm/generate`) вернут `502 LLM service error`.
 
 ---
 
@@ -515,9 +497,9 @@ curl -X POST http://localhost:11434/api/generate \
 
 Проверьте:
 
-- запущен ли Ollama на том же сервере;
-- что `ollama list` содержит `gemma4:e4b`;
-- что локальный Ollama доступен на `http://localhost:11434` и отвечает через Python SDK `ollama`.
+- задана ли переменная окружения `OLLAMA_API_KEY`;
+- есть ли доступ к `https://ollama.com` с сервера;
+- что cloud Ollama отвечает через Python SDK `ollama`.
 
 ---
 
@@ -528,4 +510,3 @@ curl -X POST http://localhost:11434/api/generate \
 - внедрить Alembic миграции;
 - добавить retry/backoff и метрики для внешних интеграций (KB, Ollama);
 - централизованно логировать ошибки и аудит действий с агентами.
-
