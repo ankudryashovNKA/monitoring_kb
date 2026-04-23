@@ -13,6 +13,7 @@ from typing import Deque
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, status
 import httpx
+import ollama
 
 from app.api.users import router as users_router
 from app.config import settings
@@ -54,6 +55,8 @@ MAX_STORED_LOGS_PER_NODE_AND_SEVERITY = 2000
 LOG_SEVERITY_LEVELS = ("DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY")
 
 logger = logging.getLogger(__name__)
+OLLAMA_MODEL = "gemma4:e4b"
+OLLAMA_HOST = "http://localhost:11434"
 
 METRIC_VALUE_EXTRACTORS = {
     "cpu_percent": lambda metric: float(metric.cpu_percent),
@@ -1552,6 +1555,16 @@ def _build_node_analysis_prompt(payload: dict[str, object]) -> str:
     )
 
 
+def _stream_ollama_generate(prompt: str) -> object:
+    client = ollama.Client(host=OLLAMA_HOST)
+    return client.generate(
+        model=OLLAMA_MODEL,
+        prompt=prompt,
+        keep_alive="30m",
+        stream=True,
+    )
+
+
 @app.post("/api/llm/analyze-node")
 async def analyze_node_with_llm(payload: LLMNodeAnalysisIn) -> StreamingResponse:
     with SessionLocal() as db:
@@ -1632,31 +1645,13 @@ async def analyze_node_with_llm(payload: LLMNodeAnalysisIn) -> StreamingResponse
     }
 
     prompt = _build_node_analysis_prompt(analysis_payload)
-    async def stream_llm_response() -> object:
+    def stream_llm_response() -> object:
         try:
-            async with httpx.AsyncClient(timeout=300.0) as client:
-                async with client.stream(
-                    "POST",
-                    "http://localhost:11434/api/generate",
-                    json={
-                        "model": "gemma4:e4b",
-                        "prompt": prompt,
-                        "keep_alive": "30m",
-                        "stream": True,
-                    },
-                ) as response:
-                    response.raise_for_status()
-                    async for line in response.aiter_lines():
-                        if not line:
-                            continue
-                        try:
-                            data = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        chunk = str(data.get("response", ""))
-                        if chunk:
-                            yield chunk
-        except httpx.HTTPError as exc:
+            for data in _stream_ollama_generate(prompt):
+                chunk = str(data.get("response", ""))
+                if chunk:
+                    yield chunk
+        except Exception as exc:
             raise HTTPException(status_code=502, detail=f"LLM service error: {exc}") from exc
 
     return StreamingResponse(stream_llm_response(), media_type="text/plain; charset=utf-8")
@@ -1666,29 +1661,11 @@ async def analyze_node_with_llm(payload: LLMNodeAnalysisIn) -> StreamingResponse
 async def generate_llm(payload: LLMGenerateIn) -> dict[str, str]:
     chunks: list[str] = []
     try:
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            async with client.stream(
-                "POST",
-                "http://localhost:11434/api/generate",
-                json={
-                    "model": "gemma4:e4b",
-                    "prompt": payload.prompt,
-                    "keep_alive": "30m",
-                    "stream": True,
-                },
-            ) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    chunk = str(data.get("response", ""))
-                    if chunk:
-                        chunks.append(chunk)
-    except httpx.HTTPError as exc:
+        for data in _stream_ollama_generate(payload.prompt):
+            chunk = str(data.get("response", ""))
+            if chunk:
+                chunks.append(chunk)
+    except Exception as exc:
         raise HTTPException(status_code=502, detail=f"LLM service error: {exc}") from exc
 
     return {"response": "".join(chunks)}
