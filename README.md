@@ -510,3 +510,59 @@ OLLAMA_API_KEY=... python -c "import os, ollama; print(next(iter(ollama.Client(h
 - внедрить Alembic миграции;
 - добавить retry/backoff и метрики для внешних интеграций (KB, Ollama);
 - централизованно логировать ошибки и аудит действий с агентами.
+
+---
+
+## LLM-assisted remediation (MVP)
+
+Добавлен безопасный remediation flow по принципу **LLM recommends, backend validates, agent executes**:
+
+1. LLM анализирует контекст узла (метрики, логи, активные триггеры, recent commands, available scripts).
+2. LLM возвращает только рекомендации `script_id` из `available_scripts`.
+3. Backend валидирует рекомендации и сохраняет их как `proposed`.
+4. Пользователь в LLM-вкладке нажимает approve (dry-run или run).
+5. Backend повторно валидирует script hash/OS/args/risk и только после этого создаёт `AgentCommand`.
+6. Скрипт запускается только агентом на удалённом узле.
+
+### Важно по безопасности
+
+- LLM **не получает shell** и не может запускать команды напрямую.
+- LLM **не может предлагать произвольные shell-команды**, только `script_id` из списка доступных скриптов.
+- Для `medium/high` risk требуется явное подтверждение пользователя.
+- Если скрипт поддерживает dry-run, UI предлагает сначала dry-run.
+- Аргументы передаются агенту через `MONITORING_KB_ARGS_JSON` (JSON), без shell-строки.
+- Исполнение идёт через `subprocess` c `list[str]` и без `shell=True`.
+
+### Script manifest format
+
+Для скрипта рядом можно положить manifest JSON:
+
+- `<filename>.json` (например `linux.cleanup_old_logs.sh.json`)
+- fallback: `<stem>.json` (например `linux.cleanup_old_logs.json`)
+
+Поля:
+
+- `title`, `description`
+- `os_family`: `linux|windows|any`
+- `tags`: array
+- `risk_level`: `low|medium|high`
+- `requires_confirmation`: bool
+- `dry_run_supported`: bool
+- `args_schema`: минимальная JSON-схема object
+
+Если manifest невалидный, скрипт публикуется как `enabled=false` с `manifest_error`.
+
+### Новые endpoints
+
+- `POST /api/llm/recommend-scripts`
+- `GET /api/llm/script-recommendations?node_id=...`
+- `POST /api/llm/script-recommendations/{id}/approve`
+- `POST /api/llm/script-recommendations/{id}/reject`
+
+### Примерные out-of-the-box scripts
+
+- `scripts/linux.diagnose_disk_usage.sh` (low risk, диагностика)
+- `scripts/linux.cleanup_old_logs.sh` (medium risk, dry-run by default)
+- `scripts/windows.diagnose_disk_usage.ps1` (low risk, диагностика)
+- `scripts/windows.cleanup_temp.ps1` (medium risk, dry-run by default)
+

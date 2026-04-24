@@ -1,0 +1,16 @@
+{
+  "title": "Windows temp cleanup",
+  "description": "Cleans temporary directories only. Supports dry-run.",
+  "os_family": "windows",
+  "tags": ["cleanup", "temp"],
+  "risk_level": "medium",
+  "requires_confirmation": true,
+  "dry_run_supported": true,
+  "args_schema": {
+    "type": "object",
+    "properties": {
+      "dry_run": {"type": "boolean", "default": true}
+    },
+    "required": ["dry_run"]
+  }
+}

@@ -5,6 +5,7 @@ import contextlib
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+import hashlib
 import json
 import logging
 import operator
@@ -32,6 +33,7 @@ import app.models.user  # noqa: F401
 import app.models.agent  # noqa: F401
 import app.models.filesystem_sample  # noqa: F401
 import app.models.process_sample  # noqa: F401
+import app.models.llm_script_recommendation  # noqa: F401
 from app.security.agent_auth import (
     register_agent,
     rotate_agent_secret,
@@ -51,10 +53,11 @@ from app.models.agent_command import AgentCommand
 from app.models.user import User
 from app.models.filesystem_sample import FilesystemSample
 from app.models.process_sample import ProcessSample
+from app.models.llm_script_recommendation import LlmScriptRecommendation
 from app.security.user_auth import decode_session_token, hash_password, make_session_token, verify_password
 from sqlalchemy import inspect, text
 from app.services.llm_context import build_node_analysis_context
-from app.services.llm_prompt import build_node_analysis_prompt
+from app.services.llm_prompt import build_node_analysis_prompt, build_script_recommendation_prompt
 
 METRICS_RETENTION_HOURS = int(os.getenv("METRICS_RETENTION_HOURS", "168"))
 FILESYSTEM_RETENTION_HOURS = int(os.getenv("FILESYSTEM_RETENTION_HOURS", "168"))
@@ -222,6 +225,17 @@ class LogsIn(BaseModel):
 class AgentScriptEntryIn(BaseModel):
     script_id: str = Field(..., min_length=1, max_length=200)
     script_path: str = Field(..., min_length=1, max_length=500)
+    content_hash: str = Field(default="", max_length=128)
+    os_family: str = Field(default="any", pattern="^(linux|windows|any)$")
+    title: str = Field(default="", max_length=255)
+    description: str = Field(default="", max_length=5000)
+    tags: list[str] = Field(default_factory=list, max_length=100)
+    risk_level: str = Field(default="medium", pattern="^(low|medium|high)$")
+    requires_confirmation: bool = True
+    dry_run_supported: bool = False
+    args_schema: dict[str, object] = Field(default_factory=dict)
+    enabled: bool = True
+    manifest_error: str | None = Field(default=None, max_length=5000)
 
 
 class AgentScriptsIn(BaseModel):
@@ -236,6 +250,20 @@ class AgentCommandResultIn(BaseModel):
     exit_code: int | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+
+
+class LLMScriptRecommendIn(BaseModel):
+    node_id: str = Field(..., min_length=1, max_length=100)
+    window_minutes: int = Field(default=60, ge=10, le=1440)
+
+
+class LLMRecommendationApproveIn(BaseModel):
+    confirm: bool = False
+    dry_run: bool = True
+
+
+class LLMRecommendationRejectIn(BaseModel):
+    reason: str | None = Field(default=None, max_length=2000)
 
 
 class TriggerCreateIn(BaseModel):
@@ -340,6 +368,7 @@ def init_db() -> None:
     _migrate_triggers_table()
     _migrate_agent_scripts_table()
     _migrate_agent_commands_table()
+    _migrate_llm_script_recommendations_table()
     _migrate_metrics_table()
     _migrate_log_entries_table()
     _migrate_filesystem_samples_table()
@@ -510,7 +539,45 @@ def _migrate_agent_scripts_table() -> None:
     if "agent_scripts" not in inspector.get_table_names():
         return
     dialect_name = engine.dialect.name
+    bool_default_true = "TRUE" if dialect_name == "postgresql" else "1"
+    bool_default_false = "FALSE" if dialect_name == "postgresql" else "0"
+    existing_columns = {column["name"] for column in inspector.get_columns("agent_scripts")}
+    statements: list[str] = []
+    if "content_hash" not in existing_columns:
+        statements.append("ALTER TABLE agent_scripts ADD COLUMN content_hash VARCHAR(128) DEFAULT '' NOT NULL")
+    if "os_family" not in existing_columns:
+        statements.append("ALTER TABLE agent_scripts ADD COLUMN os_family VARCHAR(32) DEFAULT 'any' NOT NULL")
+    if "title" not in existing_columns:
+        statements.append("ALTER TABLE agent_scripts ADD COLUMN title VARCHAR(255) DEFAULT '' NOT NULL")
+    if "description" not in existing_columns:
+        statements.append("ALTER TABLE agent_scripts ADD COLUMN description TEXT DEFAULT '' NOT NULL")
+    if "tags_json" not in existing_columns:
+        statements.append("ALTER TABLE agent_scripts ADD COLUMN tags_json TEXT DEFAULT '[]' NOT NULL")
+    if "risk_level" not in existing_columns:
+        statements.append("ALTER TABLE agent_scripts ADD COLUMN risk_level VARCHAR(16) DEFAULT 'medium' NOT NULL")
+    if "requires_confirmation" not in existing_columns:
+        statements.append(f"ALTER TABLE agent_scripts ADD COLUMN requires_confirmation BOOLEAN DEFAULT {bool_default_true} NOT NULL")
+    if "dry_run_supported" not in existing_columns:
+        statements.append(f"ALTER TABLE agent_scripts ADD COLUMN dry_run_supported BOOLEAN DEFAULT {bool_default_false} NOT NULL")
+    if "args_schema_json" not in existing_columns:
+        statements.append("ALTER TABLE agent_scripts ADD COLUMN args_schema_json TEXT DEFAULT '{}' NOT NULL")
+    if "enabled" not in existing_columns:
+        statements.append(f"ALTER TABLE agent_scripts ADD COLUMN enabled BOOLEAN DEFAULT {bool_default_true} NOT NULL")
+    if "manifest_error" not in existing_columns:
+        statements.append("ALTER TABLE agent_scripts ADD COLUMN manifest_error TEXT")
     with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+        connection.execute(text("UPDATE agent_scripts SET content_hash = '' WHERE content_hash IS NULL"))
+        connection.execute(text("UPDATE agent_scripts SET os_family = 'any' WHERE os_family IS NULL OR os_family = ''"))
+        connection.execute(text("UPDATE agent_scripts SET title = script_id WHERE title IS NULL OR title = ''"))
+        connection.execute(text("UPDATE agent_scripts SET description = '' WHERE description IS NULL"))
+        connection.execute(text("UPDATE agent_scripts SET tags_json = '[]' WHERE tags_json IS NULL OR tags_json = ''"))
+        connection.execute(text("UPDATE agent_scripts SET risk_level = 'medium' WHERE risk_level IS NULL OR risk_level = ''"))
+        connection.execute(text("UPDATE agent_scripts SET requires_confirmation = 1 WHERE requires_confirmation IS NULL"))
+        connection.execute(text("UPDATE agent_scripts SET dry_run_supported = 0 WHERE dry_run_supported IS NULL"))
+        connection.execute(text("UPDATE agent_scripts SET args_schema_json = '{}' WHERE args_schema_json IS NULL OR args_schema_json = ''"))
+        connection.execute(text("UPDATE agent_scripts SET enabled = 1 WHERE enabled IS NULL"))
         statement = "CREATE UNIQUE INDEX IF NOT EXISTS ix_agent_scripts_node_script ON agent_scripts (node_id, script_id)"
         if dialect_name == "postgresql":
             connection.execute(text(statement))
@@ -524,10 +591,79 @@ def _migrate_agent_commands_table() -> None:
     if "agent_commands" not in inspector.get_table_names():
         return
     dialect_name = engine.dialect.name
+    bool_default_false = "FALSE" if dialect_name == "postgresql" else "0"
+    existing_columns = {column["name"] for column in inspector.get_columns("agent_commands")}
+    statements: list[str] = []
+    if "source" not in existing_columns:
+        statements.append("ALTER TABLE agent_commands ADD COLUMN source VARCHAR(32) DEFAULT 'trigger' NOT NULL")
+    if "recommendation_id" not in existing_columns:
+        statements.append("ALTER TABLE agent_commands ADD COLUMN recommendation_id INTEGER")
+    if "args_json" not in existing_columns:
+        statements.append("ALTER TABLE agent_commands ADD COLUMN args_json TEXT DEFAULT '{}' NOT NULL")
+    if "dry_run" not in existing_columns:
+        statements.append(f"ALTER TABLE agent_commands ADD COLUMN dry_run BOOLEAN DEFAULT {bool_default_false} NOT NULL")
+    if "requested_by_user_id" not in existing_columns:
+        statements.append("ALTER TABLE agent_commands ADD COLUMN requested_by_user_id INTEGER")
+    if "risk_level_snapshot" not in existing_columns:
+        statements.append("ALTER TABLE agent_commands ADD COLUMN risk_level_snapshot VARCHAR(16) DEFAULT 'medium' NOT NULL")
     with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+        connection.execute(text("UPDATE agent_commands SET source = 'trigger' WHERE source IS NULL OR source = ''"))
+        connection.execute(text("UPDATE agent_commands SET args_json = '{}' WHERE args_json IS NULL OR args_json = ''"))
+        connection.execute(text("UPDATE agent_commands SET dry_run = 0 WHERE dry_run IS NULL"))
+        connection.execute(text("UPDATE agent_commands SET risk_level_snapshot = 'medium' WHERE risk_level_snapshot IS NULL OR risk_level_snapshot = ''"))
         for statement in (
             "CREATE INDEX IF NOT EXISTS ix_agent_commands_agent_status_created ON agent_commands (agent_id, status, created_at)",
             "CREATE INDEX IF NOT EXISTS ix_agent_commands_trigger_status ON agent_commands (trigger_id, status)",
+            "CREATE INDEX IF NOT EXISTS ix_agent_commands_node_script_status_created ON agent_commands (node_id, script_id, status, created_at)",
+        ):
+            if dialect_name == "postgresql":
+                connection.execute(text(statement))
+            else:
+                with contextlib.suppress(Exception):
+                    connection.execute(text(statement))
+
+
+def _migrate_llm_script_recommendations_table() -> None:
+    inspector = inspect(engine)
+    if "llm_script_recommendations" not in inspector.get_table_names():
+        return
+    dialect_name = engine.dialect.name
+    bool_default_true = "TRUE" if dialect_name == "postgresql" else "1"
+    bool_default_false = "FALSE" if dialect_name == "postgresql" else "0"
+    existing_columns = {column["name"] for column in inspector.get_columns("llm_script_recommendations")}
+    statements: list[str] = []
+    desired_columns = [
+        ("node_id", "VARCHAR(100)"),
+        ("agent_id", "VARCHAR(64)"),
+        ("script_id", "VARCHAR(200)"),
+        ("script_content_hash", "VARCHAR(128) DEFAULT '' NOT NULL"),
+        ("args_json", "TEXT DEFAULT '{}' NOT NULL"),
+        ("summary", "TEXT DEFAULT '' NOT NULL"),
+        ("reason", "TEXT DEFAULT '' NOT NULL"),
+        ("evidence_json", "TEXT DEFAULT '[]' NOT NULL"),
+        ("confidence", "FLOAT DEFAULT 0.0 NOT NULL"),
+        ("risk_level", "VARCHAR(16) DEFAULT 'medium' NOT NULL"),
+        ("requires_confirmation", f"BOOLEAN DEFAULT {bool_default_true} NOT NULL"),
+        ("dry_run_first", f"BOOLEAN DEFAULT {bool_default_false} NOT NULL"),
+        ("status", "VARCHAR(32) DEFAULT 'proposed' NOT NULL"),
+        ("model_name", "VARCHAR(128) DEFAULT '' NOT NULL"),
+        ("prompt_hash", "VARCHAR(128) DEFAULT '' NOT NULL"),
+        ("approved_at", "TIMESTAMP"),
+        ("rejected_at", "TIMESTAMP"),
+        ("executed_command_id", "INTEGER"),
+        ("error_message", "TEXT"),
+    ]
+    for name, ddl in desired_columns:
+        if name not in existing_columns:
+            statements.append(f"ALTER TABLE llm_script_recommendations ADD COLUMN {name} {ddl}")
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+        for statement in (
+            "CREATE INDEX IF NOT EXISTS ix_llm_recommendations_node_status_created ON llm_script_recommendations (node_id, status, created_at)",
+            "CREATE INDEX IF NOT EXISTS ix_llm_recommendations_node_created ON llm_script_recommendations (node_id, created_at)",
         ):
             if dialect_name == "postgresql":
                 connection.execute(text(statement))
@@ -699,8 +835,31 @@ def _serialize_trigger(
     return payload
 
 
-def _serialize_agent_script(script: AgentScript) -> dict[str, str]:
-    return {"script_id": script.script_id, "script_path": script.script_path}
+def _serialize_agent_script(script: AgentScript) -> dict[str, object]:
+    try:
+        tags = json.loads(script.tags_json or "[]")
+    except Exception:
+        tags = []
+    try:
+        args_schema = json.loads(script.args_schema_json or "{}")
+    except Exception:
+        args_schema = {}
+    return {
+        "script_id": script.script_id,
+        "script_path": script.script_path,
+        "content_hash": script.content_hash,
+        "os_family": script.os_family,
+        "title": script.title,
+        "description": script.description,
+        "tags": tags if isinstance(tags, list) else [],
+        "risk_level": script.risk_level,
+        "requires_confirmation": bool(script.requires_confirmation),
+        "dry_run_supported": bool(script.dry_run_supported),
+        "args_schema": args_schema if isinstance(args_schema, dict) else {},
+        "enabled": bool(script.enabled),
+        "manifest_error": script.manifest_error,
+        "updated_at": script.updated_at.isoformat(),
+    }
 
 
 def _validate_trigger_script(db: Session, *, node_id: str, action_script_id: str) -> None:
@@ -711,6 +870,111 @@ def _validate_trigger_script(db: Session, *, node_id: str, action_script_id: str
     )
     if script is None:
         raise HTTPException(status_code=400, detail="Selected action_script_id is not available for this node")
+
+
+def _os_family_matches_node(node_os_name: str | None, script_os_family: str | None) -> bool:
+    family = (script_os_family or "any").lower()
+    if family == "any":
+        return True
+    node_os = (node_os_name or "").lower()
+    if "linux" in node_os:
+        return family in {"linux", "any"}
+    if "windows" in node_os:
+        return family in {"windows", "any"}
+    return family == "any"
+
+
+def _load_json_dict(raw: str | None, default: dict[str, object] | None = None) -> dict[str, object]:
+    if not raw:
+        return default or {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return default or {}
+    return parsed if isinstance(parsed, dict) else (default or {})
+
+
+def _validate_and_apply_args_schema(args_schema: dict[str, object], args: object) -> dict[str, object]:
+    if args is None:
+        args_data: dict[str, object] = {}
+    elif isinstance(args, dict):
+        args_data = dict(args)
+    else:
+        raise HTTPException(status_code=400, detail="args must be a JSON object")
+    if args_schema and args_schema.get("type") != "object":
+        raise HTTPException(status_code=400, detail="args_schema.type must be object")
+    properties = args_schema.get("properties", {})
+    required = args_schema.get("required", [])
+    if properties and not isinstance(properties, dict):
+        raise HTTPException(status_code=400, detail="args_schema.properties must be object")
+    if required and not isinstance(required, list):
+        raise HTTPException(status_code=400, detail="args_schema.required must be array")
+    normalized: dict[str, object] = {}
+    props = properties if isinstance(properties, dict) else {}
+    for key in args_data:
+        if key not in props:
+            raise HTTPException(status_code=400, detail=f"Unknown arg: {key}")
+    for name, spec in props.items():
+        if not isinstance(spec, dict):
+            continue
+        if name in args_data:
+            value = args_data[name]
+        elif "default" in spec:
+            value = spec["default"]
+        else:
+            continue
+        expected_type = spec.get("type")
+        if expected_type == "string":
+            if not isinstance(value, str):
+                raise HTTPException(status_code=400, detail=f"Arg {name} must be string")
+            if len(value) > 500:
+                raise HTTPException(status_code=400, detail=f"Arg {name} is too long")
+        elif expected_type == "integer":
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise HTTPException(status_code=400, detail=f"Arg {name} must be integer")
+        elif expected_type == "number":
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise HTTPException(status_code=400, detail=f"Arg {name} must be number")
+        elif expected_type == "boolean":
+            if not isinstance(value, bool):
+                raise HTTPException(status_code=400, detail=f"Arg {name} must be boolean")
+        normalized[name] = value
+    for req_name in required if isinstance(required, list) else []:
+        if req_name not in normalized:
+            raise HTTPException(status_code=400, detail=f"Missing required arg: {req_name}")
+    return normalized
+
+
+def _extract_json_object_from_llm_text(raw_text: str) -> dict[str, object]:
+    text_body = (raw_text or "").strip()
+    try:
+        parsed = json.loads(text_body)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    if "```" in text_body:
+        cleaned = text_body.replace("```json", "```")
+        for part in cleaned.split("```"):
+            candidate = part.strip()
+            if not candidate:
+                continue
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+    raise HTTPException(status_code=502, detail="LLM returned invalid JSON for script recommendations")
+
+
+def _generate_llm_recommendation_text(prompt: str) -> str:
+    chunks: list[str] = []
+    for data in _stream_ollama_generate(prompt):
+        chunk = str(data.get("response", ""))
+        if chunk:
+            chunks.append(chunk)
+    return "".join(chunks)
 
 
 def _send_trigger_alert_email(trigger: Trigger, user: User, metric_value: float) -> bool:
@@ -793,6 +1057,10 @@ def _process_trigger_alerts(db: Session, node_id: str, metric: MetricIn) -> None
                 node_id=trigger.node_id,
                 trigger_id=trigger.id,
                 script_id=trigger.action_script_id,
+                source="trigger",
+                args_json="{}",
+                dry_run=False,
+                risk_level_snapshot=script.risk_level or "medium",
                 status="pending",
                 created_at=_utcnow(),
             )
@@ -1021,6 +1289,17 @@ async def upsert_agent_scripts(request: Request) -> dict[str, str | int]:
                     node_id=payload.node_id,
                     script_id=script.script_id,
                     script_path=script.script_path,
+                    content_hash=script.content_hash or "",
+                    os_family=script.os_family or "any",
+                    title=script.title or script.script_id,
+                    description=script.description or "",
+                    tags_json=json.dumps(script.tags or [], ensure_ascii=False),
+                    risk_level=script.risk_level or "medium",
+                    requires_confirmation=bool(script.requires_confirmation),
+                    dry_run_supported=bool(script.dry_run_supported),
+                    args_schema_json=json.dumps(script.args_schema or {}, ensure_ascii=False),
+                    enabled=bool(script.enabled),
+                    manifest_error=script.manifest_error,
                     updated_at=now,
                 )
             )
@@ -1046,6 +1325,8 @@ def get_next_agent_command(request: Request) -> dict[str, object]:
                 "node_id": command.node_id,
                 "trigger_id": command.trigger_id,
                 "script_id": command.script_id,
+                "args_json": command.args_json,
+                "dry_run": bool(command.dry_run),
                 "status": command.status,
                 "created_at": command.created_at.isoformat(),
             }
@@ -1070,6 +1351,11 @@ async def update_agent_command_result(command_id: int, request: Request) -> dict
         command.exit_code = payload.exit_code
         command.started_at = payload.started_at.astimezone(timezone.utc) if payload.started_at else command.started_at
         command.finished_at = payload.finished_at.astimezone(timezone.utc) if payload.finished_at else command.finished_at
+        if command.recommendation_id and payload.status in {"completed", "failed"}:
+            recommendation = db.query(LlmScriptRecommendation).filter(LlmScriptRecommendation.id == command.recommendation_id).first()
+            if recommendation is not None:
+                recommendation.status = "executed" if payload.status == "completed" else "error"
+                recommendation.error_message = payload.stderr if payload.status == "failed" else None
         db.commit()
     return {"status": "ok", "id": command_id}
 
@@ -1812,6 +2098,231 @@ async def analyze_node_with_llm(payload: LLMNodeAnalysisIn) -> StreamingResponse
             raise HTTPException(status_code=502, detail=f"LLM service error: {exc}") from exc
 
     return StreamingResponse(stream_llm_response(), media_type="text/plain; charset=utf-8")
+
+
+@app.post("/api/llm/recommend-scripts")
+def recommend_scripts_with_llm(payload: LLMScriptRecommendIn) -> dict[str, object]:
+    with SessionLocal() as db:
+        node = db.query(Node).filter(Node.display_name == payload.node_id).first()
+        if node is None:
+            raise HTTPException(status_code=404, detail="Node not found")
+        context = build_node_analysis_context(
+            db,
+            node_id=payload.node_id,
+            window_minutes=payload.window_minutes,
+            max_recent_points=LLM_CONTEXT_MAX_RECENT_POINTS,
+            max_log_signatures=LLM_CONTEXT_MAX_LOG_SIGNATURES,
+            max_log_examples_per_signature=LLM_CONTEXT_MAX_LOG_EXAMPLES_PER_SIGNATURE,
+        )
+        available_scripts = {item["script_id"]: item for item in context.get("available_scripts", []) if isinstance(item, dict)}
+        if not available_scripts:
+            return {"node_id": payload.node_id, "summary": "Нет доступных remediation scripts для узла.", "recommendations": []}
+        prompt = build_script_recommendation_prompt(context)
+        prompt_hash = f"sha256:{hashlib.sha256(prompt.encode('utf-8')).hexdigest()}"
+        try:
+            raw_text = _generate_llm_recommendation_text(prompt)
+            llm_payload = _extract_json_object_from_llm_text(raw_text)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"LLM service error: {exc}") from exc
+        summary = str(llm_payload.get("summary") or "").strip()
+        incoming_recommendations = llm_payload.get("recommendations", [])
+        if not isinstance(incoming_recommendations, list):
+            raise HTTPException(status_code=502, detail="LLM payload field 'recommendations' must be a list")
+        stored: list[dict[str, object]] = []
+        now = _utcnow()
+        for item in incoming_recommendations:
+            if not isinstance(item, dict):
+                continue
+            script_id = str(item.get("script_id") or "").strip()
+            script = available_scripts.get(script_id)
+            if not script:
+                continue
+            confidence = float(item.get("confidence") or 0.0)
+            if not (0.0 <= confidence <= 1.0):
+                continue
+            risk_level = str(item.get("risk_level") or script.get("risk_level") or "medium").lower()
+            if risk_level not in {"low", "medium", "high"}:
+                continue
+            requires_confirmation = bool(item.get("requires_confirmation", script.get("requires_confirmation", True)))
+            if risk_level in {"medium", "high"}:
+                requires_confirmation = True
+            args_schema = script.get("args_schema") if isinstance(script.get("args_schema"), dict) else {}
+            try:
+                normalized_args = _validate_and_apply_args_schema(args_schema, item.get("args", {}))
+            except HTTPException:
+                continue
+            dry_run_supported = bool(script.get("dry_run_supported"))
+            dry_run_first = bool(item.get("dry_run_first", dry_run_supported))
+            if dry_run_supported and not dry_run_first:
+                reason = str(item.get("reason") or "").lower()
+                if "why not" not in reason and "почему" not in reason:
+                    dry_run_first = True
+            rec = LlmScriptRecommendation(
+                node_id=payload.node_id,
+                agent_id=node.agent_id or "",
+                script_id=script_id,
+                script_content_hash=str(script.get("content_hash") or ""),
+                args_json=json.dumps(normalized_args, ensure_ascii=False),
+                summary=summary,
+                reason=str(item.get("reason") or ""),
+                evidence_json=json.dumps(item.get("evidence") if isinstance(item.get("evidence"), list) else [], ensure_ascii=False),
+                confidence=confidence,
+                risk_level=risk_level,
+                requires_confirmation=requires_confirmation,
+                dry_run_first=dry_run_first,
+                status="proposed",
+                model_name=OLLAMA_MODEL,
+                prompt_hash=prompt_hash,
+                created_at=now,
+            )
+            db.add(rec)
+            db.flush()
+            stored.append(
+                {
+                    "id": rec.id,
+                    "script_id": rec.script_id,
+                    "confidence": rec.confidence,
+                    "risk_level": rec.risk_level,
+                    "requires_confirmation": rec.requires_confirmation,
+                    "dry_run_first": rec.dry_run_first,
+                    "reason": rec.reason,
+                    "evidence": json.loads(rec.evidence_json or "[]"),
+                    "args": json.loads(rec.args_json or "{}"),
+                    "status": rec.status,
+                }
+            )
+        db.commit()
+    return {"node_id": payload.node_id, "summary": summary, "recommendations": stored}
+
+
+@app.get("/api/llm/script-recommendations")
+def list_script_recommendations(node_id: str = Query(..., min_length=1, max_length=100)) -> dict[str, object]:
+    with SessionLocal() as db:
+        rows = (
+            db.query(LlmScriptRecommendation)
+            .filter(LlmScriptRecommendation.node_id == node_id)
+            .order_by(LlmScriptRecommendation.created_at.desc(), LlmScriptRecommendation.id.desc())
+            .limit(100)
+            .all()
+        )
+        return {
+            "items": [
+                {
+                    "id": row.id,
+                    "node_id": row.node_id,
+                    "script_id": row.script_id,
+                    "confidence": row.confidence,
+                    "risk_level": row.risk_level,
+                    "requires_confirmation": row.requires_confirmation,
+                    "dry_run_first": row.dry_run_first,
+                    "summary": row.summary,
+                    "reason": row.reason,
+                    "evidence": json.loads(row.evidence_json or "[]"),
+                    "args": json.loads(row.args_json or "{}"),
+                    "status": row.status,
+                    "created_at": row.created_at.isoformat(),
+                }
+                for row in rows
+            ]
+        }
+
+
+@app.post("/api/llm/script-recommendations/{recommendation_id}/approve")
+def approve_script_recommendation(recommendation_id: int, payload: LLMRecommendationApproveIn, request: Request) -> dict[str, object]:
+    with SessionLocal() as db:
+        recommendation = db.query(LlmScriptRecommendation).filter(LlmScriptRecommendation.id == recommendation_id).first()
+        if recommendation is None:
+            raise HTTPException(status_code=404, detail="Recommendation not found")
+        if recommendation.status != "proposed":
+            raise HTTPException(status_code=409, detail="Recommendation is not in proposed status")
+        node = db.query(Node).filter(Node.display_name == recommendation.node_id).first()
+        if node is None:
+            raise HTTPException(status_code=404, detail="Node not found")
+        script = (
+            db.query(AgentScript)
+            .filter(AgentScript.node_id == recommendation.node_id, AgentScript.script_id == recommendation.script_id)
+            .first()
+        )
+        if script is None:
+            raise HTTPException(status_code=404, detail="Script not found for recommendation")
+        if not script.enabled or script.manifest_error:
+            raise HTTPException(status_code=400, detail="Script is disabled or has manifest_error")
+        if recommendation.script_content_hash != script.content_hash:
+            raise HTTPException(status_code=409, detail="Script changed since recommendation")
+        if not _os_family_matches_node(node.os_name, script.os_family):
+            raise HTTPException(status_code=400, detail="Script OS family is incompatible with node")
+        args_schema = _load_json_dict(script.args_schema_json, {})
+        recommendation_args = _load_json_dict(recommendation.args_json, {})
+        normalized_args = _validate_and_apply_args_schema(args_schema, recommendation_args)
+        if recommendation.risk_level in {"medium", "high"} or recommendation.requires_confirmation:
+            if not payload.confirm:
+                raise HTTPException(status_code=400, detail="Explicit confirmation is required")
+        existing = (
+            db.query(AgentCommand.id)
+            .filter(
+                AgentCommand.node_id == recommendation.node_id,
+                AgentCommand.script_id == recommendation.script_id,
+                AgentCommand.status.in_(("pending", "running")),
+            )
+            .first()
+        )
+        if existing is not None:
+            raise HTTPException(status_code=409, detail="Pending/running command already exists for this script")
+        requested_login = decode_session_token(request.cookies.get("dashboard_session") or "")
+        requested_user_id = None
+        if requested_login:
+            user = db.query(User).filter(User.login == requested_login).first()
+            requested_user_id = user.id if user else None
+        dry_run_value = bool(payload.dry_run or recommendation.dry_run_first)
+        command = AgentCommand(
+            agent_id=recommendation.agent_id or (node.agent_id or ""),
+            node_id=recommendation.node_id,
+            trigger_id=None,
+            script_id=recommendation.script_id,
+            status="pending",
+            source="llm",
+            recommendation_id=recommendation.id,
+            args_json=json.dumps(normalized_args, ensure_ascii=False),
+            dry_run=dry_run_value,
+            requested_by_user_id=requested_user_id,
+            risk_level_snapshot=recommendation.risk_level,
+            created_at=_utcnow(),
+        )
+        db.add(command)
+        db.flush()
+        recommendation.status = "approved"
+        recommendation.approved_at = _utcnow()
+        recommendation.executed_command_id = command.id
+        db.commit()
+        return {
+            "status": "ok",
+            "command": {
+                "id": command.id,
+                "node_id": command.node_id,
+                "script_id": command.script_id,
+                "status": command.status,
+                "dry_run": command.dry_run,
+                "source": command.source,
+            },
+        }
+
+
+@app.post("/api/llm/script-recommendations/{recommendation_id}/reject")
+def reject_script_recommendation(recommendation_id: int, payload: LLMRecommendationRejectIn) -> dict[str, object]:
+    with SessionLocal() as db:
+        recommendation = db.query(LlmScriptRecommendation).filter(LlmScriptRecommendation.id == recommendation_id).first()
+        if recommendation is None:
+            raise HTTPException(status_code=404, detail="Recommendation not found")
+        if recommendation.status != "proposed":
+            raise HTTPException(status_code=409, detail="Recommendation is not in proposed status")
+        recommendation.status = "rejected"
+        recommendation.rejected_at = _utcnow()
+        if payload.reason:
+            recommendation.error_message = payload.reason
+        db.commit()
+    return {"status": "ok"}
 
 
 @app.post("/api/llm/generate")
@@ -2664,6 +3175,8 @@ def dashboard() -> str:
                     <label><span class="meta">Window</span><br /><select id="llm-window-select"><option value="10">10m</option><option value="30">30m</option><option value="60" selected>60m</option><option value="360">6h</option><option value="1440">24h</option></select></label>
                     <label><input id="llm-show-context" type="checkbox" /> Show context JSON</label>
                     <button id="run-llm" type="button">Analyze node</button>
+                    <button id="recommend-llm-scripts" type="button" class="secondary">Recommend scripts</button>
+                    <button id="refresh-llm-recommendations" type="button" class="secondary">Refresh recommendations</button>
                 </div>
                 <details id="llm-context-wrap" hidden><summary>Context JSON</summary><pre id="llm-context-json"></pre></details>
                 <div>
@@ -2672,6 +3185,8 @@ def dashboard() -> str:
                         <div id="llm-output"></div>
                     </label>
                 </div>
+                <h3>Recommended remediation scripts</h3>
+                <div id="llm-recommendations"></div>
                 <div id="llm-status" class="status"></div>
             </section>
         </main>
@@ -2780,6 +3295,7 @@ def dashboard() -> str:
             llmWindowMinutes: 60,
             llmShowContext: false,
             llmContextJson: null,
+            llmRecommendations: [],
             activeMenuKey: '',
             activeMenuData: null,
             activeTab: 'latest',
@@ -2903,6 +3419,29 @@ def dashboard() -> str:
             document.getElementById('llm-output').innerHTML = state.llmRawOutput
                 ? markdownToHtml(state.llmRawOutput)
                 : '<p class="meta">Оценка состояния узла и рекомендации...</p>';
+        }
+
+        function renderLlmRecommendations() {
+            const box = document.getElementById('llm-recommendations');
+            if (!box) return;
+            if (!state.llmRecommendations.length) {
+                box.innerHTML = '<p class="meta">No recommended scripts yet.</p>';
+                return;
+            }
+            box.innerHTML = state.llmRecommendations.map((item) => `
+                <div class="stat">
+                    <div><strong>${escapeHtml(item.script_id || 'unknown')}</strong> · ${escapeHtml(item.risk_level || 'medium')} · confidence ${(Number(item.confidence || 0) * 100).toFixed(0)}%</div>
+                    <div class="meta">Status: ${escapeHtml(item.status || '-')} · dry_run_first: ${item.dry_run_first ? 'true' : 'false'}</div>
+                    <p>${escapeHtml(item.reason || '')}</p>
+                    <pre>${escapeHtml(JSON.stringify(item.args || {}, null, 2))}</pre>
+                    <div class="meta">Evidence: ${escapeHtml((item.evidence || []).join(' | '))}</div>
+                    <div style="display:flex; gap:8px; margin-top:8px;">
+                        <button type="button" class="secondary" onclick="runLlmRecommendation(${Number(item.id)}, true)">Run dry-run</button>
+                        <button type="button" onclick="runLlmRecommendation(${Number(item.id)}, false)">Run</button>
+                        <button type="button" class="danger" onclick="rejectLlmRecommendation(${Number(item.id)})">Reject</button>
+                    </div>
+                </div>
+            `).join('');
         }
 
         function renderTabs() {
@@ -3853,6 +4392,55 @@ def dashboard() -> str:
             }
         }
 
+        async function fetchLlmRecommendations() {
+            if (!state.llmSelectedNodeId) {
+                state.llmRecommendations = [];
+                renderLlmRecommendations();
+                return;
+            }
+            const data = await fetchJson(`/api/llm/script-recommendations?node_id=${encodeURIComponent(state.llmSelectedNodeId)}`);
+            state.llmRecommendations = data.items || [];
+            renderLlmRecommendations();
+        }
+
+        async function requestLlmScriptRecommendations() {
+            if (!state.llmSelectedNodeId) {
+                setStatus('llm-status', 'Choose a node first.', true);
+                return;
+            }
+            setStatus('llm-status', 'Requesting remediation script recommendations...');
+            const payload = { node_id: state.llmSelectedNodeId, window_minutes: Number(state.llmWindowMinutes || 60) };
+            await fetchJson('/api/llm/recommend-scripts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+            await fetchLlmRecommendations();
+            setStatus('llm-status', 'Recommendations updated.');
+        }
+
+        async function runLlmRecommendation(recommendationId, dryRun) {
+            const rec = state.llmRecommendations.find((item) => Number(item.id) === Number(recommendationId));
+            if (!rec) return;
+            if (!dryRun && (rec.risk_level === 'medium' || rec.risk_level === 'high')) {
+                const ok = window.confirm('Подтвердите запуск remediation-скрипта на удалённом узле');
+                if (!ok) return;
+            }
+            const response = await fetchJson(`/api/llm/script-recommendations/${encodeURIComponent(recommendationId)}/approve`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ confirm: true, dry_run: Boolean(dryRun) }),
+            });
+            setStatus('llm-status', `Command created: #${response.command.id} (${response.command.status})`);
+            await fetchLlmRecommendations();
+        }
+
+        async function rejectLlmRecommendation(recommendationId) {
+            await fetchJson(`/api/llm/script-recommendations/${encodeURIComponent(recommendationId)}/reject`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+            });
+            await fetchLlmRecommendations();
+            setStatus('llm-status', `Recommendation #${recommendationId} rejected.`);
+        }
+
         document.querySelectorAll('.nav-btn').forEach((button) => {
             button.addEventListener('click', () => {
                 state.activeTab = button.dataset.tab;
@@ -3964,10 +4552,13 @@ def dashboard() -> str:
         document.getElementById('llm-node-select').addEventListener('change', (event) => {
             state.llmSelectedNodeId = event.target.value;
             setStatus('llm-status', state.llmSelectedNodeId ? 'Node selected. Click "Analyze node".' : 'Choose a node for LLM analysis.');
+            fetchLlmRecommendations().catch((error) => setStatus('llm-status', error.message, true));
         });
         document.getElementById('llm-window-select').addEventListener('change', (event) => { state.llmWindowMinutes = Number(event.target.value || 60); });
         document.getElementById('llm-show-context').addEventListener('change', (event) => { state.llmShowContext = Boolean(event.target.checked); renderLlmContext(); });
         document.getElementById('run-llm').addEventListener('click', runLlm);
+        document.getElementById('recommend-llm-scripts').addEventListener('click', () => requestLlmScriptRecommendations().catch((error) => setStatus('llm-status', error.message, true)));
+        document.getElementById('refresh-llm-recommendations').addEventListener('click', () => fetchLlmRecommendations().catch((error) => setStatus('llm-status', error.message, true)));
         document.getElementById('auth-sign-in').addEventListener('click', signIn);
         document.getElementById('sign-out').addEventListener('click', signOut);
         document.getElementById('close-credentials-modal').addEventListener('click', hideCredentialsModal);
@@ -4225,6 +4816,7 @@ def dashboard() -> str:
         setStatus('knowledge-base-status', 'Choose a node and click "Run KB solve" to fetch Knowledge Base results.');
         setStatus('llm-status', 'Choose a node and click "Analyze node" to run LLM diagnostics.');
         renderLlmOutput();
+        renderLlmRecommendations();
         document.getElementById('create-user-form').addEventListener('submit', async (event) => {
             event.preventDefault();
             const login = document.getElementById('user-login-input').value.trim();

@@ -23,6 +23,9 @@ MAX_LOG_ENTRIES = 100
 TOP_PROCESS_LIMIT = 10
 SCRIPTS_DIR = "scripts"
 LOG_SEVERITY_LEVELS = ("DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY")
+SCRIPT_TIMEOUT_SECONDS = 120
+LINUX_EXTENSIONS = {".sh", ".py"}
+WINDOWS_EXTENSIONS = {".ps1", ".bat", ".cmd", ".py"}
 
 load_dotenv()
 
@@ -525,15 +528,69 @@ def discover_local_scripts(base_dir: Path) -> list[dict[str, str]]:
     scripts_dir = base_dir / SCRIPTS_DIR
     if not scripts_dir.exists() or not scripts_dir.is_dir():
         return []
-    items: list[dict[str, str]] = []
+    items: list[dict[str, str | bool | dict[str, object] | list[str] | None]] = []
+    current_os = platform.system().lower()
+    allowed_extensions = WINDOWS_EXTENSIONS if current_os == "windows" else LINUX_EXTENSIONS
     for path in sorted(scripts_dir.iterdir(), key=lambda item: item.name.lower()):
         if not path.is_file():
             continue
-        items.append({"script_id": path.name, "script_path": str(path.resolve())})
+        if path.suffix.lower() == ".json":
+            continue
+        if path.suffix.lower() not in allowed_extensions:
+            continue
+        content_hash = f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+        manifest_data = {
+            "os_family": "any",
+            "title": path.stem,
+            "description": "",
+            "tags": [],
+            "risk_level": "medium",
+            "requires_confirmation": True,
+            "dry_run_supported": False,
+            "args_schema": {},
+            "enabled": True,
+            "manifest_error": None,
+        }
+        manifest_candidates = [path.with_name(f"{path.name}.json"), path.with_name(f"{path.stem}.json")]
+        manifest_path = next((candidate for candidate in manifest_candidates if candidate.exists() and candidate.is_file()), None)
+        if manifest_path:
+            try:
+                parsed = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if not isinstance(parsed, dict):
+                    raise ValueError("manifest is not a JSON object")
+                manifest_data["os_family"] = str(parsed.get("os_family") or "any").lower()
+                manifest_data["title"] = str(parsed.get("title") or path.stem)
+                manifest_data["description"] = str(parsed.get("description") or "")
+                manifest_data["tags"] = parsed.get("tags") if isinstance(parsed.get("tags"), list) else []
+                manifest_data["risk_level"] = str(parsed.get("risk_level") or "medium").lower()
+                manifest_data["requires_confirmation"] = bool(parsed.get("requires_confirmation", True))
+                manifest_data["dry_run_supported"] = bool(parsed.get("dry_run_supported", False))
+                manifest_data["args_schema"] = parsed.get("args_schema") if isinstance(parsed.get("args_schema"), dict) else {}
+                manifest_data["enabled"] = bool(parsed.get("enabled", True))
+            except Exception as error:
+                manifest_data["enabled"] = False
+                manifest_data["manifest_error"] = str(error)
+        items.append(
+            {
+                "script_id": path.name,
+                "script_path": str(path.resolve()),
+                "content_hash": content_hash,
+                "os_family": manifest_data["os_family"],
+                "title": manifest_data["title"],
+                "description": manifest_data["description"],
+                "tags": manifest_data["tags"],
+                "risk_level": manifest_data["risk_level"],
+                "requires_confirmation": manifest_data["requires_confirmation"],
+                "dry_run_supported": manifest_data["dry_run_supported"],
+                "args_schema": manifest_data["args_schema"],
+                "enabled": manifest_data["enabled"],
+                "manifest_error": manifest_data["manifest_error"],
+            }
+        )
     return items
 
 
-def run_local_script(base_dir: Path, script_id: str) -> tuple[int, str, str]:
+def run_local_script(base_dir: Path, script_id: str, args_json: str | None = None, dry_run: bool = False) -> tuple[int, str, str]:
     scripts_dir = (base_dir / SCRIPTS_DIR).resolve()
     candidate = (scripts_dir / script_id).resolve()
     if not str(candidate).startswith(str(scripts_dir)):
@@ -561,7 +618,20 @@ def run_local_script(base_dir: Path, script_id: str) -> tuple[int, str, str]:
             return 1, "", f"Unsupported script extension on Linux: {extension or '(none)'}"
 
     try:
-        completed = subprocess.run(command, capture_output=True, text=True, check=False, cwd=str(base_dir))
+        env = os.environ.copy()
+        env["MONITORING_KB_ARGS_JSON"] = args_json or "{}"
+        env["MONITORING_KB_DRY_RUN"] = "true" if dry_run else "false"
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(base_dir),
+            timeout=SCRIPT_TIMEOUT_SECONDS,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, "", f"Script execution timed out after {SCRIPT_TIMEOUT_SECONDS}s"
     except OSError as error:
         return 1, "", str(error)
     return completed.returncode, completed.stdout[-200000:], completed.stderr[-200000:]
@@ -624,7 +694,12 @@ def main() -> None:
             command_item = command_response.json().get("item")
             if command_item:
                 started_at = datetime.now(timezone.utc).isoformat()
-                exit_code, stdout, stderr = run_local_script(base_dir, str(command_item.get("script_id", "")))
+                exit_code, stdout, stderr = run_local_script(
+                    base_dir,
+                    str(command_item.get("script_id", "")),
+                    args_json=str(command_item.get("args_json", "{}")),
+                    dry_run=bool(command_item.get("dry_run", False)),
+                )
                 finished_at = datetime.now(timezone.utc).isoformat()
                 result_payload = {"status": "completed" if exit_code == 0 else "failed", "stdout": stdout, "stderr": stderr, "exit_code": exit_code, "started_at": started_at, "finished_at": finished_at}
                 result_response = post_signed_json(server_url=args.server_url, endpoint_path=f"/api/agent/commands/{int(command_item['id'])}/result", payload=result_payload, timeout=120, agent_id=args.agent_id, agent_secret=args.agent_secret)
