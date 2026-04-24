@@ -29,3 +29,5 @@ class Node(Base):
     log_entries = relationship("LogEntry", back_populates="node", cascade="all, delete-orphan")
     agent_scripts = relationship("AgentScript", back_populates="node", cascade="all, delete-orphan")
     agent_commands = relationship("AgentCommand", back_populates="node", cascade="all, delete-orphan")
+    filesystem_samples = relationship("FilesystemSample", back_populates="node", cascade="all, delete-orphan")
+    process_samples = relationship("ProcessSample", back_populates="node", cascade="all, delete-orphan")
