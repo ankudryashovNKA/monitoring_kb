@@ -54,6 +54,28 @@ def collect_metrics(display_name: str, agent_id: str) -> dict[str, object]:
     swap_memory = psutil.swap_memory()
     disk_io = psutil.disk_io_counters()
     io_rates = collect_io_rates(disk_io)
+    load1 = load5 = load15 = None
+    try:
+        load1, load5, load15 = os.getloadavg()
+    except (AttributeError, OSError):
+        pass
+    cpu_times = psutil.cpu_times_percent(interval=None)
+    cpu_iowait = float(getattr(cpu_times, "iowait", 0.0) or 0.0)
+    cpu_steal = float(getattr(cpu_times, "steal", 0.0) or 0.0)
+
+    tcp_established = 0
+    tcp_listen = 0
+    try:
+        for conn in psutil.net_connections(kind="inet"):
+            status = str(getattr(conn, "status", ""))
+            if status == "ESTABLISHED":
+                tcp_established += 1
+            elif status == "LISTEN":
+                tcp_listen += 1
+    except (psutil.AccessDenied, psutil.Error):
+        tcp_established = 0
+        tcp_listen = 0
+
     return {
         "node_id": display_name,
         "agent_id": agent_id,
@@ -67,6 +89,27 @@ def collect_metrics(display_name: str, agent_id: str) -> dict[str, object]:
         "net_sent_kbps": io_rates["net_sent_kbps"],
         "process_count": count_processes(),
         "zombie_processes": count_zombie_processes(),
+        "load1": load1,
+        "load5": load5,
+        "load15": load15,
+        "cpu_iowait_percent": cpu_iowait,
+        "cpu_steal_percent": cpu_steal,
+        "ram_used_mb": int(virtual_memory.used / (1024 * 1024)),
+        "ram_available_mb": int(virtual_memory.available / (1024 * 1024)),
+        "swap_used_mb": int(swap_memory.used / (1024 * 1024)),
+        "swap_free_mb": int(swap_memory.free / (1024 * 1024)),
+        "disk_read_kbps": io_rates["disk_read_kbps"],
+        "disk_write_kbps": io_rates["disk_write_kbps"],
+        "disk_read_iops": io_rates["disk_read_iops"],
+        "disk_write_iops": io_rates["disk_write_iops"],
+        "net_packets_recv_per_sec": io_rates["net_packets_recv_per_sec"],
+        "net_packets_sent_per_sec": io_rates["net_packets_sent_per_sec"],
+        "net_errors_in_per_sec": io_rates["net_errors_in_per_sec"],
+        "net_errors_out_per_sec": io_rates["net_errors_out_per_sec"],
+        "net_drops_in_per_sec": io_rates["net_drops_in_per_sec"],
+        "net_drops_out_per_sec": io_rates["net_drops_out_per_sec"],
+        "tcp_established": tcp_established,
+        "tcp_listen": tcp_listen,
         "os_name": os_name,
         "cpu_cores": psutil.cpu_count() or 1,
         "ram_total_mb": int(virtual_memory.total / (1024 * 1024)),
@@ -75,7 +118,7 @@ def collect_metrics(display_name: str, agent_id: str) -> dict[str, object]:
         "top_cpu_processes": collect_top_processes(sort_by="cpu_percent"),
         "top_ram_processes": collect_top_processes(sort_by="ram_percent"),
         "timestamp": datetime.now(timezone.utc).isoformat(),
-}
+    }
 
 
 def collect_io_rates(disk_io: psutil._common.sdiskio | None) -> dict[str, float]:
@@ -88,6 +131,16 @@ def collect_io_rates(disk_io: psutil._common.sdiskio | None) -> dict[str, float]
         "disk_write_time_ms": 0.0,
         "net_recv_kbps": 0.0,
         "net_sent_kbps": 0.0,
+        "disk_read_kbps": 0.0,
+        "disk_write_kbps": 0.0,
+        "disk_read_iops": 0.0,
+        "disk_write_iops": 0.0,
+        "net_packets_recv_per_sec": 0.0,
+        "net_packets_sent_per_sec": 0.0,
+        "net_errors_in_per_sec": 0.0,
+        "net_errors_out_per_sec": 0.0,
+        "net_drops_in_per_sec": 0.0,
+        "net_drops_out_per_sec": 0.0,
     }
     if _last_io_sample_ts is None or _last_disk_io_counters is None or _last_net_io_counters is None:
         _last_io_sample_ts = now
@@ -113,6 +166,22 @@ def collect_io_rates(disk_io: psutil._common.sdiskio | None) -> dict[str, float]
 
     recv_kbps = max(0.0, float(net_io.bytes_recv - _last_net_io_counters.bytes_recv) / elapsed / 1024)
     sent_kbps = max(0.0, float(net_io.bytes_sent - _last_net_io_counters.bytes_sent) / elapsed / 1024)
+    read_bytes_delta = 0.0
+    write_bytes_delta = 0.0
+    read_iops = 0.0
+    write_iops = 0.0
+    if disk_io and _last_disk_io_counters:
+        read_bytes_delta = max(0.0, float(getattr(disk_io, "read_bytes", 0.0)) - float(getattr(_last_disk_io_counters, "read_bytes", 0.0)))
+        write_bytes_delta = max(0.0, float(getattr(disk_io, "write_bytes", 0.0)) - float(getattr(_last_disk_io_counters, "write_bytes", 0.0)))
+        read_iops = max(0.0, read_count_delta / elapsed)
+        write_iops = max(0.0, write_count_delta / elapsed)
+
+    packets_recv = max(0.0, float(net_io.packets_recv - _last_net_io_counters.packets_recv) / elapsed)
+    packets_sent = max(0.0, float(net_io.packets_sent - _last_net_io_counters.packets_sent) / elapsed)
+    err_in = max(0.0, float(net_io.errin - _last_net_io_counters.errin) / elapsed)
+    err_out = max(0.0, float(net_io.errout - _last_net_io_counters.errout) / elapsed)
+    drop_in = max(0.0, float(net_io.dropin - _last_net_io_counters.dropin) / elapsed)
+    drop_out = max(0.0, float(net_io.dropout - _last_net_io_counters.dropout) / elapsed)
 
     _last_io_sample_ts = now
     _last_disk_io_counters = disk_io
@@ -122,6 +191,16 @@ def collect_io_rates(disk_io: psutil._common.sdiskio | None) -> dict[str, float]
         "disk_write_time_ms": write_latency,
         "net_recv_kbps": recv_kbps,
         "net_sent_kbps": sent_kbps,
+        "disk_read_kbps": read_bytes_delta / elapsed / 1024,
+        "disk_write_kbps": write_bytes_delta / elapsed / 1024,
+        "disk_read_iops": read_iops,
+        "disk_write_iops": write_iops,
+        "net_packets_recv_per_sec": packets_recv,
+        "net_packets_sent_per_sec": packets_sent,
+        "net_errors_in_per_sec": err_in,
+        "net_errors_out_per_sec": err_out,
+        "net_drops_in_per_sec": drop_in,
+        "net_drops_out_per_sec": drop_out,
     }
 
 
@@ -131,7 +210,7 @@ def collect_top_processes(sort_by: str) -> list[dict[str, str | float | int]]:
 
     total_ram = psutil.virtual_memory().total or 1
     entries: list[dict[str, str | float | int]] = []
-    for process in psutil.process_iter(["pid", "name", "memory_info"]):
+    for process in psutil.process_iter(["pid", "name", "memory_info", "username", "cmdline", "status", "create_time"]):
         try:
             memory_info = process.info.get("memory_info")
             rss = int(memory_info.rss) if memory_info is not None else 0
@@ -140,6 +219,10 @@ def collect_top_processes(sort_by: str) -> list[dict[str, str | float | int]]:
                 {
                     "pid": int(process.info.get("pid") or 0),
                     "name": str(process.info.get("name") or "unknown"),
+                    "username": process.info.get("username"),
+                    "cmdline": " ".join(process.info.get("cmdline") or [])[:500] or None,
+                    "status": process.info.get("status"),
+                    "create_time": process.info.get("create_time"),
                     "cpu_percent": max(0.0, float(process.cpu_percent(interval=None))),
                     "ram_percent": max(0.0, min(100.0, float(ram_percent))),
                     "ram_mb": int(rss / (1024 * 1024)),
@@ -191,6 +274,17 @@ def collect_filesystem_usage() -> list[dict[str, str | float]]:
         total_gb = usage.total / (1024 ** 3)
         used_gb = usage.used / (1024 ** 3)
         free_gb = usage.free / (1024 ** 3)
+        inodes_total = inodes_free = inodes_used = None
+        inodes_percent = None
+        try:
+            stat = os.statvfs(mountpoint)
+            if int(stat.f_files) > 0:
+                inodes_total = int(stat.f_files)
+                inodes_free = int(stat.f_ffree)
+                inodes_used = max(0, inodes_total - inodes_free)
+                inodes_percent = (inodes_used / inodes_total) * 100.0
+        except (AttributeError, OSError):
+            pass
         filesystems.append(
             {
                 "device": partition.device or mountpoint,
@@ -200,6 +294,10 @@ def collect_filesystem_usage() -> list[dict[str, str | float]]:
                 "used_gb": round(used_gb, 2),
                 "free_gb": round(free_gb, 2),
                 "percent": float(usage.percent),
+                "inodes_total": inodes_total,
+                "inodes_used": inodes_used,
+                "inodes_free": inodes_free,
+                "inodes_percent": inodes_percent,
             }
         )
     return sorted(filesystems, key=lambda item: str(item["mountpoint"]).lower())
@@ -496,74 +594,50 @@ def main() -> None:
     command_next_path = "/api/agent/commands/next"
     base_dir = Path.cwd()
 
+    backoff_seconds = send_interval
     while True:
-        metrics_payload = collect_metrics(args.display_name, args.agent_id)
-        logs_payload = collect_logs_payload(args.display_name, args.agent_id)
-        metrics_response = post_signed_json(
-            server_url=args.server_url,
-            endpoint_path=metrics_path,
-            payload=metrics_payload,
-            timeout=10,
-            agent_id=args.agent_id,
-            agent_secret=args.agent_secret,
-        )
-        metrics_response.raise_for_status()
-        logs_response = post_signed_json(
-            server_url=args.server_url,
-            endpoint_path=logs_path,
-            payload=logs_payload,
-            timeout=20,
-            agent_id=args.agent_id,
-            agent_secret=args.agent_secret,
-        )
-        logs_response.raise_for_status()
+        try:
+            metrics_payload: dict[str, object] = {}
+            logs_payload: dict[str, str | int | list[dict[str, str]]] = {"entries": []}
+            try:
+                metrics_payload = collect_metrics(args.display_name, args.agent_id)
+            except Exception as error:
+                print(f"collect_metrics failed: {error}", file=sys.stderr)
+            try:
+                logs_payload = collect_logs_payload(args.display_name, args.agent_id)
+            except Exception as error:
+                print(f"collect_logs_payload failed: {error}", file=sys.stderr)
 
-        scripts_payload = {
-            "node_id": args.display_name,
-            "scripts": discover_local_scripts(base_dir),
-        }
-        scripts_response = post_signed_json(
-            server_url=args.server_url,
-            endpoint_path=scripts_path,
-            payload=scripts_payload,
-            timeout=10,
-            agent_id=args.agent_id,
-            agent_secret=args.agent_secret,
-        )
-        scripts_response.raise_for_status()
+            if metrics_payload:
+                metrics_response = post_signed_json(server_url=args.server_url, endpoint_path=metrics_path, payload=metrics_payload, timeout=10, agent_id=args.agent_id, agent_secret=args.agent_secret)
+                metrics_response.raise_for_status()
+            if logs_payload:
+                logs_response = post_signed_json(server_url=args.server_url, endpoint_path=logs_path, payload=logs_payload, timeout=20, agent_id=args.agent_id, agent_secret=args.agent_secret)
+                logs_response.raise_for_status()
 
-        command_response = get_signed_json(
-            server_url=args.server_url,
-            endpoint_path=command_next_path,
-            timeout=10,
-            agent_id=args.agent_id,
-            agent_secret=args.agent_secret,
-        )
-        command_response.raise_for_status()
-        command_item = command_response.json().get("item")
-        if command_item:
-            started_at = datetime.now(timezone.utc).isoformat()
-            exit_code, stdout, stderr = run_local_script(base_dir, str(command_item.get("script_id", "")))
-            finished_at = datetime.now(timezone.utc).isoformat()
-            result_payload = {
-                "status": "completed" if exit_code == 0 else "failed",
-                "stdout": stdout,
-                "stderr": stderr,
-                "exit_code": exit_code,
-                "started_at": started_at,
-                "finished_at": finished_at,
-            }
-            result_response = post_signed_json(
-                server_url=args.server_url,
-                endpoint_path=f"/api/agent/commands/{int(command_item['id'])}/result",
-                payload=result_payload,
-                timeout=120,
-                agent_id=args.agent_id,
-                agent_secret=args.agent_secret,
-            )
-            result_response.raise_for_status()
-        print(f"Sent metrics: {json.dumps(metrics_payload)}")
-        print(f"Sent logs entries: {len(logs_payload['entries'])}")
+            scripts_payload = {"node_id": args.display_name, "scripts": discover_local_scripts(base_dir)}
+            scripts_response = post_signed_json(server_url=args.server_url, endpoint_path=scripts_path, payload=scripts_payload, timeout=10, agent_id=args.agent_id, agent_secret=args.agent_secret)
+            scripts_response.raise_for_status()
+
+            command_response = get_signed_json(server_url=args.server_url, endpoint_path=command_next_path, timeout=10, agent_id=args.agent_id, agent_secret=args.agent_secret)
+            command_response.raise_for_status()
+            command_item = command_response.json().get("item")
+            if command_item:
+                started_at = datetime.now(timezone.utc).isoformat()
+                exit_code, stdout, stderr = run_local_script(base_dir, str(command_item.get("script_id", "")))
+                finished_at = datetime.now(timezone.utc).isoformat()
+                result_payload = {"status": "completed" if exit_code == 0 else "failed", "stdout": stdout, "stderr": stderr, "exit_code": exit_code, "started_at": started_at, "finished_at": finished_at}
+                result_response = post_signed_json(server_url=args.server_url, endpoint_path=f"/api/agent/commands/{int(command_item['id'])}/result", payload=result_payload, timeout=120, agent_id=args.agent_id, agent_secret=args.agent_secret)
+                result_response.raise_for_status()
+            if metrics_payload:
+                print(f"Sent metrics: {json.dumps(metrics_payload)}")
+            print(f"Sent logs entries: {len(logs_payload.get('entries', []))}")
+            backoff_seconds = send_interval
+        except Exception as error:
+            print(f"Iteration failed: {error}", file=sys.stderr)
+            time.sleep(backoff_seconds)
+            backoff_seconds = min(backoff_seconds * 2, max(send_interval, 300))
+            continue
         time.sleep(send_interval)
 
 

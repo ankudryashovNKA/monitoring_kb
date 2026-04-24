@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
@@ -39,6 +39,9 @@ from main import (  # noqa: E402
 )
 from app.db.session import SessionLocal  # noqa: E402
 from app.models.agent import Agent  # noqa: E402
+from app.models.filesystem_sample import FilesystemSample  # noqa: E402
+from app.models.process_sample import ProcessSample  # noqa: E402
+from app.services.llm_context import build_node_analysis_context, get_metric_window_stats, group_log_signatures  # noqa: E402
 from app.models.metric import Metric  # noqa: E402
 from app.models.node import Node  # noqa: E402
 from app.models.log_entry import LogEntry  # noqa: E402
@@ -53,6 +56,8 @@ def setup_function() -> None:
         db.query(Metric).delete()
         db.query(LogEntry).delete()
         db.query(Trigger).delete()
+        db.query(FilesystemSample).delete()
+        db.query(ProcessSample).delete()
         db.query(AgentCommand).delete()
         db.query(AgentScript).delete()
         db.query(Node).delete()
@@ -548,3 +553,92 @@ def test_rename_node_updates_cached_top_processes_key() -> None:
     payload = list_top_processes(node_id="node-cache-renamed")
     assert payload["node_id"] == "node-cache-renamed"
     assert payload["top_cpu_processes"]
+
+
+def test_context_builder_schema_without_metrics() -> None:
+    with SessionLocal() as db:
+        db.add(Node(display_name="ctx-node", agent_id=None, os_name="Linux", cpu_cores=2, ram_total_mb=2048, ip_address="127.0.0.1", last_seen=datetime.now(timezone.utc)))
+        db.commit()
+        context = build_node_analysis_context(db, "ctx-node", window_minutes=60)
+    assert context["schema_version"] == "llm_node_context.v2"
+    assert "metrics" in context
+
+
+def test_metric_window_stats_synthetic() -> None:
+    now = datetime.now(timezone.utc)
+    points = [
+        Metric(node_id="n", cpu_percent=10, ram_percent=20, uptime_seconds=1, swap_percent=0, disk_read_time_ms=0, disk_write_time_ms=0, net_recv_kbps=0, net_sent_kbps=0, process_count=1, zombie_processes=0, timestamp=now - timedelta(minutes=2)),
+        Metric(node_id="n", cpu_percent=20, ram_percent=30, uptime_seconds=1, swap_percent=0, disk_read_time_ms=0, disk_write_time_ms=0, net_recv_kbps=0, net_sent_kbps=0, process_count=1, zombie_processes=0, timestamp=now - timedelta(minutes=1)),
+        Metric(node_id="n", cpu_percent=30, ram_percent=40, uptime_seconds=1, swap_percent=0, disk_read_time_ms=0, disk_write_time_ms=0, net_recv_kbps=0, net_sent_kbps=0, process_count=1, zombie_processes=0, timestamp=now),
+    ]
+    stats = get_metric_window_stats(points, ["cpu_percent"])
+    assert stats["cpu_percent"]["avg"] == 20.0
+    assert stats["cpu_percent"]["max"] == 30.0
+    assert stats["cpu_percent"]["p95"] == 30.0
+    assert stats["cpu_percent"]["delta_abs"] == 20.0
+    assert stats["cpu_percent"]["trend"] == "rising"
+
+
+def test_ingest_metric_saves_filesystem_and_process_samples() -> None:
+    ingest_metric(
+        MetricIn(
+            node_id="node-samples",
+            cpu_percent=10,
+            ram_percent=10,
+            os_name="Linux",
+            cpu_cores=2,
+            ram_total_mb=2048,
+            ip_address="10.1.1.1",
+            filesystems=[{"device": "/dev/sda1", "mountpoint": "/", "fstype": "ext4", "total_gb": 100, "used_gb": 80, "free_gb": 20, "percent": 80, "inodes_total": 1000, "inodes_used": 500, "inodes_free": 500, "inodes_percent": 50}],
+            top_cpu_processes=[{"pid": 1, "name": "python", "cpu_percent": 50, "ram_percent": 1, "ram_mb": 10}],
+            top_ram_processes=[{"pid": 2, "name": "java", "cpu_percent": 10, "ram_percent": 20, "ram_mb": 200}],
+        )
+    )
+    with SessionLocal() as db:
+        assert db.query(FilesystemSample).filter(FilesystemSample.node_id == "node-samples").count() == 1
+        assert db.query(ProcessSample).filter(ProcessSample.node_id == "node-samples").count() == 2
+
+
+def test_group_log_signatures_normalizes_numbers_uuid_ip() -> None:
+    now = datetime.now(timezone.utc)
+    logs = [
+        LogEntry(node_id="n", source="s", severity="ERROR", message="pid=123 failed for 10.0.0.1 req 42", captured_at=now),
+        LogEntry(node_id="n", source="s", severity="ERROR", message="pid=999 failed for 10.0.0.2 req 84", captured_at=now),
+    ]
+    grouped = group_log_signatures(logs)
+    assert grouped[0]["count"] == 2
+    assert "<ip>" in grouped[0]["signature"]
+    assert "<num>" in grouped[0]["signature"]
+
+
+def test_llm_context_endpoint_returns_context() -> None:
+    ingest_metric(
+        MetricIn(node_id="node-llm-context", cpu_percent=1, ram_percent=1, os_name="Linux", cpu_cores=2, ram_total_mb=2048, ip_address="1.1.1.1")
+    )
+    client = TestClient(app)
+    login_resp = client.post('/api/auth/login', json={'login': 'admin', 'password': 'admin'})
+    assert login_resp.status_code == 200
+    resp = client.get('/api/llm/context', params={'node_id': 'node-llm-context', 'window_minutes': 60})
+    assert resp.status_code == 200
+    assert resp.json()["schema_version"] == "llm_node_context.v2"
+
+
+def test_llm_analyze_backward_compatible_payload(monkeypatch) -> None:
+    ingest_metric(
+        MetricIn(node_id="node-llm", cpu_percent=1, ram_percent=1, os_name="Linux", cpu_cores=2, ram_total_mb=2048, ip_address="1.1.1.1")
+    )
+
+    def fake_stream(_prompt: str):
+        yield {"response": "ok"}
+
+    monkeypatch.setattr("main._stream_ollama_generate", fake_stream)
+    async def fake_kb(_node_id: str):
+        return {"status": "disabled", "items": [], "active_triggers": [], "matched_node_ids": [], "last_updated": None, "error": None}
+
+    monkeypatch.setattr("main.get_knowledge_base", fake_kb)
+    client = TestClient(app)
+    login_resp = client.post('/api/auth/login', json={'login': 'admin', 'password': 'admin'})
+    assert login_resp.status_code == 200
+    resp = client.post('/api/llm/analyze-node', json={'node_id': 'node-llm'})
+    assert resp.status_code == 200
+    assert 'ok' in resp.text

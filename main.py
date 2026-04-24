@@ -30,6 +30,8 @@ import app.models.agent_script  # noqa: F401
 import app.models.agent_command  # noqa: F401
 import app.models.user  # noqa: F401
 import app.models.agent  # noqa: F401
+import app.models.filesystem_sample  # noqa: F401
+import app.models.process_sample  # noqa: F401
 from app.security.agent_auth import (
     register_agent,
     rotate_agent_secret,
@@ -47,18 +49,30 @@ from app.models.trigger import Trigger
 from app.models.agent_script import AgentScript
 from app.models.agent_command import AgentCommand
 from app.models.user import User
+from app.models.filesystem_sample import FilesystemSample
+from app.models.process_sample import ProcessSample
 from app.security.user_auth import decode_session_token, hash_password, make_session_token, verify_password
 from sqlalchemy import inspect, text
+from app.services.llm_context import build_node_analysis_context
+from app.services.llm_prompt import build_node_analysis_prompt
 
-RETENTION_PERIOD = timedelta(hours=1)
+METRICS_RETENTION_HOURS = int(os.getenv("METRICS_RETENTION_HOURS", "168"))
+FILESYSTEM_RETENTION_HOURS = int(os.getenv("FILESYSTEM_RETENTION_HOURS", "168"))
+PROCESS_RETENTION_HOURS = int(os.getenv("PROCESS_RETENTION_HOURS", "24"))
+LOG_RETENTION_PER_NODE_AND_SEVERITY = int(os.getenv("LOG_RETENTION_PER_NODE_AND_SEVERITY", "2000"))
+RETENTION_PERIOD = timedelta(hours=METRICS_RETENTION_HOURS)
 RECENT_POINTS_LIMIT = 10
 LOG_POINTS_LIMIT = 100
-MAX_STORED_LOGS_PER_NODE_AND_SEVERITY = 2000
+MAX_STORED_LOGS_PER_NODE_AND_SEVERITY = LOG_RETENTION_PER_NODE_AND_SEVERITY
 LOG_SEVERITY_LEVELS = ("DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY")
 
 logger = logging.getLogger(__name__)
-OLLAMA_MODEL = "gpt-oss:120b-cloud"
-OLLAMA_HOST = "https://ollama.com"
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:120b-cloud")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "https://ollama.com")
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
+LLM_CONTEXT_MAX_RECENT_POINTS = int(os.getenv("LLM_CONTEXT_MAX_RECENT_POINTS", "15"))
+LLM_CONTEXT_MAX_LOG_SIGNATURES = int(os.getenv("LLM_CONTEXT_MAX_LOG_SIGNATURES", "10"))
+LLM_CONTEXT_MAX_LOG_EXAMPLES_PER_SIGNATURE = int(os.getenv("LLM_CONTEXT_MAX_LOG_EXAMPLES_PER_SIGNATURE", "3"))
 
 METRIC_VALUE_EXTRACTORS = {
     "cpu_percent": lambda metric: float(metric.cpu_percent),
@@ -71,6 +85,27 @@ METRIC_VALUE_EXTRACTORS = {
     "net_sent_kbps": lambda metric: float(metric.net_sent_kbps),
     "process_count": lambda metric: float(metric.process_count),
     "zombie_processes": lambda metric: float(metric.zombie_processes),
+    "load1": lambda metric: float(metric.load1 or 0.0),
+    "load5": lambda metric: float(metric.load5 or 0.0),
+    "load15": lambda metric: float(metric.load15 or 0.0),
+    "cpu_iowait_percent": lambda metric: float(metric.cpu_iowait_percent or 0.0),
+    "cpu_steal_percent": lambda metric: float(metric.cpu_steal_percent or 0.0),
+    "ram_used_mb": lambda metric: float(metric.ram_used_mb or 0.0),
+    "ram_available_mb": lambda metric: float(metric.ram_available_mb or 0.0),
+    "swap_used_mb": lambda metric: float(metric.swap_used_mb or 0.0),
+    "swap_free_mb": lambda metric: float(metric.swap_free_mb or 0.0),
+    "disk_read_kbps": lambda metric: float(metric.disk_read_kbps or 0.0),
+    "disk_write_kbps": lambda metric: float(metric.disk_write_kbps or 0.0),
+    "disk_read_iops": lambda metric: float(metric.disk_read_iops or 0.0),
+    "disk_write_iops": lambda metric: float(metric.disk_write_iops or 0.0),
+    "net_packets_recv_per_sec": lambda metric: float(metric.net_packets_recv_per_sec or 0.0),
+    "net_packets_sent_per_sec": lambda metric: float(metric.net_packets_sent_per_sec or 0.0),
+    "net_errors_in_per_sec": lambda metric: float(metric.net_errors_in_per_sec or 0.0),
+    "net_errors_out_per_sec": lambda metric: float(metric.net_errors_out_per_sec or 0.0),
+    "net_drops_in_per_sec": lambda metric: float(metric.net_drops_in_per_sec or 0.0),
+    "net_drops_out_per_sec": lambda metric: float(metric.net_drops_out_per_sec or 0.0),
+    "tcp_established": lambda metric: float(metric.tcp_established or 0.0),
+    "tcp_listen": lambda metric: float(metric.tcp_listen or 0.0),
 }
 
 
@@ -96,6 +131,10 @@ class NodeInfo:
 class TopProcessIn(BaseModel):
     pid: int = Field(..., ge=0)
     name: str = Field(..., min_length=1, max_length=300)
+    username: str | None = Field(default=None, max_length=300)
+    cmdline: str | None = Field(default=None, max_length=500)
+    status: str | None = Field(default=None, max_length=64)
+    create_time: datetime | None = None
     cpu_percent: float = Field(..., ge=0)
     ram_percent: float = Field(..., ge=0, le=100)
     ram_mb: int = Field(..., ge=0)
@@ -109,6 +148,10 @@ class FilesystemUsageIn(BaseModel):
     used_gb: float = Field(..., ge=0)
     free_gb: float = Field(..., ge=0)
     percent: float = Field(..., ge=0, le=100)
+    inodes_total: int | None = Field(default=None, ge=0)
+    inodes_used: int | None = Field(default=None, ge=0)
+    inodes_free: int | None = Field(default=None, ge=0)
+    inodes_percent: float | None = Field(default=None, ge=0, le=100)
 
 
 class MetricIn(BaseModel):
@@ -124,6 +167,27 @@ class MetricIn(BaseModel):
     net_sent_kbps: float = Field(default=0, ge=0)
     process_count: int = Field(default=0, ge=0)
     zombie_processes: int = Field(default=0, ge=0)
+    load1: float | None = Field(default=None)
+    load5: float | None = Field(default=None)
+    load15: float | None = Field(default=None)
+    cpu_iowait_percent: float | None = Field(default=None)
+    cpu_steal_percent: float | None = Field(default=None)
+    ram_used_mb: int | None = Field(default=None, ge=0)
+    ram_available_mb: int | None = Field(default=None, ge=0)
+    swap_used_mb: int | None = Field(default=None, ge=0)
+    swap_free_mb: int | None = Field(default=None, ge=0)
+    disk_read_kbps: float | None = Field(default=None, ge=0)
+    disk_write_kbps: float | None = Field(default=None, ge=0)
+    disk_read_iops: float | None = Field(default=None, ge=0)
+    disk_write_iops: float | None = Field(default=None, ge=0)
+    net_packets_recv_per_sec: float | None = Field(default=None, ge=0)
+    net_packets_sent_per_sec: float | None = Field(default=None, ge=0)
+    net_errors_in_per_sec: float | None = Field(default=None, ge=0)
+    net_errors_out_per_sec: float | None = Field(default=None, ge=0)
+    net_drops_in_per_sec: float | None = Field(default=None, ge=0)
+    net_drops_out_per_sec: float | None = Field(default=None, ge=0)
+    tcp_established: int | None = Field(default=None, ge=0)
+    tcp_listen: int | None = Field(default=None, ge=0)
     os_name: str = Field(..., min_length=1, max_length=200)
     cpu_cores: int = Field(..., ge=1, le=4096)
     ram_total_mb: int = Field(..., ge=1)
@@ -215,6 +279,8 @@ class LLMGenerateIn(BaseModel):
 
 class LLMNodeAnalysisIn(BaseModel):
     node_id: str = Field(..., min_length=1, max_length=100)
+    window_minutes: int = Field(default=60, ge=10, le=1440)
+    include_raw: bool = False
 
 
 class LoginIn(BaseModel):
@@ -276,6 +342,8 @@ def init_db() -> None:
     _migrate_agent_commands_table()
     _migrate_metrics_table()
     _migrate_log_entries_table()
+    _migrate_filesystem_samples_table()
+    _migrate_process_samples_table()
     _ensure_admin_user()
 
 
@@ -395,10 +463,23 @@ def _migrate_metrics_table() -> None:
         statements.append("ALTER TABLE metrics ADD COLUMN process_count INTEGER NOT NULL DEFAULT 0")
     if "zombie_processes" not in existing_columns:
         statements.append("ALTER TABLE metrics ADD COLUMN zombie_processes INTEGER NOT NULL DEFAULT 0")
+    for col, ddl in (
+        ("load1", "FLOAT"), ("load5", "FLOAT"), ("load15", "FLOAT"), ("cpu_iowait_percent", "FLOAT"),
+        ("cpu_steal_percent", "FLOAT"), ("ram_used_mb", "INTEGER"), ("ram_available_mb", "INTEGER"),
+        ("swap_used_mb", "INTEGER"), ("swap_free_mb", "INTEGER"), ("disk_read_kbps", "FLOAT"),
+        ("disk_write_kbps", "FLOAT"), ("disk_read_iops", "FLOAT"), ("disk_write_iops", "FLOAT"),
+        ("net_packets_recv_per_sec", "FLOAT"), ("net_packets_sent_per_sec", "FLOAT"), ("net_errors_in_per_sec", "FLOAT"),
+        ("net_errors_out_per_sec", "FLOAT"), ("net_drops_in_per_sec", "FLOAT"), ("net_drops_out_per_sec", "FLOAT"),
+        ("tcp_established", "INTEGER"), ("tcp_listen", "INTEGER"),
+    ):
+        if col not in existing_columns:
+            statements.append(f"ALTER TABLE metrics ADD COLUMN {col} {ddl}")
 
     with engine.begin() as connection:
         for statement in statements:
             connection.execute(text(statement))
+        with contextlib.suppress(Exception):
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_metrics_node_timestamp_desc ON metrics (node_id, timestamp DESC)"))
 
 
 def _migrate_triggers_table() -> None:
@@ -453,6 +534,24 @@ def _migrate_agent_commands_table() -> None:
             else:
                 with contextlib.suppress(Exception):
                     connection.execute(text(statement))
+
+
+def _migrate_filesystem_samples_table() -> None:
+    inspector = inspect(engine)
+    if "filesystem_samples" not in inspector.get_table_names():
+        return
+    with engine.begin() as connection:
+        with contextlib.suppress(Exception):
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_filesystem_samples_node_mount_ts_desc ON filesystem_samples (node_id, mountpoint, timestamp DESC)"))
+
+
+def _migrate_process_samples_table() -> None:
+    inspector = inspect(engine)
+    if "process_samples" not in inspector.get_table_names():
+        return
+    with engine.begin() as connection:
+        with contextlib.suppress(Exception):
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_process_samples_node_ts_desc ON process_samples (node_id, timestamp DESC)"))
 
 
 def _knowledge_base_enabled() -> bool:
@@ -722,10 +821,12 @@ def ingest_metric(metric: MetricIn) -> dict[str, str]:
         timestamp = timestamp.replace(tzinfo=timezone.utc)
 
     normalized_timestamp = timestamp.astimezone(timezone.utc)
-    cutoff = _utcnow() - RETENTION_PERIOD
+    metrics_cutoff = _utcnow() - timedelta(hours=METRICS_RETENTION_HOURS)
+    fs_cutoff = _utcnow() - timedelta(hours=FILESYSTEM_RETENTION_HOURS)
+    proc_cutoff = _utcnow() - timedelta(hours=PROCESS_RETENTION_HOURS)
 
     with SessionLocal() as db:
-        db.query(Metric).filter(Metric.timestamp < cutoff).delete(synchronize_session=False)
+        db.query(Metric).filter(Metric.timestamp < metrics_cutoff).delete(synchronize_session=False)
 
         node = db.query(Node).filter(Node.display_name == metric.node_id).first()
         if node is None:
@@ -761,9 +862,36 @@ def ingest_metric(metric: MetricIn) -> dict[str, str]:
                 net_sent_kbps=metric.net_sent_kbps,
                 process_count=metric.process_count,
                 zombie_processes=metric.zombie_processes,
+                load1=metric.load1,
+                load5=metric.load5,
+                load15=metric.load15,
+                cpu_iowait_percent=metric.cpu_iowait_percent,
+                cpu_steal_percent=metric.cpu_steal_percent,
+                ram_used_mb=metric.ram_used_mb,
+                ram_available_mb=metric.ram_available_mb,
+                swap_used_mb=metric.swap_used_mb,
+                swap_free_mb=metric.swap_free_mb,
+                disk_read_kbps=metric.disk_read_kbps,
+                disk_write_kbps=metric.disk_write_kbps,
+                disk_read_iops=metric.disk_read_iops,
+                disk_write_iops=metric.disk_write_iops,
+                net_packets_recv_per_sec=metric.net_packets_recv_per_sec,
+                net_packets_sent_per_sec=metric.net_packets_sent_per_sec,
+                net_errors_in_per_sec=metric.net_errors_in_per_sec,
+                net_errors_out_per_sec=metric.net_errors_out_per_sec,
+                net_drops_in_per_sec=metric.net_drops_in_per_sec,
+                net_drops_out_per_sec=metric.net_drops_out_per_sec,
+                tcp_established=metric.tcp_established,
+                tcp_listen=metric.tcp_listen,
                 timestamp=normalized_timestamp,
             )
         )
+        for fs in metric.filesystems[:100]:
+            db.add(FilesystemSample(node_id=metric.node_id, device=fs.device, mountpoint=fs.mountpoint, fstype=fs.fstype, total_gb=fs.total_gb, used_gb=fs.used_gb, free_gb=fs.free_gb, percent=fs.percent, inodes_total=fs.inodes_total, inodes_used=fs.inodes_used, inodes_free=fs.inodes_free, inodes_percent=fs.inodes_percent, timestamp=normalized_timestamp))
+        for proc in metric.top_cpu_processes[:10]:
+            db.add(ProcessSample(node_id=metric.node_id, pid=proc.pid, name=proc.name, username=proc.username, cmdline=proc.cmdline, status=proc.status, cpu_percent=proc.cpu_percent, ram_percent=proc.ram_percent, ram_mb=proc.ram_mb, kind="cpu", timestamp=normalized_timestamp))
+        for proc in metric.top_ram_processes[:10]:
+            db.add(ProcessSample(node_id=metric.node_id, pid=proc.pid, name=proc.name, username=proc.username, cmdline=proc.cmdline, status=proc.status, cpu_percent=proc.cpu_percent, ram_percent=proc.ram_percent, ram_mb=proc.ram_mb, kind="ram", timestamp=normalized_timestamp))
         _process_trigger_alerts(db, metric.node_id, metric)
         db.commit()
 
@@ -986,9 +1114,10 @@ def list_logs(node_id: str, severity: str = Query(default="INFO")) -> dict[str, 
 def list_metrics(node_id: str | None = None) -> dict[str, list[dict[str, str | float]]]:
     now = _utcnow()
     cutoff = now - RETENTION_PERIOD
+    metrics_cutoff = cutoff
 
     with SessionLocal() as db:
-        db.query(Metric).filter(Metric.timestamp < cutoff).delete(synchronize_session=False)
+        db.query(Metric).filter(Metric.timestamp < metrics_cutoff).delete(synchronize_session=False)
         db.commit()
 
         query = (
@@ -1016,6 +1145,27 @@ def list_metrics(node_id: str | None = None) -> dict[str, list[dict[str, str | f
                 "net_sent_kbps": metric.net_sent_kbps,
                 "process_count": metric.process_count,
                 "zombie_processes": metric.zombie_processes,
+                "load1": metric.load1,
+                "load5": metric.load5,
+                "load15": metric.load15,
+                "cpu_iowait_percent": metric.cpu_iowait_percent,
+                "cpu_steal_percent": metric.cpu_steal_percent,
+                "ram_used_mb": metric.ram_used_mb,
+                "ram_available_mb": metric.ram_available_mb,
+                "swap_used_mb": metric.swap_used_mb,
+                "swap_free_mb": metric.swap_free_mb,
+                "disk_read_kbps": metric.disk_read_kbps,
+                "disk_write_kbps": metric.disk_write_kbps,
+                "disk_read_iops": metric.disk_read_iops,
+                "disk_write_iops": metric.disk_write_iops,
+                "net_packets_recv_per_sec": metric.net_packets_recv_per_sec,
+                "net_packets_sent_per_sec": metric.net_packets_sent_per_sec,
+                "net_errors_in_per_sec": metric.net_errors_in_per_sec,
+                "net_errors_out_per_sec": metric.net_errors_out_per_sec,
+                "net_drops_in_per_sec": metric.net_drops_in_per_sec,
+                "net_drops_out_per_sec": metric.net_drops_out_per_sec,
+                "tcp_established": metric.tcp_established,
+                "tcp_listen": metric.tcp_listen,
                 "timestamp": metric.timestamp.isoformat(),
                 "display_name": display_name,
             }
@@ -1049,22 +1199,46 @@ def list_filesystems(node_id: str) -> dict[str, object]:
         node = db.query(Node).filter(Node.display_name == node_id).first()
         if node is None:
             raise HTTPException(status_code=404, detail="Node not found")
+        rows = (
+            db.query(FilesystemSample)
+            .filter(FilesystemSample.node_id == node_id)
+            .order_by(FilesystemSample.timestamp.desc())
+            .limit(500)
+            .all()
+        )
 
-    payload = _latest_filesystems.get(node_id)
-    if payload is None:
-        return {"node_id": node_id, "filesystems": [], "timestamp": None}
-    return payload
+    latest_by_mount: dict[str, FilesystemSample] = {}
+    for row in rows:
+        latest_by_mount.setdefault(row.mountpoint, row)
+    items = [
+        {
+            "device": row.device,
+            "mountpoint": row.mountpoint,
+            "fstype": row.fstype,
+            "total_gb": row.total_gb,
+            "used_gb": row.used_gb,
+            "free_gb": row.free_gb,
+            "percent": row.percent,
+            "inodes_total": row.inodes_total,
+            "inodes_used": row.inodes_used,
+            "inodes_free": row.inodes_free,
+            "inodes_percent": row.inodes_percent,
+            "timestamp": row.timestamp.isoformat(),
+        }
+        for row in latest_by_mount.values()
+    ]
+    latest_ts = max((item["timestamp"] for item in items), default=None)
+    return {"node_id": node_id, "filesystems": items, "timestamp": latest_ts}
 
 
 @app.get("/api/metrics/history")
 def list_metric_history(
     node_id: str,
-    metric_name: str = Query(
-        "cpu_percent",
-        pattern="^(cpu_percent|ram_percent|swap_percent|uptime_seconds|disk_read_time_ms|disk_write_time_ms|net_recv_kbps|net_sent_kbps|process_count|zombie_processes)$",
-    ),
+    metric_name: str = Query("cpu_percent", pattern="^[a-z0-9_]+$"),
     interval_minutes: int = Query(15, ge=1, le=60),
 ) -> dict[str, str | list[dict[str, str | float]]]:
+    if metric_name not in METRIC_VALUE_EXTRACTORS:
+        raise HTTPException(status_code=400, detail=f"Unsupported metric: {metric_name}")
     now = _utcnow()
     cutoff = max(now - RETENTION_PERIOD, now - timedelta(minutes=interval_minutes))
 
@@ -1152,6 +1326,8 @@ def rename_node(node_id: str, payload: NodeRenameIn) -> dict[str, str | int]:
         db.query(Trigger).filter(Trigger.node_id == node_id).update({"node_id": next_name}, synchronize_session=False)
         db.query(AgentScript).filter(AgentScript.node_id == node_id).update({"node_id": next_name}, synchronize_session=False)
         db.query(AgentCommand).filter(AgentCommand.node_id == node_id).update({"node_id": next_name}, synchronize_session=False)
+        db.query(FilesystemSample).filter(FilesystemSample.node_id == node_id).update({"node_id": next_name}, synchronize_session=False)
+        db.query(ProcessSample).filter(ProcessSample.node_id == node_id).update({"node_id": next_name}, synchronize_session=False)
         node.display_name = next_name
         db.commit()
         db.refresh(node)
@@ -1573,9 +1749,26 @@ def _stream_ollama_generate(prompt: str) -> object:
     return client.generate(
         model=OLLAMA_MODEL,
         prompt=prompt,
-        keep_alive="30m",
+        keep_alive=OLLAMA_KEEP_ALIVE,
         stream=True,
     )
+
+
+@app.get("/api/llm/context")
+def get_llm_node_context(node_id: str = Query(..., min_length=1, max_length=100), window_minutes: int = Query(60, ge=10, le=1440)) -> dict[str, object]:
+    with SessionLocal() as db:
+        node = db.query(Node).filter(Node.display_name == node_id).first()
+        if node is None:
+            raise HTTPException(status_code=404, detail="Node not found")
+        context = build_node_analysis_context(
+            db,
+            node_id=node_id,
+            window_minutes=window_minutes,
+            max_recent_points=LLM_CONTEXT_MAX_RECENT_POINTS,
+            max_log_signatures=LLM_CONTEXT_MAX_LOG_SIGNATURES,
+            max_log_examples_per_signature=LLM_CONTEXT_MAX_LOG_EXAMPLES_PER_SIGNATURE,
+        )
+    return context
 
 
 @app.post("/api/llm/analyze-node")
@@ -1584,86 +1777,37 @@ async def analyze_node_with_llm(payload: LLMNodeAnalysisIn) -> StreamingResponse
         node = db.query(Node).filter(Node.display_name == payload.node_id).first()
         if node is None:
             raise HTTPException(status_code=404, detail="Node not found")
-        agent_enabled = False
-        if node.agent_id:
-            agent = db.query(Agent).filter(Agent.agent_id == node.agent_id).first()
-            agent_enabled = bool(agent.enabled) if agent else False
-
-        metric = (
-            db.query(Metric)
-            .filter(Metric.node_id == payload.node_id)
-            .order_by(Metric.timestamp.desc())
-            .first()
+        context = build_node_analysis_context(
+            db,
+            node_id=payload.node_id,
+            window_minutes=payload.window_minutes,
+            max_recent_points=LLM_CONTEXT_MAX_RECENT_POINTS,
+            max_log_signatures=LLM_CONTEXT_MAX_LOG_SIGNATURES,
+            max_log_examples_per_signature=LLM_CONTEXT_MAX_LOG_EXAMPLES_PER_SIGNATURE,
         )
-        active_triggers = (
-            db.query(Trigger)
-            .filter(Trigger.node_id == payload.node_id)
-            .all()
-        )
-        active_trigger_items = [
-            {
-                "id": trigger.id,
-                "name": trigger.name,
-                "metric_name": trigger.metric_name,
-                "operator": trigger.operator,
-                "threshold": trigger.threshold,
-            }
-            for trigger in active_triggers
-            if _is_trigger_active(trigger, metric)
-        ]
-
-        logs = _collect_logs_for_llm(db, payload.node_id)
-        top_payload = _latest_top_processes.get(payload.node_id, {})
-
-    kb_payload = await get_knowledge_base(payload.node_id)
-    kb_items = kb_payload.get("items", []) if isinstance(kb_payload, dict) else []
-
-    analysis_payload: dict[str, object] = {
-        "node": {
-            "node_id": node.display_name,
-            "os_name": node.os_name,
-            "ip_address": node.ip_address,
-            "agent_id": node.agent_id,
-            "agent_enabled": agent_enabled,
-            "last_seen": node.last_seen.isoformat() if node.last_seen else None,
-        },
-        "latest_metric": {
-            "timestamp": metric.timestamp.isoformat() if metric else None,
-            "cpu_percent": metric.cpu_percent if metric else None,
-            "ram_percent": metric.ram_percent if metric else None,
-            "swap_percent": metric.swap_percent if metric else None,
-            "uptime_seconds": metric.uptime_seconds if metric else None,
-            "disk_read_time_ms": metric.disk_read_time_ms if metric else None,
-            "disk_write_time_ms": metric.disk_write_time_ms if metric else None,
-            "net_recv_kbps": metric.net_recv_kbps if metric else None,
-            "net_sent_kbps": metric.net_sent_kbps if metric else None,
-            "process_count": metric.process_count if metric else None,
-            "zombie_processes": metric.zombie_processes if metric else None,
-        },
-        "active_triggers": active_trigger_items,
-        "logs_above_info": logs,
-        "top": {
-            "timestamp": top_payload.get("timestamp"),
-            "top_cpu_processes": top_payload.get("top_cpu_processes", []),
-            "top_ram_processes": top_payload.get("top_ram_processes", []),
-        },
-        "knowledge_base": {
-            "status": kb_payload.get("status") if isinstance(kb_payload, dict) else "error",
-            "error": kb_payload.get("error") if isinstance(kb_payload, dict) else "Unknown KB response",
-            "items": kb_items,
-            "active_triggers": kb_payload.get("active_triggers", []) if isinstance(kb_payload, dict) else [],
-            "matched_node_ids": kb_payload.get("matched_node_ids", []) if isinstance(kb_payload, dict) else [],
-            "last_updated": kb_payload.get("last_updated") if isinstance(kb_payload, dict) else None,
-        },
+    try:
+        kb_payload = await get_knowledge_base(payload.node_id)
+    except Exception as exc:
+        kb_payload = {"status": "error", "error": str(exc), "items": [], "active_triggers": [], "matched_node_ids": [], "last_updated": None}
+    context["knowledge_base"] = {
+        "status": kb_payload.get("status") if isinstance(kb_payload, dict) else "error",
+        "error": kb_payload.get("error") if isinstance(kb_payload, dict) else "Unknown KB response",
+        "items": kb_payload.get("items", []) if isinstance(kb_payload, dict) else [],
+        "active_triggers": kb_payload.get("active_triggers", []) if isinstance(kb_payload, dict) else [],
+        "matched_node_ids": kb_payload.get("matched_node_ids", []) if isinstance(kb_payload, dict) else [],
+        "last_updated": kb_payload.get("last_updated") if isinstance(kb_payload, dict) else None,
     }
 
-    prompt = _build_node_analysis_prompt(analysis_payload)
+    prompt = build_node_analysis_prompt(context)
+
     def stream_llm_response() -> object:
         try:
             for data in _stream_ollama_generate(prompt):
                 chunk = str(data.get("response", ""))
                 if chunk:
                     yield chunk
+            if payload.include_raw:
+                yield "\n\n---\nRaw context JSON:\n" + json.dumps(context, ensure_ascii=False, indent=2)
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"LLM service error: {exc}") from exc
 
@@ -1692,7 +1836,7 @@ def dashboard() -> str:
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Monitoring KB</title>
+    <title>Monitoring KB MVP</title>
     <link
         rel="icon"
         type="image/svg+xml"
@@ -2186,6 +2330,8 @@ def dashboard() -> str:
                             <th>Used (GB)</th>
                             <th>Free (GB)</th>
                             <th>Used %</th>
+                            <th>Inodes %</th>
+                            <th>Sample time (UTC+3)</th>
                         </tr>
                     </thead>
                     <tbody id="filesystems-body"></tbody>
@@ -2511,12 +2657,15 @@ def dashboard() -> str:
             <section class="panel tab-panel" data-panel="llm" hidden>
                 <div class="page-header">
                     <h2>LLM</h2>
-                    <p class="meta">Выберите узел и запустите автоматический анализ: метрики, активные триггеры, логи выше INFO, top и выводы Knowledge Base.</p>
+                    <p class="meta">LLM анализирует тренды метрик, filesystem, логи, top processes, triggers, remediation и Knowledge Base.</p>
                 </div>
                 <div class="toolbar">
                     <label><span class="meta">Node</span><br /><select id="llm-node-select"></select></label>
+                    <label><span class="meta">Window</span><br /><select id="llm-window-select"><option value="10">10m</option><option value="30">30m</option><option value="60" selected>60m</option><option value="360">6h</option><option value="1440">24h</option></select></label>
+                    <label><input id="llm-show-context" type="checkbox" /> Show context JSON</label>
                     <button id="run-llm" type="button">Analyze node</button>
                 </div>
+                <details id="llm-context-wrap" hidden><summary>Context JSON</summary><pre id="llm-context-json"></pre></details>
                 <div>
                     <label>
                         <span class="meta">Model output</span><br />
@@ -2587,6 +2736,27 @@ def dashboard() -> str:
             net_sent_kbps: { label: 'Net sent (KB/s)', unit: ' KB/s' },
             process_count: { label: 'Processes', unit: '' },
             zombie_processes: { label: 'Zombie processes', unit: '' },
+            load1: { label: 'Load 1m', unit: '' },
+            load5: { label: 'Load 5m', unit: '' },
+            load15: { label: 'Load 15m', unit: '' },
+            cpu_iowait_percent: { label: 'CPU iowait %', unit: '%' },
+            cpu_steal_percent: { label: 'CPU steal %', unit: '%' },
+            ram_used_mb: { label: 'RAM used MB', unit: ' MB' },
+            ram_available_mb: { label: 'RAM available MB', unit: ' MB' },
+            swap_used_mb: { label: 'Swap used MB', unit: ' MB' },
+            swap_free_mb: { label: 'Swap free MB', unit: ' MB' },
+            disk_read_kbps: { label: 'Disk read KB/s', unit: ' KB/s' },
+            disk_write_kbps: { label: 'Disk write KB/s', unit: ' KB/s' },
+            disk_read_iops: { label: 'Disk read IOPS', unit: '' },
+            disk_write_iops: { label: 'Disk write IOPS', unit: '' },
+            net_packets_recv_per_sec: { label: 'Packets recv/s', unit: '' },
+            net_packets_sent_per_sec: { label: 'Packets sent/s', unit: '' },
+            net_errors_in_per_sec: { label: 'Net errors in/s', unit: '' },
+            net_errors_out_per_sec: { label: 'Net errors out/s', unit: '' },
+            net_drops_in_per_sec: { label: 'Net drops in/s', unit: '' },
+            net_drops_out_per_sec: { label: 'Net drops out/s', unit: '' },
+            tcp_established: { label: 'TCP established', unit: '' },
+            tcp_listen: { label: 'TCP listen', unit: '' },
         };
 
         const state = {
@@ -2607,6 +2777,9 @@ def dashboard() -> str:
             kbSelectedNodeId: '',
             llmSelectedNodeId: '',
             llmRawOutput: '',
+            llmWindowMinutes: 60,
+            llmShowContext: false,
+            llmContextJson: null,
             activeMenuKey: '',
             activeMenuData: null,
             activeTab: 'latest',
@@ -2634,6 +2807,22 @@ def dashboard() -> str:
 
         function formatRamMb(value) {
             return `${(value / 1024).toFixed(1)} GB (${value} MB)`;
+        }
+
+
+        function populateGraphMetricOptions() {
+            const select = document.getElementById('graph-metric-select');
+            const current = select.value || 'cpu_percent';
+            select.innerHTML = '';
+            Object.entries(METRIC_META).forEach(([metricName, meta]) => {
+                const option = document.createElement('option');
+                option.value = metricName;
+                option.textContent = meta.label;
+                select.appendChild(option);
+            });
+            if (METRIC_META[current]) {
+                select.value = current;
+            }
         }
 
         function metricLabel(metricName) {
@@ -2695,6 +2884,19 @@ def dashboard() -> str:
                 html = html.replace(`__CODE_BLOCK_${index}__`, codeBlock);
             });
             return html;
+        }
+
+
+        function renderLlmContext() {
+            const wrap = document.getElementById('llm-context-wrap');
+            const pre = document.getElementById('llm-context-json');
+            if (!state.llmShowContext) {
+                wrap.hidden = true;
+                pre.textContent = '';
+                return;
+            }
+            wrap.hidden = false;
+            pre.textContent = state.llmContextJson ? JSON.stringify(state.llmContextJson, null, 2) : 'No context loaded';
         }
 
         function renderLlmOutput() {
@@ -2955,7 +3157,7 @@ def dashboard() -> str:
             const body = document.getElementById('filesystems-body');
             body.innerHTML = '';
             if (!filesystems.length) {
-                body.innerHTML = '<tr><td colspan="7" class="empty">No filesystem data yet.</td></tr>';
+                body.innerHTML = '<tr><td colspan="9" class="empty">No filesystem data yet.</td></tr>';
                 return;
             }
             for (const item of filesystems) {
@@ -2968,6 +3170,8 @@ def dashboard() -> str:
                     <td>${Number(item.used_gb).toFixed(2)}</td>
                     <td>${Number(item.free_gb).toFixed(2)}</td>
                     <td>${Number(item.percent).toFixed(2)}</td>
+                    <td>${item.inodes_percent == null ? "-" : Number(item.inodes_percent).toFixed(2)}</td>
+                    <td>${item.timestamp ? formatUtc(item.timestamp) : "-"}</td>
                 `;
                 body.appendChild(row);
             }
@@ -3601,12 +3805,22 @@ def dashboard() -> str:
             }
             setStatus('llm-status', 'Analyzing node with LLM...');
             state.llmRawOutput = '';
+            state.llmContextJson = null;
             renderLlmOutput();
+            renderLlmContext();
+            if (state.llmShowContext) {
+                try {
+                    state.llmContextJson = await fetchJson(`/api/llm/context?node_id=${encodeURIComponent(state.llmSelectedNodeId)}&window_minutes=${encodeURIComponent(state.llmWindowMinutes)}`);
+                    renderLlmContext();
+                } catch (contextError) {
+                    setStatus('llm-status', `Context fetch failed: ${contextError.message}`, true);
+                }
+            }
             try {
                 const response = await fetch('/api/llm/analyze-node', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ node_id: state.llmSelectedNodeId }),
+                    body: JSON.stringify({ node_id: state.llmSelectedNodeId, window_minutes: Number(state.llmWindowMinutes || 60) }),
                 });
                 if (!response.ok) {
                     let detail = response.statusText || 'Request failed';
@@ -3751,6 +3965,8 @@ def dashboard() -> str:
             state.llmSelectedNodeId = event.target.value;
             setStatus('llm-status', state.llmSelectedNodeId ? 'Node selected. Click "Analyze node".' : 'Choose a node for LLM analysis.');
         });
+        document.getElementById('llm-window-select').addEventListener('change', (event) => { state.llmWindowMinutes = Number(event.target.value || 60); });
+        document.getElementById('llm-show-context').addEventListener('change', (event) => { state.llmShowContext = Boolean(event.target.checked); renderLlmContext(); });
         document.getElementById('run-llm').addEventListener('click', runLlm);
         document.getElementById('auth-sign-in').addEventListener('click', signIn);
         document.getElementById('sign-out').addEventListener('click', signOut);
