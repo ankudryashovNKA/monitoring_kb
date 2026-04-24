@@ -541,6 +541,8 @@ def _migrate_agent_scripts_table() -> None:
     dialect_name = engine.dialect.name
     bool_default_true = "TRUE" if dialect_name == "postgresql" else "1"
     bool_default_false = "FALSE" if dialect_name == "postgresql" else "0"
+    bool_true_value = "TRUE" if dialect_name == "postgresql" else "1"
+    bool_false_value = "FALSE" if dialect_name == "postgresql" else "0"
     existing_columns = {column["name"] for column in inspector.get_columns("agent_scripts")}
     statements: list[str] = []
     if "content_hash" not in existing_columns:
@@ -574,10 +576,10 @@ def _migrate_agent_scripts_table() -> None:
         connection.execute(text("UPDATE agent_scripts SET description = '' WHERE description IS NULL"))
         connection.execute(text("UPDATE agent_scripts SET tags_json = '[]' WHERE tags_json IS NULL OR tags_json = ''"))
         connection.execute(text("UPDATE agent_scripts SET risk_level = 'medium' WHERE risk_level IS NULL OR risk_level = ''"))
-        connection.execute(text("UPDATE agent_scripts SET requires_confirmation = 1 WHERE requires_confirmation IS NULL"))
-        connection.execute(text("UPDATE agent_scripts SET dry_run_supported = 0 WHERE dry_run_supported IS NULL"))
+        connection.execute(text(f"UPDATE agent_scripts SET requires_confirmation = {bool_true_value} WHERE requires_confirmation IS NULL"))
+        connection.execute(text(f"UPDATE agent_scripts SET dry_run_supported = {bool_false_value} WHERE dry_run_supported IS NULL"))
         connection.execute(text("UPDATE agent_scripts SET args_schema_json = '{}' WHERE args_schema_json IS NULL OR args_schema_json = ''"))
-        connection.execute(text("UPDATE agent_scripts SET enabled = 1 WHERE enabled IS NULL"))
+        connection.execute(text(f"UPDATE agent_scripts SET enabled = {bool_true_value} WHERE enabled IS NULL"))
         statement = "CREATE UNIQUE INDEX IF NOT EXISTS ix_agent_scripts_node_script ON agent_scripts (node_id, script_id)"
         if dialect_name == "postgresql":
             connection.execute(text(statement))
@@ -592,6 +594,7 @@ def _migrate_agent_commands_table() -> None:
         return
     dialect_name = engine.dialect.name
     bool_default_false = "FALSE" if dialect_name == "postgresql" else "0"
+    bool_false_value = "FALSE" if dialect_name == "postgresql" else "0"
     existing_columns = {column["name"] for column in inspector.get_columns("agent_commands")}
     statements: list[str] = []
     if "source" not in existing_columns:
@@ -611,7 +614,7 @@ def _migrate_agent_commands_table() -> None:
             connection.execute(text(statement))
         connection.execute(text("UPDATE agent_commands SET source = 'trigger' WHERE source IS NULL OR source = ''"))
         connection.execute(text("UPDATE agent_commands SET args_json = '{}' WHERE args_json IS NULL OR args_json = ''"))
-        connection.execute(text("UPDATE agent_commands SET dry_run = 0 WHERE dry_run IS NULL"))
+        connection.execute(text(f"UPDATE agent_commands SET dry_run = {bool_false_value} WHERE dry_run IS NULL"))
         connection.execute(text("UPDATE agent_commands SET risk_level_snapshot = 'medium' WHERE risk_level_snapshot IS NULL OR risk_level_snapshot = ''"))
         for statement in (
             "CREATE INDEX IF NOT EXISTS ix_agent_commands_agent_status_created ON agent_commands (agent_id, status, created_at)",
