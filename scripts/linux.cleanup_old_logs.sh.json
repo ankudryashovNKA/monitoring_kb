@@ -1,0 +1,18 @@
+{
+  "title": "Очистка старых логов",
+  "description": "Удаляет только старые ротированные/сжатые логи. По умолчанию dry-run.",
+  "os_family": "linux",
+  "tags": ["filesystem", "logs", "cleanup"],
+  "risk_level": "medium",
+  "requires_confirmation": true,
+  "dry_run_supported": true,
+  "args_schema": {
+    "type": "object",
+    "properties": {
+      "path": {"type": "string", "default": "/var/log"},
+      "older_than_days": {"type": "integer", "default": 14},
+      "dry_run": {"type": "boolean", "default": true}
+    },
+    "required": ["path", "older_than_days", "dry_run"]
+  }
+}

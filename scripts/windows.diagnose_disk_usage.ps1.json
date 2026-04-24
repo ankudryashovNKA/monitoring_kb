@@ -1,0 +1,10 @@
+{
+  "title": "Windows disk diagnostics",
+  "description": "Diagnostic only. Lists disks and large temp/log directories.",
+  "os_family": "windows",
+  "tags": ["filesystem", "diagnostic", "disk"],
+  "risk_level": "low",
+  "requires_confirmation": false,
+  "dry_run_supported": false,
+  "args_schema": {"type": "object", "properties": {}, "required": []}
+}

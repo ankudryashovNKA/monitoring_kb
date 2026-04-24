@@ -48,7 +48,9 @@ from app.models.log_entry import LogEntry  # noqa: E402
 from app.models.trigger import Trigger  # noqa: E402
 from app.models.agent_script import AgentScript  # noqa: E402
 from app.models.agent_command import AgentCommand  # noqa: E402
+from app.models.llm_script_recommendation import LlmScriptRecommendation  # noqa: E402
 from app.security.agent_auth import register_agent  # noqa: E402
+from agent import discover_local_scripts, run_local_script  # noqa: E402
 
 
 def setup_function() -> None:
@@ -59,6 +61,7 @@ def setup_function() -> None:
         db.query(FilesystemSample).delete()
         db.query(ProcessSample).delete()
         db.query(AgentCommand).delete()
+        db.query(LlmScriptRecommendation).delete()
         db.query(AgentScript).delete()
         db.query(Node).delete()
         db.query(Agent).delete()
@@ -642,3 +645,167 @@ def test_llm_analyze_backward_compatible_payload(monkeypatch) -> None:
     resp = client.post('/api/llm/analyze-node', json={'node_id': 'node-llm'})
     assert resp.status_code == 200
     assert 'ok' in resp.text
+
+
+def test_agent_scripts_payload_backward_compatible() -> None:
+    with SessionLocal() as db:
+        agent_id, secret = register_agent(db)
+    client = TestClient(app)
+    ingest_metric(MetricIn(node_id="node-backward", agent_id=agent_id, cpu_percent=1, ram_percent=1, os_name="Linux", cpu_cores=2, ram_total_mb=2048, ip_address="1.1.1.1"))
+    scripts_raw = json.dumps({"node_id": "node-backward", "scripts": [{"script_id": "fix.sh", "script_path": "/x/fix.sh"}]}).encode("utf-8")
+    headers = _signed_headers(agent_id, secret, "/api/agent/scripts", scripts_raw)
+    response = client.post("/api/agent/scripts", data=scripts_raw, headers=headers)
+    assert response.status_code == 200
+    with SessionLocal() as db:
+        script = db.query(AgentScript).filter(AgentScript.node_id == "node-backward").first()
+        assert script is not None
+        assert script.content_hash == ""
+        assert script.os_family == "any"
+        assert script.risk_level == "medium"
+
+
+def test_agent_scripts_payload_with_manifest_metadata() -> None:
+    with SessionLocal() as db:
+        agent_id, secret = register_agent(db)
+    client = TestClient(app)
+    ingest_metric(MetricIn(node_id="node-meta", agent_id=agent_id, cpu_percent=1, ram_percent=1, os_name="Linux", cpu_cores=2, ram_total_mb=2048, ip_address="1.1.1.1"))
+    payload = {
+        "node_id": "node-meta",
+        "scripts": [{
+            "script_id": "linux.cleanup_old_logs.sh",
+            "script_path": "/x/linux.cleanup_old_logs.sh",
+            "content_hash": "sha256:abc",
+            "os_family": "linux",
+            "title": "Cleanup logs",
+            "tags": ["logs"],
+            "risk_level": "medium",
+            "args_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            "requires_confirmation": True,
+            "dry_run_supported": True,
+        }],
+    }
+    raw = json.dumps(payload).encode("utf-8")
+    response = client.post("/api/agent/scripts", data=raw, headers=_signed_headers(agent_id, secret, "/api/agent/scripts", raw))
+    assert response.status_code == 200
+    context_client = TestClient(app)
+    login_resp = context_client.post('/api/auth/login', json={'login': 'admin', 'password': 'admin'})
+    assert login_resp.status_code == 200
+    ctx = context_client.get('/api/llm/context', params={'node_id': 'node-meta', 'window_minutes': 60})
+    assert ctx.status_code == 200
+    assert ctx.json()["available_scripts"][0]["script_id"] == "linux.cleanup_old_logs.sh"
+
+
+def test_llm_context_includes_available_scripts() -> None:
+    with SessionLocal() as db:
+        node = Node(display_name="ctx-scripts", agent_id=None, os_name="Linux", cpu_cores=2, ram_total_mb=2048, ip_address="127.0.0.1", last_seen=datetime.now(timezone.utc))
+        db.add(node)
+        db.add(AgentScript(agent_id="agent-x", node_id="ctx-scripts", script_id="diag.sh", script_path="/x/diag.sh", enabled=True, manifest_error=None, updated_at=datetime.now(timezone.utc)))
+        db.commit()
+        context = build_node_analysis_context(db, "ctx-scripts", window_minutes=60)
+    assert "available_scripts" in context
+    assert context["available_scripts"][0]["script_id"] == "diag.sh"
+
+
+def test_llm_recommend_scripts_stores_recommendations(monkeypatch) -> None:
+    with SessionLocal() as db:
+        agent_id, _ = register_agent(db)
+        db.add(Node(display_name="node-rec", agent_id=agent_id, os_name="Linux", cpu_cores=2, ram_total_mb=2048, ip_address="1.2.3.4", last_seen=datetime.now(timezone.utc)))
+        db.add(AgentScript(agent_id=agent_id, node_id="node-rec", script_id="diag.sh", script_path="/x/diag.sh", content_hash="sha256:1", os_family="linux", enabled=True, args_schema_json='{\"type\":\"object\",\"properties\":{},\"required\":[]}', manifest_error=None, updated_at=datetime.now(timezone.utc)))
+        db.commit()
+    monkeypatch.setattr("main._generate_llm_recommendation_text", lambda _prompt: json.dumps({"summary": "s", "recommendations": [{"script_id": "diag.sh", "confidence": 0.9, "risk_level": "low", "requires_confirmation": False, "dry_run_first": False, "reason": "r", "evidence": ["metrics.latest"], "args": {}}]}))
+    client = TestClient(app)
+    login_resp = client.post('/api/auth/login', json={'login': 'admin', 'password': 'admin'})
+    assert login_resp.status_code == 200
+    response = client.post("/api/llm/recommend-scripts", json={"node_id": "node-rec", "window_minutes": 60})
+    assert response.status_code == 200
+    with SessionLocal() as db:
+        rec = db.query(LlmScriptRecommendation).filter(LlmScriptRecommendation.node_id == "node-rec").first()
+        assert rec is not None
+        assert rec.status == "proposed"
+
+
+def test_approve_medium_risk_requires_confirmation() -> None:
+    with SessionLocal() as db:
+        agent_id, _ = register_agent(db)
+        db.add(Node(display_name="node-approve", agent_id=agent_id, os_name="Linux", cpu_cores=2, ram_total_mb=2048, ip_address="1.2.3.4", last_seen=datetime.now(timezone.utc)))
+        db.add(AgentScript(agent_id=agent_id, node_id="node-approve", script_id="cleanup.sh", script_path="/x/cleanup.sh", content_hash="sha256:1", risk_level="medium", args_schema_json='{\"type\":\"object\",\"properties\":{},\"required\":[]}', enabled=True, manifest_error=None, updated_at=datetime.now(timezone.utc)))
+        db.add(LlmScriptRecommendation(node_id="node-approve", agent_id=agent_id, script_id="cleanup.sh", script_content_hash="sha256:1", args_json="{}", risk_level="medium", requires_confirmation=True, status="proposed", created_at=datetime.now(timezone.utc)))
+        db.commit()
+        rec_id = db.query(LlmScriptRecommendation.id).filter(LlmScriptRecommendation.node_id == "node-approve").scalar()
+    client = TestClient(app)
+    login_resp = client.post('/api/auth/login', json={'login': 'admin', 'password': 'admin'})
+    assert login_resp.status_code == 200
+    response = client.post(f"/api/llm/script-recommendations/{rec_id}/approve", json={"confirm": False, "dry_run": True})
+    assert response.status_code == 400
+
+
+def test_approve_creates_llm_agent_command() -> None:
+    with SessionLocal() as db:
+        agent_id, _ = register_agent(db)
+        db.add(Node(display_name="node-approve-ok", agent_id=agent_id, os_name="Linux", cpu_cores=2, ram_total_mb=2048, ip_address="1.2.3.4", last_seen=datetime.now(timezone.utc)))
+        db.add(AgentScript(agent_id=agent_id, node_id="node-approve-ok", script_id="cleanup.sh", script_path="/x/cleanup.sh", content_hash="sha256:1", risk_level="medium", args_schema_json='{\"type\":\"object\",\"properties\":{\"dry_run\":{\"type\":\"boolean\",\"default\":true}},\"required\":[]}', enabled=True, manifest_error=None, updated_at=datetime.now(timezone.utc)))
+        db.add(LlmScriptRecommendation(node_id="node-approve-ok", agent_id=agent_id, script_id="cleanup.sh", script_content_hash="sha256:1", args_json='{\"dry_run\":true}', risk_level="medium", requires_confirmation=True, dry_run_first=True, status="proposed", created_at=datetime.now(timezone.utc)))
+        db.commit()
+        rec_id = db.query(LlmScriptRecommendation.id).filter(LlmScriptRecommendation.node_id == "node-approve-ok").scalar()
+    client = TestClient(app)
+    client.post('/api/auth/login', json={'login': 'admin', 'password': 'admin'})
+    response = client.post(f"/api/llm/script-recommendations/{rec_id}/approve", json={"confirm": True, "dry_run": True})
+    assert response.status_code == 200
+    with SessionLocal() as db:
+        cmd = db.query(AgentCommand).filter(AgentCommand.recommendation_id == rec_id).first()
+        assert cmd is not None
+        assert cmd.source == "llm"
+        assert cmd.dry_run is True
+        rec = db.query(LlmScriptRecommendation).filter(LlmScriptRecommendation.id == rec_id).first()
+        assert rec is not None and rec.status == "approved"
+
+
+def test_approve_rejects_changed_script_hash() -> None:
+    with SessionLocal() as db:
+        agent_id, _ = register_agent(db)
+        db.add(Node(display_name="node-hash", agent_id=agent_id, os_name="Linux", cpu_cores=2, ram_total_mb=2048, ip_address="1.2.3.4", last_seen=datetime.now(timezone.utc)))
+        db.add(AgentScript(agent_id=agent_id, node_id="node-hash", script_id="cleanup.sh", script_path="/x/cleanup.sh", content_hash="sha256:new", args_schema_json='{\"type\":\"object\",\"properties\":{},\"required\":[]}', enabled=True, manifest_error=None, updated_at=datetime.now(timezone.utc)))
+        db.add(LlmScriptRecommendation(node_id="node-hash", agent_id=agent_id, script_id="cleanup.sh", script_content_hash="sha256:old", args_json="{}", status="proposed", created_at=datetime.now(timezone.utc)))
+        db.commit()
+        rec_id = db.query(LlmScriptRecommendation.id).filter(LlmScriptRecommendation.node_id == "node-hash").scalar()
+    client = TestClient(app)
+    client.post('/api/auth/login', json={'login': 'admin', 'password': 'admin'})
+    response = client.post(f"/api/llm/script-recommendations/{rec_id}/approve", json={"confirm": True, "dry_run": True})
+    assert response.status_code == 409
+
+
+def test_agent_command_next_includes_args_and_dry_run() -> None:
+    with SessionLocal() as db:
+        agent_id, secret = register_agent(db)
+        db.add(Node(display_name="node-next", agent_id=agent_id, os_name="Linux", cpu_cores=2, ram_total_mb=2048, ip_address="1.2.3.4", last_seen=datetime.now(timezone.utc)))
+        db.add(AgentCommand(agent_id=agent_id, node_id="node-next", trigger_id=None, script_id="x.sh", source="llm", args_json='{\"a\":1}', dry_run=True, risk_level_snapshot="low", status="pending", created_at=datetime.now(timezone.utc)))
+        db.commit()
+    client = TestClient(app)
+    response = client.get("/api/agent/commands/next", headers=_signed_headers(agent_id, secret, "/api/agent/commands/next", b"", method="GET"))
+    assert response.status_code == 200
+    assert response.json()["item"]["args_json"] == '{"a":1}'
+    assert response.json()["item"]["dry_run"] is True
+
+
+def test_agent_discover_local_scripts_ignores_json_manifest(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "a.sh").write_text("#!/usr/bin/env bash\necho ok\n", encoding="utf-8")
+    (scripts_dir / "a.sh.json").write_text("{\"title\":\"A\"}", encoding="utf-8")
+    items = discover_local_scripts(tmp_path)
+    assert len(items) == 1
+    assert items[0]["script_id"] == "a.sh"
+    assert str(items[0]["content_hash"]).startswith("sha256:")
+
+
+def test_run_local_script_receives_args_env(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    script = scripts_dir / "print_env.sh"
+    script.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\n[[ -n \"${MONITORING_KB_ARGS_JSON:-}\" ]]\n[[ \"${MONITORING_KB_DRY_RUN:-}\" == \"true\" ]]\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    exit_code, stdout, _stderr = run_local_script(tmp_path, "print_env.sh", args_json='{\"dry_run\": true}', dry_run=True)
+    assert exit_code == 0

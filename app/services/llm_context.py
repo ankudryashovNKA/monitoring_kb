@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
+import json
 import math
 import re
 from typing import Any
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.models.agent import Agent
 from app.models.agent_command import AgentCommand
+from app.models.agent_script import AgentScript
 from app.models.filesystem_sample import FilesystemSample
 from app.models.log_entry import LogEntry
 from app.models.metric import Metric
@@ -177,6 +179,7 @@ def build_node_analysis_context(
     proc_60 = db.query(ProcessSample).filter(ProcessSample.node_id == node_id, ProcessSample.timestamp >= w60).order_by(ProcessSample.timestamp.desc()).all()
     triggers = db.query(Trigger).filter(Trigger.node_id == node_id).all()
     cmds = db.query(AgentCommand).filter(AgentCommand.node_id == node_id).order_by(AgentCommand.created_at.desc()).limit(20).all()
+    scripts = db.query(AgentScript).filter(AgentScript.node_id == node_id).all()
 
     latest_metric = metrics_60[-1] if metrics_60 else db.query(Metric).filter(Metric.node_id == node_id).order_by(Metric.timestamp.desc()).first()
     latest_fs: dict[str, FilesystemSample] = {}
@@ -205,6 +208,47 @@ def build_node_analysis_context(
             "free_gb": {"count": len(free_vals), "avg": round(sum(free_vals)/len(free_vals),4), "min": min(free_vals), "max": max(free_vals), "p95": _p95(free_vals)} if free_vals else {},
             "used_gb_growth_per_hour": growth,
         }
+
+    os_hint = (node.os_name or "").lower()
+    preferred_os_families: set[str] = {"any"}
+    if "linux" in os_hint:
+        preferred_os_families.update({"linux", "any"})
+    elif "windows" in os_hint:
+        preferred_os_families.update({"windows", "any"})
+    else:
+        preferred_os_families.update({"linux", "windows"})
+
+    available_scripts: list[dict[str, Any]] = []
+    for script in scripts:
+        if not script.enabled or script.manifest_error:
+            continue
+        script_os = (script.os_family or "any").lower()
+        if script_os not in preferred_os_families:
+            continue
+        try:
+            tags = json.loads(script.tags_json or "[]")
+        except Exception:
+            tags = []
+        try:
+            args_schema = json.loads(script.args_schema_json or "{}")
+        except Exception:
+            args_schema = {}
+        available_scripts.append(
+            {
+                "script_id": script.script_id,
+                "title": script.title,
+                "description": script.description,
+                "os_family": script.os_family,
+                "tags": tags if isinstance(tags, list) else [],
+                "risk_level": script.risk_level,
+                "requires_confirmation": bool(script.requires_confirmation),
+                "dry_run_supported": bool(script.dry_run_supported),
+                "args_schema": args_schema if isinstance(args_schema, dict) else {},
+                "content_hash": script.content_hash,
+                "updated_at": _iso(script.updated_at),
+                "manifest_error": script.manifest_error,
+            }
+        )
 
     counts_10 = Counter([row.severity for row in logs_60 if row.captured_at >= w10])
     counts_60 = Counter([row.severity for row in logs_60])
@@ -255,6 +299,7 @@ def build_node_analysis_context(
             "recent_commands": [{"id": c.id, "script_id": c.script_id, "status": c.status, "exit_code": c.exit_code, "created_at": _iso(c.created_at), "finished_at": _iso(c.finished_at)} for c in cmds],
             "failed_recently": [c.script_id for c in cmds if c.status == "failed"],
         },
+        "available_scripts": available_scripts,
         "knowledge_base": {},
         "deterministic_observations": [],
     }
