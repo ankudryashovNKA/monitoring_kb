@@ -1400,7 +1400,7 @@ def list_logs(node_id: str, severity: str = Query(default="INFO")) -> dict[str, 
 
 
 @app.get("/api/metrics")
-def list_metrics(node_id: str | None = None) -> dict[str, list[dict[str, str | float]]]:
+def list_metrics(node_id: str | None = None) -> dict[str, list[dict[str, str | int | float | None]]]:
     now = _utcnow()
     cutoff = now - RETENTION_PERIOD
     metrics_cutoff = cutoff
